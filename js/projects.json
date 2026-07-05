@@ -1,0 +1,13 @@
+{
+  "generated": "2026-07-05T12:52:38+0100",
+  "projects": [
+    { "id": "crook-community", "name": "crook-community", "color": "#eef1fe", "text": "#3b4bb8" },
+    { "id": "holitrackr", "name": "holitrackr", "color": "#ccfbf1", "text": "#0f766e" },
+    { "id": "portfolio-new", "name": "portfolio-new", "color": "#ede9fe", "text": "#6d28d9" },
+    { "id": "portfolio-website", "name": "portfolio-website", "color": "#fef3c7", "text": "#b45309" },
+    { "id": "SART", "name": "SART", "color": "#fef3c7", "text": "#b45309" },
+    { "id": "strava-worker", "name": "strava-worker", "color": "#eef1fe", "text": "#3b4bb8" },
+    { "id": "SwiftPlan", "name": "SwiftPlan", "color": "#fef9c3", "text": "#a16207" },
+    { "id": "weatherapp", "name": "weatherapp", "color": "#f3e8ff", "text": "#7e22ce" }
+  ]
+}

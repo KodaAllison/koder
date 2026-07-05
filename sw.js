@@ -14,7 +14,7 @@
  * A byte-different sw.js is what triggers the browser to install
  * the new version (the "update flow" you'll see in app.js).
  */
-const CACHE_NAME = 'kanban-shell-v2';
+const CACHE_NAME = 'kanban-shell-v8';
 
 /* The "app shell": the minimal static files needed to render the UI.
  * We cache these at install time so the app boots with zero network. */
@@ -23,6 +23,7 @@ const SHELL_ASSETS = [
   './index.html',
   './css/styles.css',
   './js/app.js',
+  './js/projects.json',
   './manifest.webmanifest',
   './icons/icon-192.png',
   './icons/icon-512.png',
@@ -70,6 +71,22 @@ self.addEventListener('fetch', (event) => {
   if (event.request.method !== 'GET') return;
   const url = new URL(event.request.url);
   if (url.origin !== self.location.origin) return;
+
+  /* projects.json is regenerated out-of-band (gen-projects.ps1), so serve it
+   * NETWORK-FIRST: fetch a fresh copy when online, fall back to cache offline.
+   * (The rest of the shell stays cache-first below.) */
+  if (url.pathname.endsWith('/projects.json')) {
+    event.respondWith(
+      fetch(event.request).then((response) => {
+        if (response.ok) {
+          const copy = response.clone();
+          caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
+        }
+        return response;
+      }).catch(() => caches.match(event.request))
+    );
+    return;
+  }
 
   event.respondWith(
     caches.match(event.request).then((cached) => {

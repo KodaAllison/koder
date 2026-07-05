@@ -13,7 +13,7 @@
 
   <!-- theme-color tints the browser/OS chrome (address bar, title bar)
        to match your app. Part of making it feel native. -->
-  <meta name="theme-color" content="#4f6ef7">
+  <meta name="theme-color" content="#0e1014">
 
   <!-- iOS doesn't read icons from the manifest; it wants this tag. -->
   <link rel="apple-touch-icon" href="icons/icon-192.png">
@@ -32,7 +32,10 @@
   </header>
 
   <div class="tabs" id="tabs"></div>
-  <div class="board" id="board"></div>
+  <div class="main">
+    <div class="board" id="board"></div>
+    <aside class="life-sidebar" id="lifeSidebar" hidden></aside>
+  </div>
 
   <!-- Ticket create/edit modal -->
   <div class="overlay" id="overlay">
@@ -45,6 +48,11 @@
       <div>
         <label for="fNote">Notes (optional)</label>
         <textarea id="fNote" placeholder="Details, links, context…"></textarea>
+      </div>
+      <!-- Shown only for the projects board; hidden for the Life board (see app.js) -->
+      <div id="projectField">
+        <label for="fProject">Project</label>
+        <select id="fProject"></select>
       </div>
       <div class="row2">
         <div>
