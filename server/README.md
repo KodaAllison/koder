@@ -14,16 +14,21 @@ KODER_TOKEN=dev deno task dev     # http://localhost:8000, KV in a local file
 
 ## Deploy (free) on Deno Deploy
 
-1. https://dash.deno.com → New Project → link this GitHub repo.
-2. Entrypoint: `server/main.ts`.
+1. https://dash.deno.com → New App → link this GitHub repo.
+2. Build config: framework preset **None**, run as a **dynamic app** with
+   entrypoint `server/main.ts`. (Don't accept the auto-detected "static site"
+   preset — the repo's root `index.html` triggers it, and you'd get a file
+   server that 404s `/state`.)
 3. Settings → Environment Variables → add `KODER_TOKEN` (e.g. `openssl rand -hex 24`).
    Optionally `KODER_ORIGIN=https://<your-board-origin>` to lock down CORS.
-4. KV is provisioned automatically — nothing to configure.
-5. Put the deployment URL + token into `js/config.local.js` (copy
+4. Create a KV database (org sidebar → Databases) and attach it to the app
+   (app Settings → Databases), then redeploy — `Deno.openKv()` fails until
+   one is attached.
+5. Put the app URL + token into `js/config.local.js` (copy
    `js/config.example.js`) and `scripts/.koder.env`:
 
    ```
-   KODER_API=https://<project>.deno.dev
+   KODER_API=https://<app>.<org>.deno.net
    KODER_TOKEN=<token>
    ```
 
