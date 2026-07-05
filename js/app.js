@@ -11,8 +11,19 @@
  * the browser no-ops if the same SW is already registered.
  *
  * NOTE: service workers require a "secure context": https:// or localhost.
- * If you open index.html via file://, registration will fail. */
-if ('serviceWorker' in navigator) {
+ * If you open index.html via file://, registration will fail.
+ *
+ * DEV: the SW is cache-first, which serves stale CSS/JS while you're editing.
+ * So we skip it entirely on localhost/127.0.0.1 (and tear down any SW left over
+ * from earlier testing) — local reloads are then plain, uncached, and instant.
+ * The PWA/offline behaviour still runs on the real deployed origin. */
+const IS_LOCAL = ['localhost', '127.0.0.1', '[::1]', ''].includes(location.hostname);
+if ('serviceWorker' in navigator && IS_LOCAL) {
+  navigator.serviceWorker.getRegistrations().then((regs) => {
+    regs.forEach((r) => r.unregister());
+    if (regs.length) caches.keys().then((keys) => keys.forEach((k) => caches.delete(k)));
+  });
+} else if ('serviceWorker' in navigator) {
   window.addEventListener('load', async () => {
     try {
       const reg = await navigator.serviceWorker.register('sw.js');
@@ -166,7 +177,13 @@ function load() {
     const raw = localStorage.getItem(STORE_KEY);
     if (raw) s = JSON.parse(raw);
   } catch (e) { /* corrupted data → start fresh */ }
-  if (!s) s = {};
+  return normalize(s || {});
+}
+
+/* Repair/upgrade a board object into the exact shape the app expects.
+ * Runs on the localStorage cache at boot AND on every board pulled from the
+ * sync server, so both sources get identical defensive fills/migrations. */
+function normalize(s) {
   migrateLifeColumns(s);
   // Fill in any missing boards/columns (covers first run and future column additions).
   Object.keys(BOARDS).forEach(boardId => {
@@ -185,9 +202,176 @@ function load() {
   if (!Array.isArray(s.lifeMeta.focus)) s.lifeMeta.focus = [];
   if (!Array.isArray(s.lifeMeta.dates)) s.lifeMeta.dates = [];
   if (typeof s.lifeMeta.notes !== 'string') s.lifeMeta.notes = '';
+  // Notes used to be one scratchpad string; they're now a wall of sticky notes.
+  // Migrate the old text into the first sticky so nothing is lost.
+  if (!Array.isArray(s.lifeMeta.stickies)) {
+    s.lifeMeta.stickies = [];
+    if (s.lifeMeta.notes.trim()) {
+      s.lifeMeta.stickies.push({ id: uid(), text: s.lifeMeta.notes, color: 'yellow' });
+      s.lifeMeta.notes = '';
+    }
+  }
   return s;
 }
-function save() { localStorage.setItem(STORE_KEY, JSON.stringify(state)); }
+/* Persist synchronously to localStorage (offline-first, instant), then
+ * schedule a debounced push to the sync server if one is configured.
+ * Call sites don't change — everything still just calls save(). */
+function save() {
+  localStorage.setItem(STORE_KEY, JSON.stringify(state));
+  markDirty();
+  schedulePush();
+}
+
+/* ==================== Server sync (optional) ====================
+ * If js/config.local.js defines window.KODER_API = { base, token }, the board
+ * syncs with a small Deno Deploy server (see server/). The server copy is
+ * canonical; localStorage stays as the offline cache / instant first paint.
+ * Without config the app runs exactly as before: pure localStorage.
+ *
+ * Model: last-write-wins guarded by a monotonic `rev`.
+ *  - Local changes mark the board dirty and schedule a debounced full-board
+ *    PUT carrying the rev we last synced (baseRev).
+ *  - The server 409s a stale baseRev. We then merge down anything added
+ *    remotely (agent tickets via POST /tickets) and retry on the fresh rev,
+ *    so an open tab can't clobber a ticket an agent just created.
+ *  - The dirty flag persists in localStorage, so edits made right before the
+ *    tab closed get pushed on next boot instead of being reverted by pull. */
+
+const SYNC = {
+  rev: parseInt(localStorage.getItem(STORE_KEY + ':rev') || '0', 10),
+  dirty: localStorage.getItem(STORE_KEY + ':dirty') === '1',
+  pushing: false,
+  pushTimer: null,
+  pullTimer: null,
+};
+
+function apiEnabled() {
+  return !!(window.KODER_API && window.KODER_API.base && window.KODER_API.token);
+}
+function api(method, path, body) {
+  const { base, token } = window.KODER_API;
+  return fetch(base.replace(/\/+$/, '') + path, {
+    method,
+    headers: {
+      'Authorization': 'Bearer ' + token,
+      ...(body ? { 'Content-Type': 'application/json' } : {}),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+}
+
+/* Cache write WITHOUT marking dirty — used when adopting server state. */
+function writeCache() { localStorage.setItem(STORE_KEY, JSON.stringify(state)); }
+function markDirty() { SYNC.dirty = true; localStorage.setItem(STORE_KEY + ':dirty', '1'); }
+
+function allCardIds(s) {
+  const ids = new Set();
+  ['projects', 'life'].forEach(b =>
+    Object.values(s[b] || {}).forEach(cards => cards.forEach(c => ids.add(c.id))));
+  return ids;
+}
+
+/* Record a sync point: the rev plus the card ids the server knows about.
+ * The id set is how a 409-merge tells "added remotely" (unknown id → keep)
+ * from "deleted locally" (known id → the local deletion wins). */
+function adoptRev(rev) {
+  SYNC.rev = rev;
+  SYNC.dirty = false;
+  localStorage.setItem(STORE_KEY + ':rev', String(rev));
+  localStorage.removeItem(STORE_KEY + ':dirty');
+  localStorage.setItem(STORE_KEY + ':syncedIds', JSON.stringify([...allCardIds(state)]));
+}
+
+/* Debounced: sticky notes and focus items call save() per keystroke; the
+ * localStorage write stays immediate but the network push batches. */
+function schedulePush(delay = 800) {
+  if (!apiEnabled()) return;
+  clearTimeout(SYNC.pushTimer);
+  SYNC.pushTimer = setTimeout(pushState, delay);
+}
+
+async function pushState() {
+  if (!apiEnabled()) return;
+  if (SYNC.pushing) { schedulePush(); return; }
+  SYNC.pushing = true;
+  try {
+    let res = await api('PUT', '/state', { baseRev: SYNC.rev, board: state });
+    if (res.status === 409) {
+      // Someone wrote since our last sync (usually an agent ticket). Merge
+      // their additions into our board, then retry on top of their rev.
+      const cur = await api('GET', '/state');
+      if (cur.ok) mergeRemote(await cur.json());
+      res = await api('PUT', '/state', { baseRev: SYNC.rev, board: state });
+    }
+    if (res.ok) {
+      const j = await res.json();
+      adoptRev(j.rev);
+    }
+  } catch (e) { /* offline — stay dirty; retried on online/focus/next boot */ }
+  finally { SYNC.pushing = false; }
+}
+
+/* Merge a fresher server doc into dirty local state: local wins card-by-card,
+ * but server cards we've never synced (i.e. agent-added) are kept. */
+function mergeRemote(doc) {
+  const server = normalize(doc.board || {});
+  const localIds = allCardIds(state);
+  let synced = [];
+  try { synced = JSON.parse(localStorage.getItem(STORE_KEY + ':syncedIds')) || []; } catch (e) {}
+  const known = new Set(synced);
+  ['projects', 'life'].forEach(boardId => {
+    Object.entries(server[boardId]).forEach(([colId, cards]) => {
+      cards.forEach(card => {
+        if (localIds.has(card.id) || known.has(card.id)) return;
+        if (!state[boardId][colId]) state[boardId][colId] = [];
+        state[boardId][colId].push(card);
+      });
+    });
+  });
+  SYNC.rev = doc.rev;
+  localStorage.setItem(STORE_KEY + ':rev', String(doc.rev));
+  writeCache();
+  render();
+}
+
+/* Don't yank state out from under an open modal or a focused text field. */
+function editorBusy() {
+  const el = document.activeElement;
+  return overlay.classList.contains('open') ||
+    (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA'));
+}
+
+async function pullState() {
+  if (!apiEnabled()) return;
+  if (SYNC.dirty || SYNC.pushing) { schedulePush(0); return; } // our edits go first (409-merge picks up remote adds)
+  if (editorBusy()) return;
+  try {
+    const res = await api('GET', '/state');
+    if (!res.ok) return;
+    const doc = await res.json();
+    if (!doc || typeof doc.rev !== 'number') return;
+    if (doc.rev === 0) {
+      // Empty server + non-empty local board → first run: seed the server.
+      if (allCardIds(state).size || state.lifeMeta.focus.length ||
+          state.lifeMeta.dates.length || state.lifeMeta.stickies.length) {
+        markDirty();
+        schedulePush(0);
+      }
+      return;
+    }
+    if (doc.rev <= SYNC.rev) return; // nothing new
+    state = normalize(doc.board || {});
+    writeCache();
+    adoptRev(doc.rev);
+    render();
+  } catch (e) { /* offline — keep the local cache */ }
+}
+
+function schedulePull(delay = 300) {
+  if (!apiEnabled()) return;
+  clearTimeout(SYNC.pullTimer);
+  SYNC.pullTimer = setTimeout(pullState, delay);
+}
 
 /* Load the project list written by scripts/gen-projects.ps1. */
 async function loadProjects() {
@@ -340,9 +524,11 @@ function renderCard(card, colId, showProject) {
  * textContent throughout so user text is never interpreted as HTML. */
 const lifeSidebar = document.getElementById('lifeSidebar');
 const FOCUS_CAP = 3;          // the disappearing "+ add" button IS the cap
+const STICKY_COLORS = ['yellow', 'pink', 'blue', 'green']; // new notes cycle through these
 let showAllDates = false;     // "view all" toggle, persists across re-renders
 let addingFocus = false;      // inline add-form open flags
 let addingDate = false;
+let focusStickyId = null;     // a freshly-added sticky to focus after render
 
 function dayDiff(dateStr) {
   const today = new Date(); today.setHours(0, 0, 0, 0);
@@ -524,14 +710,56 @@ function renderDatesSection(meta) {
 function renderNotesSection(meta) {
   const sec = document.createElement('div');
   sec.className = 'side-sec';
-  sec.appendChild(sideTitle('Notes'));
-  const ta = document.createElement('textarea');
-  ta.className = 'side-notes';
-  ta.placeholder = 'Park a thought…';
-  ta.value = meta.notes;
-  // Autosave WITHOUT re-rendering, or typing would lose focus each keystroke.
-  ta.addEventListener('input', () => { meta.notes = ta.value; save(); });
-  sec.appendChild(ta);
+
+  // Header: title + an inline "+ add" that drops a fresh, focused sticky.
+  const head = document.createElement('div');
+  head.className = 'notes-head';
+  head.appendChild(sideTitle('Notes'));
+  const add = document.createElement('button');
+  add.className = 'side-link';
+  add.textContent = '+ add';
+  add.onclick = () => {
+    const color = STICKY_COLORS[meta.stickies.length % STICKY_COLORS.length];
+    const note = { id: uid(), text: '', color };
+    meta.stickies.push(note);
+    focusStickyId = note.id;
+    save(); render();
+  };
+  head.appendChild(add);
+  sec.appendChild(head);
+
+  const wall = document.createElement('div');
+  wall.className = 'sticky-wall';
+  meta.stickies.forEach(note => {
+    const el = document.createElement('div');
+    el.className = 'sticky';
+    el.dataset.color = note.color || 'yellow';
+
+    const ta = document.createElement('textarea');
+    ta.className = 'sticky-text';
+    ta.placeholder = 'Note…';
+    ta.value = note.text;
+    // Autosave WITHOUT re-rendering, or typing would lose focus each keystroke.
+    ta.addEventListener('input', () => { note.text = ta.value; save(); });
+    el.appendChild(ta);
+
+    el.appendChild(sideDelBtn(() => {
+      meta.stickies = meta.stickies.filter(n => n.id !== note.id);
+      save(); render();
+    }));
+
+    wall.appendChild(el);
+    if (note.id === focusStickyId) setTimeout(() => ta.focus(), 0);
+  });
+  focusStickyId = null;
+  sec.appendChild(wall);
+
+  if (!meta.stickies.length) {
+    const hint = document.createElement('div');
+    hint.className = 'empty-hint';
+    hint.textContent = 'No notes yet — add one';
+    sec.appendChild(hint);
+  }
   return sec;
 }
 
@@ -668,10 +896,42 @@ btnDelete.onclick = () => {
   save(); closeModal(); render();
 };
 
-/* Boot: load the project list, then paint. (state is already loaded from
- * localStorage synchronously above — only the project list is async.) */
+/* Boot: load the project list, paint from the local cache, then sync.
+ * (state is already loaded from localStorage synchronously above.) */
 async function init() {
   await loadProjects();
-  render();
+  render();                       // instant first paint from the cache
+  if (!apiEnabled()) return;      // no server configured → pure localStorage mode
+
+  if (SYNC.dirty) await pushState(); // flush edits left over from last session
+  await pullState();
+
+  // Keep in sync while the tab is open: refetch on focus/visibility plus a
+  // light timer, so agent-added tickets appear without a manual reload.
+  window.addEventListener('focus', () => schedulePull());
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') schedulePull();
+  });
+  setInterval(() => {
+    if (document.visibilityState === 'visible') pullState();
+  }, 30000);
+  window.addEventListener('online', () => { if (SYNC.dirty) schedulePush(0); });
+
+  // Last-chance flush if the tab closes inside the push debounce window.
+  // keepalive lets the request outlive the page; the persisted dirty flag
+  // isn't cleared here, so if this beacon fails the next boot retries.
+  window.addEventListener('pagehide', () => {
+    if (!SYNC.dirty) return;
+    try {
+      const { base, token } = window.KODER_API;
+      fetch(base.replace(/\/+$/, '') + '/state', {
+        method: 'PUT',
+        keepalive: true,
+        headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ baseRev: SYNC.rev, board: state }),
+      });
+    } catch (e) { /* best effort */ }
+  });
 }
 init();
+

@@ -14,7 +14,7 @@
  * A byte-different sw.js is what triggers the browser to install
  * the new version (the "update flow" you'll see in app.js).
  */
-const CACHE_NAME = 'kanban-shell-v8';
+const CACHE_NAME = 'kanban-shell-v10';
 
 /* The "app shell": the minimal static files needed to render the UI.
  * We cache these at install time so the app boots with zero network. */
@@ -72,10 +72,13 @@ self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
   if (url.origin !== self.location.origin) return;
 
-  /* projects.json is regenerated out-of-band (gen-projects.ps1), so serve it
-   * NETWORK-FIRST: fetch a fresh copy when online, fall back to cache offline.
-   * (The rest of the shell stays cache-first below.) */
-  if (url.pathname.endsWith('/projects.json')) {
+  /* projects.json is regenerated out-of-band (gen-projects.sh) and
+   * config.local.js can change (new sync URL/token) without a shell deploy,
+   * so serve both NETWORK-FIRST: fresh when online, cache fallback offline.
+   * (The rest of the shell stays cache-first below. Note the cross-origin
+   * sync API itself never reaches this handler — non-same-origin requests
+   * bail out above, so API calls are never cached.) */
+  if (url.pathname.endsWith('/projects.json') || url.pathname.endsWith('/config.local.js')) {
     event.respondWith(
       fetch(event.request).then((response) => {
         if (response.ok) {

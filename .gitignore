@@ -10,3 +10,5 @@ desktop.ini
 
 # Environment / secrets
 .env
+js/config.local.js
+scripts/.koder.env

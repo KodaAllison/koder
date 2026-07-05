@@ -27,6 +27,22 @@ Then open http://localhost:8000 (or whatever port it prints).
 - **Ship an update**: change something visible, bump `CACHE_NAME` in `sw.js` to `kanban-shell-v2`, reload twice — you'll get the "New version available" toast.
 - **Audit it**: DevTools → Lighthouse → PWA category. Also explore DevTools → Application tab: Manifest, Service Workers, Cache Storage.
 
+## Sync server + agent CLI (optional)
+
+The board can sync to a free Deno Deploy server (`server/`) that becomes the
+source of truth: localStorage stays as the offline cache, every change is
+pushed up, and the app pulls on focus + every 30s. This also lets agents add
+tickets from a terminal:
+
+```bash
+./scripts/koder-ticket.sh "Fix login bug" --project holitrackr --priority high --column todo
+```
+
+Setup: deploy `server/main.ts` to Deno Deploy, then copy `js/config.example.js`
+to `js/config.local.js` (gitignored) with the URL + token. No config file →
+the app runs in pure-localStorage mode exactly as before. Full deploy steps,
+API docs, and the raw `curl` equivalent live in `server/README.md`.
+
 ## Stretch goals (roughly in order of learning value)
 
 - Migrate ticket storage from localStorage to **IndexedDB** (async, larger quota, accessible from the service worker)
