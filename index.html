@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Koder — Kanban</title>
+
+  <!-- ============ PWA piece #1: the Web App Manifest ============
+       This JSON file tells the browser "this site is an installable app".
+       It defines the app's name, icons, colors, and how it opens when
+       launched from the home screen / dock. Without it, no install prompt. -->
+  <link rel="manifest" href="manifest.webmanifest">
+
+  <!-- theme-color tints the browser/OS chrome (address bar, title bar)
+       to match your app. Part of making it feel native. -->
+  <meta name="theme-color" content="#4f6ef7">
+
+  <!-- iOS doesn't read icons from the manifest; it wants this tag. -->
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
+
+  <link rel="icon" href="icons/icon-192.png" type="image/png">
+  <link rel="stylesheet" href="css/styles.css">
+</head>
+<body>
+  <header>
+    <h1>Koda's Board</h1>
+    <div class="header-right">
+      <!-- Shown only when the browser fires `beforeinstallprompt` (see app.js) -->
+      <button id="installBtn" class="btn btn-install" hidden>Install app</button>
+      <span id="offlineBadge" class="offline-badge" hidden>Offline</span>
+    </div>
+  </header>
+
+  <div class="tabs" id="tabs"></div>
+  <div class="board" id="board"></div>
+
+  <!-- Ticket create/edit modal -->
+  <div class="overlay" id="overlay">
+    <div class="modal">
+      <h2 id="modalTitle">New ticket</h2>
+      <div>
+        <label for="fTitle">Title</label>
+        <input type="text" id="fTitle" placeholder="What needs doing?" maxlength="140">
+      </div>
+      <div>
+        <label for="fNote">Notes (optional)</label>
+        <textarea id="fNote" placeholder="Details, links, context…"></textarea>
+      </div>
+      <div class="row2">
+        <div>
+          <label for="fPriority">Priority</label>
+          <select id="fPriority">
+            <option value="low">Low</option>
+            <option value="med" selected>Medium</option>
+            <option value="high">High</option>
+          </select>
+        </div>
+        <div>
+          <label for="fCol">Column</label>
+          <select id="fCol"></select>
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-danger" id="btnDelete" hidden>Delete</button>
+        <button class="btn btn-ghost" id="btnCancel">Cancel</button>
+        <button class="btn btn-primary" id="btnSave">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast shown when the service worker finds a new version -->
+  <div class="toast" id="updateToast" hidden>
+    New version available <button class="btn btn-primary" id="reloadBtn">Reload</button>
+  </div>
+
+  <script src="js/app.js"></script>
+</body>
+</html>
