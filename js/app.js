@@ -196,6 +196,15 @@ function normalize(s) {
   Object.values(s.projects).forEach(cards => {
     cards.forEach(card => { if (!('project' in card)) card.project = null; });
   });
+  // Security: priority feeds a class attribute inside renderCard's innerHTML,
+  // so whitelist it. Titles/notes are safe (textContent), but any card field
+  // that doesn't go through textContent must never be trusted — boards can
+  // arrive from the sync server, not just our own UI.
+  Object.keys(BOARDS).forEach(boardId => {
+    Object.values(s[boardId]).forEach(cards => cards.forEach(card => {
+      if (!['low', 'med', 'high'].includes(card.priority)) card.priority = 'med';
+    }));
+  });
   // Life dashboard sidebar data (Today's focus, important dates, notes).
   // Defensive fill so existing saved state upgrades cleanly.
   if (!s.lifeMeta || typeof s.lifeMeta !== 'object') s.lifeMeta = {};

@@ -83,7 +83,18 @@ Deno.serve(async (req: Request) => {
 
   /* ---- PUT /state: full-board write, conditional on baseRev ---- */
   if (url.pathname === "/state" && req.method === "PUT") {
-    const body = await req.json().catch(() => null);
+    // Deno KV values cap at 64KB — reject early with a clear error instead of
+    // letting kv.set() fail mysteriously once the board grows too big.
+    const raw = await req.text();
+    if (raw.length > 60_000) {
+      return json({ error: "board too large (60KB limit — Deno KV caps values at 64KB)" }, 413);
+    }
+    let body: { baseRev?: unknown; board?: unknown };
+    try {
+      body = JSON.parse(raw);
+    } catch {
+      return json({ error: "invalid JSON" }, 400);
+    }
     if (!body || typeof body !== "object" || !body.board || typeof body.board !== "object") {
       return json({ error: "expected { baseRev, board }" }, 400);
     }
@@ -95,7 +106,7 @@ Deno.serve(async (req: Request) => {
     const doc: Doc = {
       rev: cur.rev + 1,
       updatedAt: new Date().toISOString(),
-      board: body.board,
+      board: body.board as Doc["board"], // shape-checked above (object, non-null)
     };
     const res = await kv.atomic().check(entry).set(KEY, doc).commit();
     if (!res.ok) return json({ error: "conflict: concurrent write, retry" }, 409);
@@ -108,6 +119,9 @@ Deno.serve(async (req: Request) => {
     const body = await req.json().catch(() => null);
     if (!body || typeof body.title !== "string" || !body.title.trim()) {
       return json({ error: "title (non-empty string) is required" }, 400);
+    }
+    if (body.title.length > 300 || (typeof body.note === "string" && body.note.length > 5000)) {
+      return json({ error: "too long: title max 300 chars, note max 5000" }, 400);
     }
     const column = typeof body.column === "string" && body.column ? body.column : "backlog";
     if (!PROJECT_COLUMNS.includes(column)) {
