@@ -69,7 +69,34 @@ curl -sS -X POST \
 # → 201 { "card": { "id": "t_...", ... }, "rev": 42 }
 ```
 
-Or use the wrapper: `./scripts/koder-ticket.sh "Fix login bug" --project holitrackr --priority high`.
+### GET /tickets — read tickets
+
+Flattens the projects board into one list; each ticket gains a `column` field.
+Optional filters: `?project=<id>` and/or `?column=<id>`.
+
+```bash
+curl -sS -H "Authorization: Bearer $KODER_TOKEN" "$KODER_API/tickets?project=holitrackr&column=todo"
+# → { "tickets": [ { "id": "t_...", "title": "...", "column": "todo", ... } ] }
+```
+
+### PATCH /tickets/:id — move a ticket
+
+Body: `{ "column": "backlog" | "todo" | "doing" | "done" }`. Finds the ticket
+anywhere on the projects board and moves it atomically. 404 if the id doesn't
+exist.
+
+```bash
+curl -sS -X PATCH -H "Authorization: Bearer $KODER_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"column":"doing"}' "$KODER_API/tickets/t_abc123_x1y2z"
+```
+
+Or use the wrapper for all of the above:
+
+```bash
+./scripts/koder-ticket.sh "Fix login bug" --project holitrackr --priority high
+./scripts/koder-ticket.sh list --project holitrackr --column todo
+./scripts/koder-ticket.sh move t_abc123_x1y2z doing
+```
 
 ## Security note
 

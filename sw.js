@@ -10,7 +10,7 @@
  *   2. activate → old version is gone; clean up outdated caches here.
  *   3. fetch    → fires for EVERY network request; decide cache vs network.
  *
- * Bump this version string whenever you change any cached file.
+ * Bump this version string whenever you change any cached file
  * A byte-different sw.js is what triggers the browser to install
  * the new version (the "update flow" you'll see in app.js).
  */

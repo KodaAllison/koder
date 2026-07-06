@@ -15,9 +15,11 @@
  *    land on the same rev.
  *
  * Endpoints (all need `Authorization: Bearer $KODER_TOKEN`):
- *   GET  /state    → full doc (or an empty rev-0 doc on first run)
- *   PUT  /state    → { baseRev, board } → { rev, updatedAt } | 409
- *   POST /tickets  → { title, note?, project?, column?, priority? } → { card, rev }
+ *   GET   /state        → full doc (or an empty rev-0 doc on first run)
+ *   PUT   /state        → { baseRev, board } → { rev, updatedAt } | 409
+ *   POST  /tickets      → { title, note?, project?, column?, priority? } → { card, rev }
+ *   GET   /tickets      → compact list; filters: ?project=<id>&column=<id>
+ *   PATCH /tickets/:id  → { column } → moves the ticket → { card, column, rev }
  *
  * Env: KODER_TOKEN (required), KODER_ORIGIN (optional — lock CORS to the
  * deployed board origin instead of "*" once you know it).
@@ -111,6 +113,60 @@ Deno.serve(async (req: Request) => {
     const res = await kv.atomic().check(entry).set(KEY, doc).commit();
     if (!res.ok) return json({ error: "conflict: concurrent write, retry" }, 409);
     return json({ rev: doc.rev, updatedAt: doc.updatedAt });
+  }
+
+  /* ---- GET /tickets: compact read for agents ----
+   * Flattens the projects board into one list with a `column` field, so a
+   * caller can see work without understanding the board document. */
+  if (url.pathname === "/tickets" && req.method === "GET") {
+    const entry = await kv.get<Doc>(KEY);
+    const board = (entry.value ?? emptyDoc()).board;
+    const project = url.searchParams.get("project");
+    const column = url.searchParams.get("column");
+    const tickets: (Card & { column: string })[] = [];
+    for (const [col, cards] of Object.entries(board.projects ?? {})) {
+      if (column && col !== column) continue;
+      for (const c of cards ?? []) {
+        if (project && c.project !== project) continue;
+        tickets.push({ ...c, column: col });
+      }
+    }
+    return json({ tickets });
+  }
+
+  /* ---- PATCH /tickets/:id: move a ticket between columns ----
+   * The agent workflow: move to "doing" when picking work up, "done" when
+   * finished. Same atomic read-modify-write pattern as POST. */
+  const moveMatch = url.pathname.match(/^\/tickets\/([^/]+)$/);
+  if (moveMatch && req.method === "PATCH") {
+    const id = moveMatch[1];
+    const body = await req.json().catch(() => null);
+    if (!body || !PROJECT_COLUMNS.includes(body.column)) {
+      return json({ error: "column is required", valid: PROJECT_COLUMNS }, 400);
+    }
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const entry = await kv.get<Doc>(KEY);
+      const cur = structuredClone(entry.value ?? emptyDoc());
+      let card: Card | null = null;
+      for (const cards of Object.values(cur.board.projects ?? {})) {
+        const i = (cards ?? []).findIndex((c) => c.id === id);
+        if (i !== -1) {
+          card = cards.splice(i, 1)[0];
+          break;
+        }
+      }
+      if (!card) return json({ error: `no ticket with id "${id}"` }, 404);
+      cur.board.projects ??= {};
+      (cur.board.projects[body.column] ??= []).push(card);
+      const doc: Doc = {
+        rev: cur.rev + 1,
+        updatedAt: new Date().toISOString(),
+        board: cur.board,
+      };
+      const res = await kv.atomic().check(entry).set(KEY, doc).commit();
+      if (res.ok) return json({ card, column: body.column, rev: doc.rev });
+    }
+    return json({ error: "write contention, retry" }, 503);
   }
 
   /* ---- POST /tickets: the agent/CLI entrypoint ----

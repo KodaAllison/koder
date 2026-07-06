@@ -1,56 +1,76 @@
 ---
 name: koder-ticket
-description: Add a ticket to Koda's personal kanban board (Koder). Use whenever Koda asks to file, track, log, or add a ticket/task/todo to "the board", "koder", or "my kanban" — including logging follow-up work discovered while coding in any project.
+description: Read, add, and move tickets on Koda's personal kanban board (Koder). Use whenever Koda asks to file/track/log a ticket or todo on "the board", "koder", or "my kanban" — or asks to look at, pick up, or work on tickets for a project (e.g. "grab a ticket from holitrackr and work on it").
 ---
 
-# Add a ticket to the Koder board
+# Work with tickets on the Koder board
 
-Koda's kanban board syncs through a small API. The easiest way to create a
-ticket is the bundled CLI (works from any directory):
+Koda's kanban board syncs through a small API. Use the bundled CLI (works from
+any directory):
 
 ```bash
-~/Code/koder/scripts/koder-ticket.sh "Ticket title" [options]
+~/Code/koder/scripts/koder-ticket.sh <command>
 ```
 
-Options:
+## Commands
 
-- `--project <id>` — which project the ticket belongs to. Valid ids are the
-  folder names under `~/Code` (e.g. `holitrackr`, `SART`, `strava-worker`).
-  When working inside one of those repos, default to that repo's folder name.
-  Omit for a general/unassigned ticket.
-- `--column <id>` — `backlog` (default) | `todo` | `doing` | `done`
-- `--priority <level>` — `low` | `med` (default) | `high`
-- `--note "<text>"` — details/context. Multiline is fine.
+**List tickets** (one per line: `id | column | priority | [project] title`):
 
-Example — logging follow-up work found during a session in holitrackr:
+```bash
+~/Code/koder/scripts/koder-ticket.sh list --project holitrackr --column todo
+```
+
+Both filters optional. Valid project ids are the folder names under `~/Code`
+(e.g. `holitrackr`, `SART`, `strava-worker`). Columns: `backlog`, `todo`,
+`doing`, `done`.
+
+**Add a ticket:**
 
 ```bash
 ~/Code/koder/scripts/koder-ticket.sh "Fix flaky auth test" \
   --project holitrackr --column backlog --priority med \
-  --note "test_login_retry intermittently fails; suspect clock mock. Found during session on 2026-07-05."
+  --note "test_login_retry intermittently fails; suspect clock mock."
 ```
 
-On success it prints `created ticket <id> in <column>`. A non-zero exit prints
-the server's error (e.g. invalid column).
+Defaults: column `backlog`, priority `med`, project unassigned. When working
+inside one of the `~/Code` repos, default `--project` to that folder's name.
+
+**Move a ticket:**
+
+```bash
+~/Code/koder/scripts/koder-ticket.sh move t_abc123_x1y2z doing
+```
+
+## The "pick up work" workflow
+
+When Koda says "look at the tickets on X and work on one":
+
+1. `list --project X --column todo` (fall back to `--column backlog` if empty)
+2. Pick the highest-priority ticket you can actually complete; tell Koda which
+   and why before starting
+3. Move it to `doing`
+4. Do the work in the project repo
+5. When finished and verified, move it to `done`; if you had to stop partway,
+   move it back to `todo` and add a new ticket noting remaining work
 
 ## Conventions
 
-- Keep titles short and imperative; put context in `--note`.
-- Don't ask which column unless it's ambiguous — new work goes to `backlog`,
-  things Koda says they'll do next go to `todo`.
-- One ticket per distinct piece of work; don't bundle.
+- Titles short and imperative; context goes in `--note`
+- New work → `backlog`; things Koda will do next → `todo`
+- One ticket per distinct piece of work; don't bundle
 
 ## Fallback: raw API
 
-If the script is unavailable, POST directly. Credentials live in
-`~/Code/koder/scripts/.koder.env` (defines `KODER_API` and `KODER_TOKEN`):
+Credentials live in `~/Code/koder/scripts/.koder.env` (`KODER_API`,
+`KODER_TOKEN`); all requests need `Authorization: Bearer $KODER_TOKEN`.
 
 ```bash
 source ~/Code/koder/scripts/.koder.env
-curl -sS -X POST -H "Authorization: Bearer $KODER_TOKEN" \
-  -H 'Content-Type: application/json' \
-  -d '{"title":"...","project":"...","column":"backlog","priority":"med","note":"..."}' \
-  "${KODER_API%/}/tickets"
+curl -sS -H "Authorization: Bearer $KODER_TOKEN" "${KODER_API%/}/tickets?project=holitrackr"
+curl -sS -X POST -H "Authorization: Bearer $KODER_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"title":"...","project":"...","column":"backlog"}' "${KODER_API%/}/tickets"
+curl -sS -X PATCH -H "Authorization: Bearer $KODER_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"column":"doing"}' "${KODER_API%/}/tickets/<id>"
 ```
 
 Full API docs: `~/Code/koder/server/README.md`.
