@@ -3,6 +3,7 @@
   "projects": [
     { "id": "crook-community", "name": "crook-community", "color": "#eef1fe", "text": "#3b4bb8" },
     { "id": "holitrackr", "name": "holitrackr", "color": "#ccfbf1", "text": "#0f766e" },
+    { "id": "koder", "name": "koder", "color": "#f3e8ff", "text": "#7e22ce" },
     { "id": "portfolio-new", "name": "portfolio-new", "color": "#ede9fe", "text": "#6d28d9" },
     { "id": "portfolio-website", "name": "portfolio-website", "color": "#fef3c7", "text": "#b45309" },
     { "id": "SART", "name": "SART", "color": "#fef3c7", "text": "#b45309" },

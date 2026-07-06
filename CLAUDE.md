@@ -1,7 +1,13 @@
 # Koder
 
-Personal Kanban PWA. Static, no build step: `index.html` + `css/styles.css` + `js/app.js`,
-data from `js/projects.json`. Service worker in `sw.js`.
+Personal Kanban PWA. Static, no build step. `index.html` + `css/styles.css` + ES modules
+under `js/` (`app.js` entry → `store.js` pure logic, `state.js` persistence, `sync.js`
+server sync, `board.js`/`sidebar.js`/`modal.js` UI, `pwa.js` SW glue, `render.js` repaint
+seam), data from `js/projects.json`. Service worker in `sw.js` — adding a JS module means
+adding it to `SHELL_ASSETS` and bumping `CACHE_NAME`.
+
+Tests: `node --test` from the repo root (covers the pure logic in `js/store.js` — keep store.js free
+of DOM/localStorage so this stays true). JS uses `// @ts-check` + JSDoc types.
 
 ## Working preferences
 

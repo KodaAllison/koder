@@ -37,8 +37,9 @@ palette_index() {
 json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 
 # Collect subfolder names (glob skips dotfolders), case-insensitive sort.
-# SKIP excludes the board itself and non-project dirs.
-SKIP="node_modules koder koder-phase1"
+# SKIP excludes non-project dirs. (koder itself is a project now — it has
+# its own tickets on the board.)
+SKIP="node_modules koder-phase1"
 mapfile -t names < <(
   for d in "$CODE_DIR"/*/; do
     n="$(basename "$d")"

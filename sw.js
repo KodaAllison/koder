@@ -14,15 +14,25 @@
  * A byte-different sw.js is what triggers the browser to install
  * the new version (the "update flow" you'll see in app.js).
  */
-const CACHE_NAME = 'kanban-shell-v10';
+const CACHE_NAME = 'kanban-shell-v12';
 
 /* The "app shell": the minimal static files needed to render the UI.
- * We cache these at install time so the app boots with zero network. */
+ * We cache these at install time so the app boots with zero network.
+ * NB: app.js is an ES module — every module it imports must be listed here
+ * too, or the app won't boot offline. */
 const SHELL_ASSETS = [
   './',
   './index.html',
   './css/styles.css',
   './js/app.js',
+  './js/pwa.js',
+  './js/store.js',
+  './js/state.js',
+  './js/sync.js',
+  './js/render.js',
+  './js/board.js',
+  './js/sidebar.js',
+  './js/modal.js',
   './js/projects.json',
   './manifest.webmanifest',
   './icons/icon-192.png',

@@ -42,20 +42,48 @@ type Card = {
   created: number;
   project: string | null;
 };
+type Board = {
+  projects: Record<string, Card[]>;
+  life: Record<string, Card[]>;
+  lifeMeta: Record<string, unknown>;
+};
 type Doc = {
   rev: number;
   updatedAt: string | null;
-  // deno-lint-ignore no-explicit-any
-  board: { projects: Record<string, any[]>; life: Record<string, any[]>; lifeMeta: Record<string, unknown> };
+  board: Board;
 };
 
 function emptyDoc(): Doc {
   return { rev: 0, updatedAt: null, board: { projects: {}, life: {}, lifeMeta: {} } };
 }
 
+/* Light shape check for a client-PUT board. The client's normalize() repairs
+ * boards on read, but the server is the canonical copy — don't let a buggy
+ * caller store something that isn't even board-shaped. Column values must be
+ * arrays of objects that at minimum carry an id and a title. */
+function isBoardShaped(b: unknown): b is Board {
+  if (!b || typeof b !== "object") return false;
+  const o = b as Record<string, unknown>;
+  for (const key of ["projects", "life"]) {
+    const cols = o[key];
+    if (cols == null) continue; // client normalize() fills missing boards
+    if (typeof cols !== "object") return false;
+    for (const cards of Object.values(cols as Record<string, unknown>)) {
+      if (!Array.isArray(cards)) return false;
+      for (const c of cards) {
+        if (!c || typeof c !== "object") return false;
+        const card = c as Record<string, unknown>;
+        if (typeof card.id !== "string" || typeof card.title !== "string") return false;
+      }
+    }
+  }
+  if (o.lifeMeta != null && typeof o.lifeMeta !== "object") return false;
+  return true;
+}
+
 const CORS: Record<string, string> = {
   "Access-Control-Allow-Origin": Deno.env.get("KODER_ORIGIN") ?? "*",
-  "Access-Control-Allow-Methods": "GET, PUT, POST, OPTIONS",
+  "Access-Control-Allow-Methods": "GET, PUT, POST, PATCH, OPTIONS",
   "Access-Control-Allow-Headers": "Authorization, Content-Type",
   "Access-Control-Max-Age": "86400",
 };
@@ -97,8 +125,8 @@ Deno.serve(async (req: Request) => {
     } catch {
       return json({ error: "invalid JSON" }, 400);
     }
-    if (!body || typeof body !== "object" || !body.board || typeof body.board !== "object") {
-      return json({ error: "expected { baseRev, board }" }, 400);
+    if (!body || typeof body !== "object" || !isBoardShaped(body.board)) {
+      return json({ error: "expected { baseRev, board } with board-shaped board" }, 400);
     }
     const entry = await kv.get<Doc>(KEY);
     const cur = entry.value ?? emptyDoc();
@@ -108,7 +136,7 @@ Deno.serve(async (req: Request) => {
     const doc: Doc = {
       rev: cur.rev + 1,
       updatedAt: new Date().toISOString(),
-      board: body.board as Doc["board"], // shape-checked above (object, non-null)
+      board: body.board,
     };
     const res = await kv.atomic().check(entry).set(KEY, doc).commit();
     if (!res.ok) return json({ error: "conflict: concurrent write, retry" }, 409);

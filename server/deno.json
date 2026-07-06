@@ -1,5 +1,6 @@
 {
   "tasks": {
-    "dev": "deno run --watch --unstable-kv --allow-net --allow-env main.ts"
+    "dev": "deno run --watch --unstable-kv --allow-net --allow-env main.ts",
+    "static": "PORT=8001 deno run --allow-net --allow-env --allow-read static.ts"
   }
 }

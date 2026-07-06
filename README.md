@@ -33,8 +33,17 @@ To enable sync, copy `js/config.example.js` to `js/config.local.js`
 | Path | What it is |
 |---|---|
 | `index.html` | The app shell — one page, no templates |
-| `js/app.js` | The entire app: rendering, drag & drop, PWA glue, sync |
+| `js/app.js` | Entry point — wires the modules below together |
+| `js/store.js` | Pure board logic (columns, migrations, merge) — node-testable |
+| `js/state.js` | App state + localStorage persistence |
+| `js/sync.js` | Server sync: debounced push, focus/interval pull, 409 merge |
+| `js/board.js` | Kanban rendering + drag & drop |
+| `js/sidebar.js` | Life dashboard sidebar (focus / dates / stickies) |
+| `js/modal.js` | Ticket create/edit modal |
+| `js/pwa.js` | SW registration, update toast, install button, offline badge |
+| `js/render.js` | Repaint indirection (keeps the module graph acyclic) |
 | `css/styles.css` | All styling |
+| `tests/` | `node --test` (from the repo root) — covers `js/store.js` |
 | `sw.js` | Service worker — offline caching + update flow |
 | `manifest.webmanifest` | Makes the app installable |
 | `js/projects.json` | Generated project list (don't edit by hand) |
@@ -86,7 +95,7 @@ mkdir -p ~/.claude/skills && cp -r skills/koder-ticket ~/.claude/skills/
    cache-first (offline boot); `projects.json` and `config.local.js` are
    network-first because they change out-of-band. Read the lifecycle comments:
    install → activate → fetch.
-3. **Registration + install UX** — top of `js/app.js`. Version-update "Reload"
+3. **Registration + install UX** — `js/pwa.js`. Version-update "Reload"
    toast, custom Install button via `beforeinstallprompt`. The SW is disabled
    on localhost so development never fights stale caches.
 

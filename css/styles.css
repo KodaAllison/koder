@@ -29,8 +29,21 @@ h1 { font-size: 18px; margin: 0; font-weight: 650; }
   background: var(--med); color: var(--med-t);
 }
 
-.tabs { display: flex; gap: 4px; padding: 14px 20px 0; border-bottom: 1px solid var(--border); }
+/* Sync failing (HTTP error, not mere offline) — red: needs user attention. */
+.sync-badge {
+  font-size: 11px; font-weight: 650; padding: 3px 10px; border-radius: 10px;
+  background: var(--high); color: var(--high-t);
+}
+
+.tabs {
+  display: flex; gap: 4px; padding: 14px 20px 0; border-bottom: 1px solid var(--border);
+  /* 9+ projects overflow a phone — scroll the tab strip instead of pushing
+   * tabs off-screen. Hide the scrollbar; the fade + swipe imply scrollability. */
+  overflow-x: auto; flex-wrap: nowrap; scrollbar-width: none; -webkit-overflow-scrolling: touch;
+}
+.tabs::-webkit-scrollbar { display: none; }
 .tab {
+  flex: 0 0 auto; white-space: nowrap;
   padding: 8px 18px; border: none; background: none; cursor: pointer;
   font-size: 14px; font-weight: 550; color: var(--muted);
   border-bottom: 2px solid transparent; margin-bottom: -1px; border-radius: 6px 6px 0 0;
@@ -48,8 +61,18 @@ h1 { font-size: 18px; margin: 0; font-weight: 650; }
   .board { grid-template-columns: repeat(2, 1fr); }
   .main { flex-direction: column; }
   .life-sidebar { width: auto; position: static; max-height: none; }
+  /* Sidebar is no longer sticky here, so clipping x is safe — keeps a card
+   * clone dragged near the edge from adding a horizontal scrollbar. */
+  body { overflow-x: hidden; }
 }
-@media (max-width: 520px) { .board { grid-template-columns: 1fr; } }
+@media (max-width: 520px) {
+  /* Single column: the projects board's 4 cols and Life's 5 all stack. */
+  .board { grid-template-columns: 1fr; gap: 12px; }
+  header { padding: 14px 14px; }
+  .tabs { padding: 12px 14px 0; }
+  .main { padding: 14px 14px 24px; gap: 14px; }
+  h1 { font-size: 16px; }
+}
 
 /* Life dashboard sidebar — right of the board, Life tab only. Borderless/airy:
  * sections are separated by whitespace + thin dividers, no cards. Only the
@@ -154,9 +177,21 @@ h1 { font-size: 18px; margin: 0; font-weight: 650; }
 .card {
   background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
   padding: 10px 12px; cursor: grab; user-select: none;
+  /* Let a vertical swipe scroll the board; the drag code takes over via a
+   * press-and-hold. -webkit-touch-callout stops iOS's long-press menu. */
+  touch-action: pan-y; -webkit-touch-callout: none;
 }
 .card:hover { border-color: var(--accent); }
 .card.dragging { opacity: .4; }
+
+/* The clone that follows the pointer during a drag. pointer-events:none so
+ * elementFromPoint sees the column underneath, not the clone. */
+.drag-clone {
+  position: fixed; z-index: 50; pointer-events: none; margin: 0;
+  cursor: grabbing; transform: rotate(1.5deg);
+  box-shadow: 0 12px 28px rgba(0,0,0,.5); border-color: var(--accent);
+}
+body.dragging-active { cursor: grabbing; }
 .card-title { font-size: 14px; font-weight: 550; line-height: 1.3; }
 .card-note { font-size: 12.5px; color: var(--muted); margin-top: 4px; white-space: pre-wrap; line-height: 1.35; }
 .card-meta { display: flex; align-items: center; gap: 6px; margin-top: 8px; }
