@@ -27,9 +27,20 @@
  * Local dev:  KODER_TOKEN=dev deno task dev   (see deno.json)
  */
 
+import { serveDir } from "jsr:@std/http/file-server";
+import { fromFileUrl } from "jsr:@std/path";
+
 const kv = await Deno.openKv();
 const TOKEN = Deno.env.get("KODER_TOKEN") ?? "";
 const KEY = ["board"];
+
+// Repo root (this file is in server/) — where the PWA's static files live, so
+// one app can serve the frontend and the API. Derive from the module URL;
+// fall back to cwd (the repo root under Deno Deploy) if it isn't a file URL.
+const ROOT = (() => {
+  try { return fromFileUrl(new URL("../", import.meta.url)); }
+  catch { return "."; }
+})();
 
 const PROJECT_COLUMNS = ["backlog", "todo", "doing", "done"];
 const PRIORITIES = ["low", "med", "high"];
@@ -95,12 +106,43 @@ function json(body: unknown, status = 200): Response {
   });
 }
 
+/* The authenticated API surface. A GET to anything else is a static frontend
+ * request (the PWA's files) and skips the token gate. */
+function isApiPath(p: string): boolean {
+  return p === "/state" || p === "/tickets" || p.startsWith("/tickets/");
+}
+
+/* Generate the gitignored js/config.local.js so the token lives in env, not
+ * git. base is this same origin — board and API are one app, so the browser's
+ * calls are same-origin and never hit CORS. TOKEN is guaranteed set by the
+ * time this runs (the handler 500s earlier otherwise). */
+function configJs(origin: string): Response {
+  const cfg = { base: origin, token: TOKEN };
+  return new Response(`window.KODER_API = ${JSON.stringify(cfg)};\n`, {
+    headers: {
+      "Content-Type": "text/javascript; charset=utf-8",
+      "Cache-Control": "no-store", // token/URL can change without a shell redeploy
+    },
+  });
+}
+
 Deno.serve(async (req: Request) => {
   const url = new URL(req.url);
 
   if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
 
   if (!TOKEN) return json({ error: "server misconfigured: KODER_TOKEN not set" }, 500);
+
+  /* ---- Static frontend (no auth) ----
+   * Any GET that isn't an API path serves the PWA's files, so this one app is
+   * also the board a phone loads over HTTPS. js/config.local.js is generated
+   * from env; everything else comes off disk. API paths fall through to the
+   * token gate below. */
+  if (req.method === "GET" && !isApiPath(url.pathname)) {
+    if (url.pathname === "/js/config.local.js") return configJs(url.origin);
+    return serveDir(req, { fsRoot: ROOT, quiet: true });
+  }
+
   if (req.headers.get("Authorization") !== `Bearer ${TOKEN}`) {
     return json({ error: "unauthorized" }, 401);
   }

@@ -34,35 +34,29 @@ KODER_TOKEN=dev deno task dev     # http://localhost:8000, KV in a local file
 
 ## Host the frontend (so it works on your phone)
 
-`main.ts` is only the API. To reach the board on a phone you also need the
-static frontend served over HTTPS (a service worker — install + offline —
-requires it; a LAN `http://` address won't do). `static.ts` is a second Deno
-Deploy app that serves the repo's static files and, crucially, *generates*
-`js/config.local.js` from env vars — so the sync token lives in Deno Deploy's
-settings instead of being committed (the file stays gitignored).
+`main.ts` serves **both** the API and the PWA's static files, so the same one
+Deno Deploy app is your board — reachable over HTTPS, which a phone needs for
+install + offline (a LAN `http://` address won't do). No second app, and no
+CORS: the board calls its own origin. Any `GET` that isn't an API path
+(`/state`, `/tickets…`) is served off disk; `js/config.local.js` is *generated*
+from the token in env, so the secret lives in Deno Deploy settings and the file
+stays gitignored.
 
-1. https://dash.deno.com → New App → link this same repo.
-2. Run as a **dynamic app** (again decline the static-site preset), entrypoint
-   `server/static.ts`.
-3. Settings → Environment Variables:
-   - `KODER_API_BASE` = the sync app's URL (e.g. `https://koder.<org>.deno.net`)
-   - `KODER_API_TOKEN` = the **same** value as the sync app's `KODER_TOKEN`
-4. Deploy. Note this app's URL — that's your board.
-5. Back on the **sync** app, set `KODER_ORIGIN` to this board URL to lock CORS
-   to just your frontend, then redeploy.
-6. On the phone: open the board URL → browser menu → **Add to Home Screen**.
+If the sync app from the section above is already deployed, you're basically
+done — just **redeploy** it with this version of `main.ts` and open its URL:
+
+1. dash.deno.com → your app → it redeploys on push (or hit Redeploy).
+2. Confirm `KODER_TOKEN` is set and a KV database is attached (as above).
+3. On the phone: open the app URL → browser menu → **Add to Home Screen**.
    Test offline (airplane mode) and that a ticket added on the PC shows up.
 
-Local dev (serves on `http://localhost:8001`, alongside the API on `:8000`):
+Local dev serves the whole board at `http://localhost:8000`:
 
 ```bash
 cd server
-KODER_API_BASE=http://localhost:8000 KODER_API_TOKEN=dev deno task static
+KODER_TOKEN=dev deno task dev
+# open http://localhost:8000 — frontend + API from one process
 ```
-
-> Alternative: fold the static serving into `main.ts` so board + API are one
-> same-origin app (no CORS, no `KODER_ORIGIN` needed). Kept separate here so the
-> API stays a focused file and the frontend can scale/CDN independently.
 
 ## API
 
