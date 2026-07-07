@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import {
   BOARDS, boardFor, colsFor, cardMatchesView,
   normalize, migrateLifeColumns, migrateLifeToDashboard, sortByPriority,
-  allCardIds, mergeBoards, boardHasContent, uid,
+  allCardIds, lifeMetaIds, mergeBoards, boardHasContent, uid,
 } from '../js/store.js';
 
 function card(id, extra = {}) {
@@ -171,6 +171,53 @@ test('mergeBoards merges into both boards, creating unknown columns if needed', 
   assert.equal(added, 2);
   assert.equal(local.life.todo[0].id, 'lifecard');
   assert.equal(local.projects.custom[0].id, 'oddcol');
+});
+
+test('mergeBoards keeps remotely-added lifeMeta items', () => {
+  const local = normalize({ lifeMeta: { stickies: [{ id: 's1', text: 'mine', color: 'yellow' }] } });
+  const server = normalize({
+    lifeMeta: {
+      focus: [{ id: 'f1', text: 'remote focus', done: false }],
+      dates: [{ id: 'd1', title: 'remote date', date: '2026-08-01' }],
+      stickies: [
+        { id: 's1', text: 'mine', color: 'yellow' },
+        { id: 's2', text: 'remote sticky', color: 'pink' },
+      ],
+    },
+  });
+  const added = mergeBoards(local, server, new Set(['s1']));
+  assert.equal(added, 3);
+  assert.deepEqual(local.lifeMeta.focus.map(i => i.id), ['f1']);
+  assert.deepEqual(local.lifeMeta.dates.map(i => i.id), ['d1']);
+  assert.deepEqual(local.lifeMeta.stickies.map(i => i.id), ['s1', 's2']);
+});
+
+test('mergeBoards lets a local lifeMeta deletion win over a known server item', () => {
+  // 'gone' was synced before (known id) and deleted locally — must NOT resurrect.
+  const local = normalize({});
+  const server = normalize({ lifeMeta: { stickies: [{ id: 'gone', text: 'x', color: 'yellow' }] } });
+  const added = mergeBoards(local, server, new Set(['gone']));
+  assert.equal(added, 0);
+  assert.deepEqual(local.lifeMeta.stickies, []);
+});
+
+test('mergeBoards lets a local lifeMeta edit win over the server copy', () => {
+  const local = normalize({ lifeMeta: { focus: [{ id: 'f1', text: 'edited locally', done: true }] } });
+  const server = normalize({ lifeMeta: { focus: [{ id: 'f1', text: 'stale server text', done: false }] } });
+  mergeBoards(local, server, new Set(['f1']));
+  assert.equal(local.lifeMeta.focus.length, 1);
+  assert.equal(local.lifeMeta.focus[0].text, 'edited locally');
+});
+
+test('lifeMetaIds spans focus, dates, and stickies', () => {
+  const s = normalize({
+    lifeMeta: {
+      focus: [{ id: 'f1', text: 'x', done: false }],
+      dates: [{ id: 'd1', title: 'x', date: '2026-01-01' }],
+      stickies: [{ id: 's1', text: 'x', color: 'yellow' }],
+    },
+  });
+  assert.deepEqual([...lifeMetaIds(s)].sort(), ['d1', 'f1', 's1']);
 });
 
 /* boardHasContent guards sync's "adopt the server board" paths: a wrong false

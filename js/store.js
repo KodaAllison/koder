@@ -201,6 +201,17 @@ export function allCardIds(s) {
   return ids;
 }
 
+/* The lifeMeta arrays that sync merges item-by-item. `notes` is excluded: it's
+ * the legacy scratchpad string (no id), migrated into stickies by normalize. */
+export const LIFE_META_LISTS = /** @type {const} */ (['focus', 'dates', 'stickies']);
+
+/** Every lifeMeta item id (focus/dates/stickies). @param {BoardState} s @returns {Set<string>} */
+export function lifeMetaIds(s) {
+  const ids = new Set();
+  LIFE_META_LISTS.forEach(key => s.lifeMeta[key].forEach(item => ids.add(item.id)));
+  return ids;
+}
+
 /* True if the board holds anything a user could lose: cards on either board,
  * or any lifeMeta sidebar content (focus items, dates, stickies). Sync uses
  * this to decide whether adopting a server board would erase local-only data. */
@@ -212,16 +223,18 @@ export function boardHasContent(s) {
     s.lifeMeta.stickies.length > 0;
 }
 
-/* Merge a fresher server board into dirty local state: local wins card-by-card,
- * but server cards we've never synced (i.e. agent-added) are kept. `knownIds`
+/* Merge a fresher server board into dirty local state: local wins item-by-item,
+ * but server items we've never synced (i.e. added remotely) are kept. `knownIds`
  * is the id set recorded at the last sync point — it's how we tell "added
  * remotely" (unknown id → keep) from "deleted locally" (known id → the local
- * deletion wins). Mutates `local`; returns how many cards were adopted. */
+ * deletion wins). Covers cards on both boards AND the lifeMeta arrays
+ * (focus/dates/stickies), so a 409 push can't clobber sidebar items another
+ * device added. Mutates `local`; returns how many items were adopted. */
 /**
  * @param {BoardState} local      already-normalized local state (mutated)
  * @param {BoardState} server     already-normalized server board
- * @param {Set<string>} knownIds  card ids recorded at the last sync point
- * @returns {number}              count of remotely-added cards merged in
+ * @param {Set<string>} knownIds  item ids recorded at the last sync point
+ * @returns {number}              count of remotely-added items merged in
  */
 export function mergeBoards(local, server, knownIds) {
   const localIds = allCardIds(local);
@@ -234,6 +247,14 @@ export function mergeBoards(local, server, knownIds) {
         local[boardId][colId].push(card);
         added++;
       });
+    });
+  });
+  const localMetaIds = lifeMetaIds(local);
+  LIFE_META_LISTS.forEach(key => {
+    /** @type {{id: string}[]} */ (server.lifeMeta[key]).forEach(item => {
+      if (localMetaIds.has(item.id) || knownIds.has(item.id)) return;
+      /** @type {{id: string}[]} */ (local.lifeMeta[key]).push(item);
+      added++;
     });
   });
   return added;
