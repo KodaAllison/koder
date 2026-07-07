@@ -14,7 +14,7 @@
  * A byte-different sw.js is what triggers the browser to install
  * the new version (the "update flow" you'll see in app.js).
  */
-const CACHE_NAME = 'kanban-shell-v16';
+const CACHE_NAME = 'kanban-shell-v17';
 
 /* The "app shell": the minimal static files needed to render the UI.
  * We cache these at install time so the app boots with zero network.
