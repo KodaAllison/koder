@@ -99,11 +99,19 @@ export async function pushState() {
   SYNC.pushing = true;
   try {
     let res = await api('PUT', '/state', { baseRev: SYNC.rev, board: state });
-    if (res.status === 409) {
-      // Someone wrote since our last sync (usually an agent ticket). Merge
-      // their additions into our board, then retry on top of their rev.
+    // A 409 means someone wrote since our baseRev — usually agent tickets via
+    // POST /tickets, which can arrive in a burst that bumps rev several times.
+    // Merge their additions and retry on the fresh rev, looping because another
+    // write can land between our GET and our retry PUT so a single pass isn't
+    // enough. Mirrors the server's own 5-attempt commit loop; each GET's
+    // round-trip is the natural backoff, so no explicit sleep is needed.
+    for (let attempt = 0; res.status === 409 && attempt < 5; attempt++) {
       const cur = await api('GET', '/state');
-      if (cur.ok) mergeRemote(await cur.json());
+      // A failed re-GET means we didn't merge, so baseRev is unchanged and the
+      // next PUT would just 409 again — bail and surface the GET's real error
+      // below instead of masking it as an unresolved conflict.
+      if (!cur.ok) { res = cur; break; }
+      mergeRemote(await cur.json());
       res = await api('PUT', '/state', { baseRev: SYNC.rev, board: state });
     }
     if (res.ok) {
