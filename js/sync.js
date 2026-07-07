@@ -17,7 +17,7 @@
  * UI hooks (render / editorBusy / onStatus) are injected via initSync() so
  * this module never imports the render layer. */
 
-import { normalize, allCardIds, mergeBoards, boardHasContent } from './store.js';
+import { normalize, allCardIds, lifeMetaIds, mergeBoards, boardHasContent } from './store.js';
 import { STORE_KEY, state, setState, writeCache, onSave } from './state.js';
 
 export const SYNC = {
@@ -57,15 +57,17 @@ function api(method, path, body) {
 
 export function markDirty() { SYNC.dirty = true; localStorage.setItem(STORE_KEY + ':dirty', '1'); }
 
-/* Record a sync point: the rev plus the card ids the server knows about.
- * The id set is how a 409-merge tells "added remotely" (unknown id → keep)
- * from "deleted locally" (known id → the local deletion wins). */
+/* Record a sync point: the rev plus the item ids the server knows about —
+ * cards on both boards and lifeMeta items (focus/dates/stickies), which merge
+ * the same way. The id set is how a 409-merge tells "added remotely" (unknown
+ * id → keep) from "deleted locally" (known id → the local deletion wins). */
 function adoptRev(rev) {
   SYNC.rev = rev;
   SYNC.dirty = false;
   localStorage.setItem(STORE_KEY + ':rev', String(rev));
   localStorage.removeItem(STORE_KEY + ':dirty');
-  localStorage.setItem(STORE_KEY + ':syncedIds', JSON.stringify([...allCardIds(state)]));
+  localStorage.setItem(STORE_KEY + ':syncedIds',
+    JSON.stringify([...allCardIds(state), ...lifeMetaIds(state)]));
 }
 
 function knownIds() {
