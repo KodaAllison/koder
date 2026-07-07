@@ -17,7 +17,7 @@
  * UI hooks (render / editorBusy / onStatus) are injected via initSync() so
  * this module never imports the render layer. */
 
-import { normalize, allCardIds, mergeBoards } from './store.js';
+import { normalize, allCardIds, mergeBoards, boardHasContent } from './store.js';
 import { STORE_KEY, state, setState, writeCache, onSave } from './state.js';
 
 export const SYNC = {
@@ -149,14 +149,22 @@ export async function pullState() {
     hooks.onStatus(null);
     if (doc.rev === 0) {
       // Empty server + non-empty local board → first run: seed the server.
-      if (allCardIds(state).size || state.lifeMeta.focus.length ||
-          state.lifeMeta.dates.length || state.lifeMeta.stickies.length) {
+      if (boardHasContent(state)) {
         markDirty();
         schedulePush(0);
       }
       return;
     }
     if (doc.rev <= SYNC.rev) return; // nothing new
+    // A device that used the app before sync was configured has content but
+    // has never synced (rev 0, not dirty). Adopting the server board here
+    // would silently erase data that never reached the server — push instead;
+    // the 409-merge path unions the two boards.
+    if (SYNC.rev === 0 && boardHasContent(state)) {
+      markDirty();
+      schedulePush(0);
+      return;
+    }
     setState(normalize(doc.board || {}));
     writeCache();
     adoptRev(doc.rev);

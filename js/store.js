@@ -201,6 +201,17 @@ export function allCardIds(s) {
   return ids;
 }
 
+/* True if the board holds anything a user could lose: cards on either board,
+ * or any lifeMeta sidebar content (focus items, dates, stickies). Sync uses
+ * this to decide whether adopting a server board would erase local-only data. */
+/** @param {BoardState} s @returns {boolean} */
+export function boardHasContent(s) {
+  return allCardIds(s).size > 0 ||
+    s.lifeMeta.focus.length > 0 ||
+    s.lifeMeta.dates.length > 0 ||
+    s.lifeMeta.stickies.length > 0;
+}
+
 /* Merge a fresher server board into dirty local state: local wins card-by-card,
  * but server cards we've never synced (i.e. agent-added) are kept. `knownIds`
  * is the id set recorded at the last sync point — it's how we tell "added

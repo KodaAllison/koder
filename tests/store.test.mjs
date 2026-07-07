@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import {
   BOARDS, boardFor, colsFor, cardMatchesView,
   normalize, migrateLifeColumns, migrateLifeToDashboard, sortByPriority,
-  allCardIds, mergeBoards, uid,
+  allCardIds, mergeBoards, boardHasContent, uid,
 } from '../js/store.js';
 
 function card(id, extra = {}) {
@@ -171,6 +171,25 @@ test('mergeBoards merges into both boards, creating unknown columns if needed', 
   assert.equal(added, 2);
   assert.equal(local.life.todo[0].id, 'lifecard');
   assert.equal(local.projects.custom[0].id, 'oddcol');
+});
+
+/* boardHasContent guards sync's "adopt the server board" paths: a wrong false
+ * here means a never-synced device's data gets overwritten on first pull. */
+test('boardHasContent is false only on a truly empty board', () => {
+  assert.equal(boardHasContent(normalize({})), false);
+});
+
+test('boardHasContent sees cards on either board and every lifeMeta array', () => {
+  const withCard = normalize({ projects: { backlog: [card('a')] } });
+  assert.equal(boardHasContent(withCard), true);
+  const withLifeCard = normalize({ life: { todo: [card('l')] } });
+  assert.equal(boardHasContent(withLifeCard), true);
+  const withFocus = normalize({ lifeMeta: { focus: [{ id: 'f', text: 'x', done: false }] } });
+  assert.equal(boardHasContent(withFocus), true);
+  const withDate = normalize({ lifeMeta: { dates: [{ id: 'd', title: 'x', date: '2026-01-01' }] } });
+  assert.equal(boardHasContent(withDate), true);
+  const withSticky = normalize({ lifeMeta: { stickies: [{ id: 's', text: 'x', color: 'yellow' }] } });
+  assert.equal(boardHasContent(withSticky), true);
 });
 
 /* ---------- misc ---------- */
