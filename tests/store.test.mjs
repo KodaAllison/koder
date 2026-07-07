@@ -6,7 +6,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   BOARDS, boardFor, colsFor, cardMatchesView,
-  normalize, migrateLifeColumns, allCardIds, mergeBoards, uid,
+  normalize, migrateLifeColumns, migrateLifeToDashboard, sortByPriority,
+  allCardIds, mergeBoards, uid,
 } from '../js/store.js';
 
 function card(id, extra = {}) {
@@ -38,22 +39,60 @@ test('normalize whitelists priority (untrusted server data feeds a class attr)',
   assert.equal(s.projects.backlog[1].priority, 'high');
 });
 
-test('normalize migrates old life columns without dropping cards', () => {
-  const s = normalize({
-    life: { backlog: [card('x')], todo: [card('y')], doing: [], done: [card('z')] },
-  });
+test('migrateLifeColumns migrates the oldest dev-style shape to the five-column shape', () => {
+  const s = { life: { backlog: [card('x')], todo: [card('y')], doing: [], done: [card('z')] } };
+  migrateLifeColumns(s);
   assert.equal(s.life.someday[0].id, 'x');
   assert.equal(s.life.thisweek[0].id, 'y');
   assert.equal(s.life.done[0].id, 'z');
   assert.deepEqual(s.life.waiting, []);
-  assert.ok(!('backlog' in s.life) || Array.isArray(s.life.someday));
 });
 
-test('migrateLifeColumns is a no-op on the new shape', () => {
+test('migrateLifeColumns is a no-op on the five-column shape', () => {
   const life = { someday: [card('x')], thisweek: [], doing: [], waiting: [], done: [] };
   const s = { life: structuredClone(life) };
   migrateLifeColumns(s);
   assert.deepEqual(s.life, life);
+});
+
+test('migrateLifeToDashboard folds someday/thisweek/waiting into todo', () => {
+  const s = {
+    life: {
+      someday: [card('a')], thisweek: [card('b')],
+      doing: [card('c')], waiting: [card('d')], done: [card('e')],
+    },
+  };
+  migrateLifeToDashboard(s);
+  assert.deepEqual(s.life.todo.map(c => c.id), ['b', 'a', 'd']);
+  assert.deepEqual(s.life.doing.map(c => c.id), ['c']);
+  assert.deepEqual(s.life.done.map(c => c.id), ['e']);
+  assert.ok(!('someday' in s.life) && !('thisweek' in s.life) && !('waiting' in s.life));
+});
+
+test('migrateLifeToDashboard is a no-op on the three-column shape', () => {
+  const life = { todo: [card('x')], doing: [], done: [] };
+  const s = { life: structuredClone(life) };
+  migrateLifeToDashboard(s);
+  assert.deepEqual(s.life, life);
+});
+
+test('normalize chains both migrations: oldest dev-style shape -> current three-column shape', () => {
+  const s = normalize({
+    life: { backlog: [card('x')], todo: [card('y')], doing: [], done: [card('z')] },
+  });
+  assert.deepEqual(s.life.todo.map(c => c.id).sort(), ['x', 'y']);
+  assert.deepEqual(s.life.done.map(c => c.id), ['z']);
+  assert.ok(!('someday' in s.life) && !('thisweek' in s.life) && !('waiting' in s.life));
+});
+
+test('sortByPriority orders high > med > low, is stable within a tier, and does not mutate', () => {
+  const cards = [
+    card('a', { priority: 'low' }), card('b', { priority: 'high' }),
+    card('c', { priority: 'high' }), card('d', { priority: 'med' }),
+  ];
+  const sorted = sortByPriority(cards);
+  assert.deepEqual(sorted.map(c => c.id), ['b', 'c', 'd', 'a']);
+  assert.deepEqual(cards.map(c => c.id), ['a', 'b', 'c', 'd']);
 });
 
 test('normalize migrates the legacy notes string into a first sticky', () => {
@@ -76,7 +115,7 @@ test('boardFor: only the life view uses the life board', () => {
   for (const view of ['all', 'unassigned', 'unlinked', 'some-project']) {
     assert.equal(boardFor(view), 'projects');
   }
-  assert.equal(colsFor('life').length, 5);
+  assert.equal(colsFor('life').length, 3);
   assert.equal(colsFor('projects').length, 5);
 });
 
@@ -126,11 +165,11 @@ test('mergeBoards does not duplicate a card that moved columns locally', () => {
 test('mergeBoards merges into both boards, creating unknown columns if needed', () => {
   const local = normalize({});
   const server = normalize({});
-  server.life.someday.push(card('lifecard'));
+  server.life.todo.push(card('lifecard'));
   server.projects.custom = [card('oddcol')]; // column the client doesn't know
   const added = mergeBoards(local, server, new Set());
   assert.equal(added, 2);
-  assert.equal(local.life.someday[0].id, 'lifecard');
+  assert.equal(local.life.todo[0].id, 'lifecard');
   assert.equal(local.projects.custom[0].id, 'oddcol');
 });
 
@@ -139,7 +178,7 @@ test('mergeBoards merges into both boards, creating unknown columns if needed', 
 test('allCardIds spans both boards', () => {
   const s = normalize({
     projects: { backlog: [card('p1')] },
-    life: { someday: [card('l1')] },
+    life: { todo: [card('l1')] },
   });
   assert.deepEqual([...allCardIds(s)].sort(), ['l1', 'p1']);
 });

@@ -4,7 +4,7 @@
  * Everything re-renders from `state` on each change — simple and correct at
  * this scale; inline editors that must keep focus (sticky notes) opt out. */
 
-import { BOARDS, colsFor, boardFor, cardMatchesView } from './store.js';
+import { BOARDS, colsFor, boardFor, cardMatchesView, sortByPriority } from './store.js';
 import { state, activeTab, setActiveTab, PROJECTS, projectIds, projectById, save } from './state.js';
 import { renderSidebar } from './sidebar.js';
 import { openModal } from './modal.js';
@@ -17,16 +17,50 @@ function fmtDate(ts) {
   return new Date(ts).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 }
 
+/**
+ * Shared button construction for both nav layers below — same shape (active
+ * class, "name (count)" label, click handler), different container/class.
+ * @param {HTMLElement} container
+ * @param {string} baseClass
+ * @param {{active: boolean, name: string, count: number, onclick: () => void, id?: string}} t
+ */
+function appendTabButton(container, baseClass, t) {
+  const b = document.createElement('button');
+  b.className = baseClass + (t.active ? ' active' : '');
+  if (t.id) b.dataset.tab = t.id;
+  b.textContent = t.count ? `${t.name} (${t.count})` : t.name;
+  b.onclick = t.onclick;
+  container.appendChild(b);
+}
+
+/* Top-level mode toggle: Life (a dashboard) vs Projects (the shared kanban).
+ * The second-layer tab strip below only makes sense in Projects mode, so it's
+ * hidden whenever Life is active — see renderTabs(). */
+function renderTopTabs() {
+  const el = /** @type {HTMLElement} */ (document.getElementById('topTabs'));
+  el.innerHTML = '';
+  const inProjects = boardFor(activeTab) === 'projects';
+  const lifeCount = Object.values(state.life).flat().length;
+  const projCount = Object.values(state.projects).flat().length;
+
+  [
+    { active: !inProjects, name: 'Life', count: lifeCount, onclick: () => { setActiveTab('life'); render(); } },
+    { active: inProjects, name: 'Projects', count: projCount, onclick: () => { setActiveTab('all'); render(); } },
+  ].forEach(m => appendTabButton(el, 'top-tab', m));
+}
+
 function renderTabs() {
   const el = /** @type {HTMLElement} */ (document.getElementById('tabs'));
+  const inProjects = boardFor(activeTab) === 'projects';
+  el.hidden = !inProjects;
+  if (!inProjects) return;
   el.innerHTML = '';
 
   const projCards = Object.values(state.projects).flat();
   const ids = projectIds();
 
-  // Life (kept first for quick access) → All → each project → (Unassigned) → (Unlinked).
+  // All → each project → (Unassigned) → (Unlinked).
   const tabs = [
-    { id: 'life', name: 'Life', count: Object.values(state.life).flat().length },
     { id: 'all', name: 'All', count: projCards.length },
   ];
   PROJECTS.forEach(p => {
@@ -37,14 +71,10 @@ function renderTabs() {
   const unlinked = projCards.filter(c => c.project != null && !ids.has(c.project)).length;
   if (unlinked) tabs.push({ id: 'unlinked', name: 'Unlinked', count: unlinked });
 
-  tabs.forEach(t => {
-    const b = document.createElement('button');
-    b.className = 'tab' + (t.id === activeTab ? ' active' : '');
-    b.dataset.tab = t.id;
-    b.textContent = t.count ? `${t.name} (${t.count})` : t.name;
-    b.onclick = () => { setActiveTab(t.id); render(); };
-    el.appendChild(b);
-  });
+  tabs.forEach(t => appendTabButton(el, 'tab', {
+    active: t.id === activeTab, name: t.name, count: t.count, id: t.id,
+    onclick: () => { setActiveTab(t.id); render(); },
+  }));
 }
 
 function renderBoard() {
@@ -60,6 +90,7 @@ function renderBoard() {
   cols.forEach(col => {
     let cards = state[boardId][col.id] || [];
     if (boardId === 'projects') cards = cards.filter(c => cardMatchesView(c, activeTab, ids));
+    if (boardId === 'life' && col.id === 'todo') cards = sortByPriority(cards);
     const colEl = document.createElement('div');
     colEl.className = 'col';
     colEl.dataset.col = col.id;
@@ -294,7 +325,7 @@ export function render() {
     ids.has(activeTab);
   if (!valid) setActiveTab('all');
   document.body.style.setProperty('--accent', accentForTab(activeTab));
-  renderTabs(); renderBoard(); renderSidebar();
+  renderTopTabs(); renderTabs(); renderBoard(); renderSidebar();
 }
 
 /* Register as the implementation behind render.js, so modal/sidebar/sync can

@@ -127,6 +127,10 @@ curl -sS -X POST \
 # → 201 { "card": { "id": "t_...", ... }, "rev": 42 }
 ```
 
+The `rev` here is the *board's* new head revision after this write landed — not a
+version number on the ticket itself (tickets don't have one). You can ignore it
+unless you're also polling `/state` and want to know a write has been folded in.
+
 ### GET /tickets — read tickets
 
 Flattens the projects board into one list; each ticket gains a `column` field.

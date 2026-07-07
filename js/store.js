@@ -64,11 +64,9 @@ export const BOARDS = {
     { id: 'done',    name: 'Done' },
   ],
   life: [
-    { id: 'someday',  name: 'Someday' },
-    { id: 'thisweek', name: 'This Week' },
-    { id: 'doing',    name: 'Doing' },
-    { id: 'waiting',  name: 'Waiting' },
-    { id: 'done',     name: 'Done' },
+    { id: 'todo',  name: 'To Do' },
+    { id: 'doing', name: 'Doing' },
+    { id: 'done',  name: 'Done' },
   ],
 };
 
@@ -100,13 +98,25 @@ export function uid() { return Date.now().toString(36) + Math.random().toString(
 
 export const PRIORITIES = /** @type {Priority[]} */ (['low', 'med', 'high']);
 
-/* One-time migration: earlier versions gave every tab the same dev-style
+const PRIORITY_RANK = { low: 2, med: 1, high: 0 };
+
+/* Display-only ordering — returns a new array, never mutates `cards` or the
+ * underlying stored column array. Sort is stable, so cards of equal priority
+ * keep their existing (storage) order. */
+/** @param {Card[]} cards @returns {Card[]} */
+export function sortByPriority(cards) {
+  return [...cards].sort((a, b) => PRIORITY_RANK[a.priority] - PRIORITY_RANK[b.priority]);
+}
+
+/* One-time migration: earliest versions gave every tab the same dev-style
  * columns (backlog/todo/doing/done). Life now uses different column ids,
- * so move any existing life cards across instead of silently dropping them. */
+ * so move any existing life cards across instead of silently dropping them.
+ * Detection keys off `backlog` alone (not `todo`) since `todo` is a legitimate
+ * column id in later life shapes too. */
 /** @param {any} s */
 export function migrateLifeColumns(s) {
   if (!s.life) return;
-  const hasOldShape = 'backlog' in s.life || 'todo' in s.life;
+  const hasOldShape = 'backlog' in s.life;
   const hasNewShape = 'someday' in s.life && 'thisweek' in s.life;
   if (hasOldShape && !hasNewShape) {
     s.life = {
@@ -119,12 +129,32 @@ export function migrateLifeColumns(s) {
   }
 }
 
+/* One-time migration: the Life dashboard redesign collapses the 5-stage
+ * pipeline (someday/thisweek/doing/waiting/done) into a 3-column kanban
+ * (todo/doing/done). Someday/This Week/Waiting all fold into To Do — priority
+ * is what differentiates them now, not a column. */
+/** @param {any} s */
+export function migrateLifeToDashboard(s) {
+  if (!s.life) return;
+  const hasOldShape = 'someday' in s.life || 'thisweek' in s.life || 'waiting' in s.life;
+  if (hasOldShape) {
+    s.life = {
+      // Any pre-existing `todo` cards are folded in too (not just
+      // thisweek/someday/waiting), so a stray todo array is never dropped.
+      todo:  [...(s.life.todo || []), ...(s.life.thisweek || []), ...(s.life.someday || []), ...(s.life.waiting || [])],
+      doing: s.life.doing || [],
+      done:  s.life.done || [],
+    };
+  }
+}
+
 /* Repair/upgrade a board object into the exact shape the app expects.
  * Runs on the localStorage cache at boot AND on every board pulled from the
  * sync server, so both sources get identical defensive fills/migrations. */
 /** @param {any} s @returns {BoardState} */
 export function normalize(s) {
   migrateLifeColumns(s);
+  migrateLifeToDashboard(s);
   // Fill in any missing boards/columns (covers first run and future column additions).
   BOARD_IDS.forEach(boardId => {
     if (!s[boardId]) s[boardId] = {};

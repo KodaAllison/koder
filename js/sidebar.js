@@ -1,8 +1,9 @@
 // @ts-check
 /* ---------- Life dashboard sidebar ----------
- * Rendered only on the Life tab. Three sections in a top→bottom priority
- * gradient: Today's Focus (the hero) → Next Up (dates) → Notes. Built with
- * textContent throughout so user text is never interpreted as HTML. */
+ * Rendered only on the Life tab. Four sections in a top→bottom priority
+ * gradient: Today's Focus (the hero) → Next Up (dates) → Notes → Incoming
+ * (placeholder for now). Built with textContent throughout so user text is
+ * never interpreted as HTML. */
 
 import { uid } from './store.js';
 import { state, activeTab, save, saveSoon } from './state.js';
@@ -265,6 +266,26 @@ function renderNotesSection(meta) {
   return sec;
 }
 
+/* Placeholder for future cross-repo work surfacing (e.g. strava-insights via
+ * the ticket API or GitHub polling). No data source yet — this section only
+ * renders a styled empty state. The .incoming-list wrapper exists so a future
+ * list of real items can be dropped in without restructuring this section. */
+function renderIncomingSection() {
+  const sec = document.createElement('div');
+  sec.className = 'side-sec';
+  sec.appendChild(sideTitle('Incoming'));
+
+  const list = document.createElement('div');
+  list.className = 'incoming-list';
+  const hint = document.createElement('div');
+  hint.className = 'empty-hint';
+  hint.textContent = 'Nothing incoming yet';
+  list.appendChild(hint);
+  sec.appendChild(list);
+
+  return sec;
+}
+
 export function renderSidebar() {
   lifeSidebar.hidden = activeTab !== 'life';
   if (lifeSidebar.hidden) { addingFocus = false; addingDate = false; return; }
@@ -274,5 +295,6 @@ export function renderSidebar() {
     renderFocusSection(meta),
     renderDatesSection(meta),
     renderNotesSection(meta),
+    renderIncomingSection(),
   );
 }

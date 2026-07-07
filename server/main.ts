@@ -19,6 +19,17 @@
  * push. Restore rolls the chosen snapshot forward as a fresh rev (rev never
  * rewinds), so open tabs pull it back like any other change.
  *
+ * Terminology — "rev" means different things depending on where you see it:
+ *  - The board doc's own `rev` (`Doc.rev`) is the current HEAD: it increments
+ *    by exactly 1 on every successful write and is what baseRev is checked
+ *    against.
+ *  - A `rev` you pass in (`?rev=N`, `POST /state/restore`'s body) instead
+ *    names one SPECIFIC past snapshot to look up or restore — same numbering
+ *    space as the head, but referring to history, not "the current one".
+ *  - The `rev` returned alongside `card` from `POST`/`PATCH /tickets` is the
+ *    BOARD's new head rev after that write landed — not a per-ticket
+ *    version number. A ticket itself has no revision of its own.
+ *
  * Endpoints (all need `Authorization: Bearer $KODER_TOKEN`):
  *   GET   /state        → full doc (or an empty rev-0 doc on first run)
  *   GET   /state?rev=N   → the snapshot doc at rev N (404 if pruned)
@@ -73,7 +84,7 @@ type Board = {
   lifeMeta: Record<string, unknown>;
 };
 type Doc = {
-  rev: number;
+  rev: number; // the HEAD revision — see the "Terminology" note above
   updatedAt: string | null;
   board: Board;
 };
@@ -176,17 +187,18 @@ Deno.serve(async (req: Request) => {
     return json({ error: "unauthorized" }, 401);
   }
 
-  /* ---- GET /state (optionally ?rev=N for a kept snapshot) ---- */
+  /* ---- GET /state (optionally ?rev=N for a kept snapshot — a specific past
+   * revision, not the current head; see the "Terminology" note above) ---- */
   if (url.pathname === "/state" && req.method === "GET") {
     const revParam = url.searchParams.get("rev");
     if (revParam !== null) {
-      const rev = Number(revParam);
-      if (!Number.isInteger(rev) || rev < 0) {
+      const requestedRev = Number(revParam);
+      if (!Number.isInteger(requestedRev) || requestedRev < 0) {
         return json({ error: "rev must be a non-negative integer" }, 400);
       }
-      const snap = await kv.get<Doc>([...KEY, rev]);
+      const snap = await kv.get<Doc>([...KEY, requestedRev]);
       if (!snap.value) {
-        return json({ error: `no snapshot for rev ${rev} (only the last ${KEEP_REVISIONS} are kept)` }, 404);
+        return json({ error: `no snapshot for rev ${requestedRev} (only the last ${KEEP_REVISIONS} are kept)` }, 404);
       }
       return json(snap.value);
     }
@@ -207,15 +219,19 @@ Deno.serve(async (req: Request) => {
   /* ---- POST /state/restore: re-land a snapshot as a new head rev ----
    * Undo without rewinding: the old board becomes the newest rev, so clients
    * pull it back through the normal rev>SYNC.rev path. Same atomic + retry
-   * shape as the ticket writers. */
+   * shape as the ticket writers. The body's `rev` names the snapshot to
+   * restore FROM (history), which is a different thing from `doc.rev` below
+   * (the new HEAD this restore produces) — kept as separate locals so the
+   * two don't get confused. */
   if (url.pathname === "/state/restore" && req.method === "POST") {
     const body = await req.json().catch(() => null);
     if (!body || typeof body.rev !== "number" || !Number.isInteger(body.rev)) {
       return json({ error: "rev (integer) is required" }, 400);
     }
-    const snap = await kv.get<Doc>([...KEY, body.rev]);
+    const targetRev = body.rev;
+    const snap = await kv.get<Doc>([...KEY, targetRev]);
     if (!snap.value) {
-      return json({ error: `no snapshot for rev ${body.rev} (only the last ${KEEP_REVISIONS} are kept)` }, 404);
+      return json({ error: `no snapshot for rev ${targetRev} (only the last ${KEEP_REVISIONS} are kept)` }, 404);
     }
     for (let attempt = 0; attempt < 5; attempt++) {
       const entry = await kv.get<Doc>(KEY);
@@ -226,7 +242,7 @@ Deno.serve(async (req: Request) => {
         board: snap.value.board,
       };
       const res = await commitDoc(entry, doc);
-      if (res.ok) return json({ rev: doc.rev, restoredFrom: body.rev, updatedAt: doc.updatedAt });
+      if (res.ok) return json({ rev: doc.rev, restoredFrom: targetRev, updatedAt: doc.updatedAt });
     }
     return json({ error: "write contention, retry" }, 503);
   }
@@ -286,7 +302,9 @@ Deno.serve(async (req: Request) => {
    * The agent workflow: move to "doing" when picking work up, "review" once
    * a PR is raised. "done" is reserved for after merge — a human or a
    * separate reviewing agent moves it there, not the implementing agent.
-   * Same atomic read-modify-write pattern as POST. */
+   * Same atomic read-modify-write pattern as POST. The `rev` in the response
+   * is the board's new head after this move, not a revision of the ticket
+   * itself — tickets don't have their own version number. */
   const moveMatch = url.pathname.match(/^\/tickets\/([^/]+)$/);
   if (moveMatch && req.method === "PATCH") {
     const id = moveMatch[1];
@@ -320,7 +338,10 @@ Deno.serve(async (req: Request) => {
   }
 
   /* ---- POST /tickets: the agent/CLI entrypoint ----
-   * Server-side read-modify-write, so callers never need the whole board. */
+   * Server-side read-modify-write, so callers never need the whole board.
+   * The `rev` in the response is the board's new head after this write, not
+   * a revision of the created ticket — tickets don't have their own version
+   * number, they just ride along with whatever the board's head is. */
   if (url.pathname === "/tickets" && req.method === "POST") {
     const body = await req.json().catch(() => null);
     if (!body || typeof body.title !== "string" || !body.title.trim()) {

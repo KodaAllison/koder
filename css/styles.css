@@ -35,13 +35,27 @@ h1 { font-size: 18px; margin: 0; font-weight: 650; }
   background: var(--high); color: var(--high-t);
 }
 
+/* Top-level mode toggle: Life (dashboard) vs Projects (shared kanban). A
+ * segmented-control look on purpose — distinct from the underline .tab style
+ * below so the two layers read as different kinds of navigation, not peers. */
+.top-tabs { display: flex; gap: 6px; padding: 14px 20px 0; }
+.top-tab {
+  flex: 0 0 auto;
+  padding: 7px 16px; border: 1px solid var(--border); background: var(--surface);
+  border-radius: 20px; cursor: pointer;
+  font-size: 13.5px; font-weight: 650; color: var(--muted);
+}
+.top-tab:hover { border-color: var(--accent); color: var(--text); }
+.top-tab.active { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+
 .tabs {
-  display: flex; gap: 4px; padding: 14px 20px 0; border-bottom: 1px solid var(--border);
+  display: flex; gap: 4px; padding: 10px 20px 0; border-bottom: 1px solid var(--border);
   /* 9+ projects overflow a phone — scroll the tab strip instead of pushing
    * tabs off-screen. Hide the scrollbar; the fade + swipe imply scrollability. */
   overflow-x: auto; flex-wrap: nowrap; scrollbar-width: none; -webkit-overflow-scrolling: touch;
 }
 .tabs::-webkit-scrollbar { display: none; }
+.tabs[hidden] { display: none; } /* only shown in Projects mode — see board.js renderTabs() */
 .tab {
   flex: 0 0 auto; white-space: nowrap;
   padding: 8px 18px; border: none; background: none; cursor: pointer;
@@ -52,8 +66,25 @@ h1 { font-size: 18px; margin: 0; font-weight: 650; }
 .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
 
 .main { display: flex; align-items: flex-start; gap: 16px; padding: 16px 20px 28px; }
+.board-col { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 16px; }
+
+/* Shared panel chrome — the sidebar and the kanban frame both use this, so
+ * they read as the same kind of surface. --surface fill, an accent-tinted
+ * top edge (var(--accent) already tracks the active tab, so this is colored
+ * correctly for free), and a lifted shadow. Layout/sizing stays per-panel. */
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border); border-top: 2px solid var(--accent);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 28px rgba(0,0,0,.28);
+}
+/* Columns inside are a recessed --bg lane cut into this raised panel, with
+ * cards sitting back up at --surface — the same recessed-well-in-a-raised-
+ * panel pattern already used for text inputs (see .side-add/.modal input),
+ * just applied here too. Also the reason .board-col is its own flex column —
+ * a future panel can sit below this one without restructuring .main. */
+.board-panel { padding: 16px; }
 .board {
-  flex: 1; min-width: 0;
   display: grid; grid-template-columns: repeat(var(--board-cols, 4), 1fr); gap: 14px;
   align-items: start;
 }
@@ -69,19 +100,23 @@ h1 { font-size: 18px; margin: 0; font-weight: 650; }
   /* Single column: the projects board's 4 cols and Life's 5 all stack. */
   .board { grid-template-columns: 1fr; gap: 12px; }
   header { padding: 14px 14px; }
-  .tabs { padding: 12px 14px 0; }
+  .top-tabs { padding: 12px 14px 0; }
+  .tabs { padding: 8px 14px 0; }
   .main { padding: 14px 14px 24px; gap: 14px; }
   h1 { font-size: 16px; }
 }
 
-/* Life dashboard sidebar — right of the board, Life tab only. Borderless/airy:
- * sections are separated by whitespace + thin dividers, no cards. Only the
- * Today section carries visual weight; the rest recede into ambient info. */
+/* Life dashboard sidebar — left of the board (order:-1 puts it first
+ * regardless of flex-direction, so it's also on top on mobile), Life tab
+ * only. It's the dashboard's hero panel: wider and visually heavier than the
+ * plain kanban columns beside it (chrome comes from .panel, above).
+ * Sections inside stay borderless/airy — whitespace + thin dividers, no
+ * cards — only the Today section additionally carries its own weight. */
 .life-sidebar {
-  width: 300px; flex-shrink: 0;
+  order: -1;
+  width: 340px; flex-shrink: 0;
   display: flex; flex-direction: column; gap: 22px;
-  background: var(--surface); border: 1px solid var(--border);
-  border-radius: var(--radius); padding: 18px;
+  padding: 20px;
   position: sticky; top: 16px; align-self: flex-start;
   max-height: calc(100vh - 32px); overflow-y: auto;
 }
@@ -146,8 +181,12 @@ h1 { font-size: 18px; margin: 0; font-weight: 650; }
 .sticky[data-color="blue"]   { background: #bfe3ff; }
 .sticky[data-color="green"]  { background: #c8f0c2; }
 
+/* Incoming (placeholder for now — future cross-repo items will render here
+ * as rows inside this container; reuses .side-sec/.side-title/.empty-hint). */
+.incoming-list { display: flex; flex-direction: column; gap: 8px; }
+
 .col {
-  background: var(--surface); border: 1px solid var(--border);
+  background: var(--bg); border: 1px solid var(--border);
   border-radius: var(--radius); padding: 10px; min-height: 120px;
   display: flex; flex-direction: column; gap: 8px;
 }
@@ -163,20 +202,19 @@ h1 { font-size: 18px; margin: 0; font-weight: 650; }
 }
 /* Stage-semantic column colours — shared across both boards, keyed on the
  * column id (data-col). Independent of the per-tab accent. */
-.col[data-col="backlog"],  .col[data-col="someday"]  { --col-accent: #9aa4b2; } /* unstarted  */
-.col[data-col="todo"],     .col[data-col="thisweek"] { --col-accent: #60a5fa; } /* queued     */
-.col[data-col="doing"]                                { --col-accent: #fbbf24; } /* active     */
-.col[data-col="waiting"]                              { --col-accent: #c084fc; } /* blocked    */
-.col[data-col="review"]                               { --col-accent: #f472b6; } /* in review  */
-.col[data-col="done"]                                 { --col-accent: #34d399; } /* complete   */
+.col[data-col="backlog"] { --col-accent: #9aa4b2; } /* unstarted  */
+.col[data-col="todo"]    { --col-accent: #60a5fa; } /* queued     */
+.col[data-col="doing"]   { --col-accent: #fbbf24; } /* active     */
+.col[data-col="review"]  { --col-accent: #f472b6; } /* in review  */
+.col[data-col="done"]    { --col-accent: #34d399; } /* complete   */
 .count {
-  font-size: 11px; background: var(--bg); border: 1px solid var(--border);
+  font-size: 11px; background: var(--surface); border: 1px solid var(--border);
   border-radius: 10px; padding: 1px 8px; color: var(--muted);
 }
 .col.drag-over { outline: 2px dashed var(--accent); outline-offset: -4px; }
 
 .card {
-  background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
   padding: 10px 12px; cursor: grab; user-select: none;
   /* Let a vertical swipe scroll the board; the drag code takes over via a
    * press-and-hold. -webkit-touch-callout stops iOS's long-press menu. */

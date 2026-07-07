@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Koder — Kanban</title>
+  <title>Koder</title>
 
   <!-- ============ PWA piece #1: the Web App Manifest ============
        This JSON file tells the browser "this site is an installable app".
@@ -23,7 +23,7 @@
 </head>
 <body>
   <header>
-    <h1>Koda's Board</h1>
+    <h1>Koder</h1>
     <div class="header-right">
       <!-- Shown only when the browser fires `beforeinstallprompt` (see js/pwa.js) -->
       <button id="installBtn" class="btn btn-install" hidden>Install app</button>
@@ -33,10 +33,15 @@
     </div>
   </header>
 
+  <div class="top-tabs" id="topTabs"></div>
   <div class="tabs" id="tabs"></div>
   <div class="main">
-    <div class="board" id="board"></div>
-    <aside class="life-sidebar" id="lifeSidebar" hidden></aside>
+    <div class="board-col">
+      <div class="board-panel panel">
+        <div class="board" id="board"></div>
+      </div>
+    </div>
+    <aside class="life-sidebar panel" id="lifeSidebar" hidden></aside>
   </div>
 
   <!-- Ticket create/edit modal -->

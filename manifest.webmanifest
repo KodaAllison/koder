@@ -1,7 +1,7 @@
 {
-  "name": "Koder Kanban",
-  "short_name": "Kanban",
-  "description": "Personal kanban board for projects and life",
+  "name": "Koder",
+  "short_name": "Koder",
+  "description": "Personal project board and life dashboard",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",
