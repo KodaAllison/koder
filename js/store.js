@@ -60,6 +60,7 @@ export const BOARDS = {
     { id: 'backlog', name: 'Backlog' },
     { id: 'todo',    name: 'To Do' },
     { id: 'doing',   name: 'In Progress' },
+    { id: 'review',  name: 'For Review' },
     { id: 'done',    name: 'Done' },
   ],
   life: [

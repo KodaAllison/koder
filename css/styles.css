@@ -167,6 +167,7 @@ h1 { font-size: 18px; margin: 0; font-weight: 650; }
 .col[data-col="todo"],     .col[data-col="thisweek"] { --col-accent: #60a5fa; } /* queued     */
 .col[data-col="doing"]                                { --col-accent: #fbbf24; } /* active     */
 .col[data-col="waiting"]                              { --col-accent: #c084fc; } /* blocked    */
+.col[data-col="review"]                               { --col-accent: #f472b6; } /* in review  */
 .col[data-col="done"]                                 { --col-accent: #34d399; } /* complete   */
 .count {
   font-size: 11px; background: var(--bg); border: 1px solid var(--border);
