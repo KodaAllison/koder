@@ -9,7 +9,7 @@
 #
 # Options (add / list):
 #   --project <id>       project id (a folder name under Code/)
-#   --column <id>        backlog | todo | doing | done   (add default: backlog)
+#   --column <id>        backlog | todo | doing | review | done   (add default: backlog)
 #   --priority <level>   low | med | high                (add default: med)
 #   --note "<text>"      optional details (add only)
 #

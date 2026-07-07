@@ -113,7 +113,7 @@ curl -X POST -H "Authorization: Bearer $KODER_TOKEN" -H 'Content-Type: applicati
 ### POST /tickets — the agent entrypoint
 
 Body: `{ title, note?, project?, column?, priority? }`. Column is one of
-`backlog | todo | doing | done` (default `backlog`); priority `low | med | high`
+`backlog | todo | doing | review | done` (default `backlog`); priority `low | med | high`
 (default `med`); `project` should be a folder name under `Code/` (defaults to
 unassigned). The server assigns the id and appends the card atomically —
 callers never need to read or send the whole board.
@@ -139,7 +139,7 @@ curl -sS -H "Authorization: Bearer $KODER_TOKEN" "$KODER_API/tickets?project=hol
 
 ### PATCH /tickets/:id — move a ticket
 
-Body: `{ "column": "backlog" | "todo" | "doing" | "done" }`. Finds the ticket
+Body: `{ "column": "backlog" | "todo" | "doing" | "review" | "done" }`. Finds the ticket
 anywhere on the projects board and moves it atomically. 404 if the id doesn't
 exist.
 

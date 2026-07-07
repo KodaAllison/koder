@@ -77,7 +77,7 @@ test('boardFor: only the life view uses the life board', () => {
     assert.equal(boardFor(view), 'projects');
   }
   assert.equal(colsFor('life').length, 5);
-  assert.equal(colsFor('projects').length, 4);
+  assert.equal(colsFor('projects').length, 5);
 });
 
 test('cardMatchesView covers all/unassigned/unlinked/project', () => {

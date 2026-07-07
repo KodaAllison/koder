@@ -22,7 +22,7 @@ any directory):
 
 Both filters optional. Valid project ids are the folder names under `~/Code`
 (e.g. `holitrackr`, `SART`, `strava-worker`). Columns: `backlog`, `todo`,
-`doing`, `done`.
+`doing`, `review`, `done`.
 
 **Add a ticket:**
 
@@ -49,9 +49,14 @@ When Koda says "look at the tickets on X and work on one":
 2. Pick the highest-priority ticket you can actually complete; tell Koda which
    and why before starting
 3. Move it to `doing`
-4. Do the work in the project repo
-5. When finished and verified, move it to `done`; if you had to stop partway,
-   move it back to `todo` and add a new ticket noting remaining work
+4. Do the work in the project repo, then commit, push, and open a PR
+5. Once the PR is up, move the ticket to `review` — **not** `done`. `done` is
+   reserved for after merge; a ticket in `done` should always mean the work
+   actually shipped. Koda (or another agent given the review) merges the PR
+   and moves the card to `done`.
+
+If you had to stop partway, move the ticket back to `todo` and add a new
+ticket noting remaining work.
 
 ## Conventions
 

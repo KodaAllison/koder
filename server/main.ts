@@ -56,7 +56,7 @@ const ROOT = (() => {
   catch { return "."; }
 })();
 
-const PROJECT_COLUMNS = ["backlog", "todo", "doing", "done"];
+const PROJECT_COLUMNS = ["backlog", "todo", "doing", "review", "done"];
 const PRIORITIES = ["low", "med", "high"];
 
 type Card = {
@@ -283,8 +283,10 @@ Deno.serve(async (req: Request) => {
   }
 
   /* ---- PATCH /tickets/:id: move a ticket between columns ----
-   * The agent workflow: move to "doing" when picking work up, "done" when
-   * finished. Same atomic read-modify-write pattern as POST. */
+   * The agent workflow: move to "doing" when picking work up, "review" once
+   * a PR is raised. "done" is reserved for after merge — a human or a
+   * separate reviewing agent moves it there, not the implementing agent.
+   * Same atomic read-modify-write pattern as POST. */
   const moveMatch = url.pathname.match(/^\/tickets\/([^/]+)$/);
   if (moveMatch && req.method === "PATCH") {
     const id = moveMatch[1];
