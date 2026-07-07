@@ -14,7 +14,7 @@
  * A byte-different sw.js is what triggers the browser to install
  * the new version (the "update flow" you'll see in app.js).
  */
-const CACHE_NAME = 'kanban-shell-v13';
+const CACHE_NAME = 'kanban-shell-v14';
 
 /* The "app shell": the minimal static files needed to render the UI.
  * We cache these at install time so the app boots with zero network.
@@ -82,12 +82,23 @@ self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
   if (url.origin !== self.location.origin) return;
 
+  /* The sync API is same-origin now (main.ts serves the board and the API from
+   * one Deno app), so a GET /state would otherwise fall into the cache-first
+   * block below and get cached — freezing the board at whatever it was on first
+   * load, so remote changes (e.g. a ticket added on the phone) stay invisible
+   * until a hard reload. Never cache the API: return without respondWith and the
+   * browser does a normal network fetch. Offline, that fetch rejects and sync.js
+   * already falls back to the localStorage cache. */
+  if (url.pathname === '/state' || url.pathname === '/state/restore' ||
+      url.pathname === '/revisions' || url.pathname === '/tickets' ||
+      url.pathname.startsWith('/tickets/')) {
+    return;
+  }
+
   /* projects.json is regenerated out-of-band (gen-projects.sh) and
    * config.local.js can change (new sync URL/token) without a shell deploy,
    * so serve both NETWORK-FIRST: fresh when online, cache fallback offline.
-   * (The rest of the shell stays cache-first below. Note the cross-origin
-   * sync API itself never reaches this handler — non-same-origin requests
-   * bail out above, so API calls are never cached.) */
+   * (The rest of the shell stays cache-first below.) */
   if (url.pathname.endsWith('/projects.json') || url.pathname.endsWith('/config.local.js')) {
     event.respondWith(
       fetch(event.request).then((response) => {
