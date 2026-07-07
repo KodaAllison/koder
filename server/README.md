@@ -72,11 +72,43 @@ empty board.
 curl -H "Authorization: Bearer $KODER_TOKEN" "$KODER_API/state"
 ```
 
+Pass `?rev=N` to fetch a past snapshot instead of the current board (see
+history below). `404` if that rev has been pruned.
+
+```bash
+curl -H "Authorization: Bearer $KODER_TOKEN" "$KODER_API/state?rev=57"
+```
+
 ### PUT /state
 
 Full-board write, used by the PWA. Body: `{ baseRev, board }`. `baseRev` must
 equal the current server rev, otherwise you get `409 { rev }` — re-GET, merge,
 retry. Success: `{ rev, updatedAt }`.
+
+### History / undo
+
+Every write snapshots the resulting board under `["board", rev]` and prunes the
+one 20 revisions back, so the **last 20 boards** are recoverable. This turns a
+bad push (e.g. a stale `pagehide` beacon clobbering the board) into a restore
+instead of permanent data loss.
+
+**`GET /revisions`** — the kept restore points, newest first:
+
+```bash
+curl -H "Authorization: Bearer $KODER_TOKEN" "$KODER_API/revisions"
+# → { "revisions": [ { "rev": 61, "updatedAt": "..." }, { "rev": 60, ... }, ... ] }
+```
+
+Inspect a snapshot with `GET /state?rev=N`, then **`POST /state/restore`** with
+`{ rev }` to bring it back. Restore doesn't rewind `rev`: it re-lands that
+snapshot's board as a *new* head rev, so open tabs pull it in like any other
+change. `404` if the rev has been pruned.
+
+```bash
+curl -X POST -H "Authorization: Bearer $KODER_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"rev":57}' "$KODER_API/state/restore"
+# → { "rev": 62, "restoredFrom": 57, "updatedAt": "..." }
+```
 
 ### POST /tickets — the agent entrypoint
 
