@@ -14,9 +14,17 @@
  *  - Writes go through kv.atomic().check() so two racing writers can't both
  *    land on the same rev.
  *
+ * History / undo: every write also snapshots the new doc under ["board", rev]
+ * and prunes the one KEEP_REVISIONS behind, so the last N boards survive a bad
+ * push. Restore rolls the chosen snapshot forward as a fresh rev (rev never
+ * rewinds), so open tabs pull it back like any other change.
+ *
  * Endpoints (all need `Authorization: Bearer $KODER_TOKEN`):
  *   GET   /state        → full doc (or an empty rev-0 doc on first run)
- *   PUT   /state        → { baseRev, board } → { rev, updatedAt } | 409
+ *   GET   /state?rev=N   → the snapshot doc at rev N (404 if pruned)
+ *   PUT   /state→ { baseRev, board } → { rev, updatedAt } | 409
+ *   GET   /revisions     → kept snapshots: [{ rev, updatedAt }], newest first
+ *   POST  /state/restore → { rev } → re-lands that snapshot as a new head rev
  *   POST  /tickets      → { title, note?, project?, column?, priority? } → { card, rev }
  *   GET   /tickets      → compact list; filters: ?project=<id>&column=<id>
  *   PATCH /tickets/:id  → { column } → moves the ticket → { card, column, rev }
@@ -33,6 +41,12 @@ import { fromFileUrl } from "jsr:@std/path";
 const kv = await Deno.openKv();
 const TOKEN = Deno.env.get("KODER_TOKEN") ?? "";
 const KEY = ["board"];
+
+// How many past revisions to keep as restore points. Snapshots live under
+// ["board", rev]; a prefix list on KEY returns exactly these (the current
+// pointer ["board"] equals the prefix and is excluded). Each is a full board
+// copy — cheap, and every write prunes the one this far behind.
+const KEEP_REVISIONS = 20;
 
 // Repo root (this file is in server/) — where the PWA's static files live, so
 // one app can serve the frontend and the API. Derive from the module URL;
@@ -66,6 +80,20 @@ type Doc = {
 
 function emptyDoc(): Doc {
   return { rev: 0, updatedAt: null, board: { projects: {}, life: {}, lifeMeta: {} } };
+}
+
+/* Commit a new doc as one atomic step: advance the current pointer, snapshot
+ * the doc under ["board", rev], and prune the snapshot KEEP_REVISIONS behind.
+ * `check(entry)` guards against a concurrent writer landing on the same rev.
+ * All writers (PUT, POST, PATCH, restore) go through here so a snapshot can
+ * never diverge from the rev that produced it. */
+function commitDoc(entry: Deno.KvEntryMaybe<Doc>, doc: Doc) {
+  return kv.atomic()
+    .check(entry)
+    .set(KEY, doc)
+    .set([...KEY, doc.rev], doc)
+    .delete([...KEY, doc.rev - KEEP_REVISIONS])
+    .commit();
 }
 
 /* Light shape check for a client-PUT board. The client's normalize() repairs
@@ -109,7 +137,8 @@ function json(body: unknown, status = 200): Response {
 /* The authenticated API surface. A GET to anything else is a static frontend
  * request (the PWA's files) and skips the token gate. */
 function isApiPath(p: string): boolean {
-  return p === "/state" || p === "/tickets" || p.startsWith("/tickets/");
+  return p === "/state" || p === "/state/restore" || p === "/revisions" ||
+    p === "/tickets" || p.startsWith("/tickets/");
 }
 
 /* Generate the gitignored js/config.local.js so the token lives in env, not
@@ -147,10 +176,59 @@ Deno.serve(async (req: Request) => {
     return json({ error: "unauthorized" }, 401);
   }
 
-  /* ---- GET /state ---- */
+  /* ---- GET /state (optionally ?rev=N for a kept snapshot) ---- */
   if (url.pathname === "/state" && req.method === "GET") {
+    const revParam = url.searchParams.get("rev");
+    if (revParam !== null) {
+      const rev = Number(revParam);
+      if (!Number.isInteger(rev) || rev < 0) {
+        return json({ error: "rev must be a non-negative integer" }, 400);
+      }
+      const snap = await kv.get<Doc>([...KEY, rev]);
+      if (!snap.value) {
+        return json({ error: `no snapshot for rev ${rev} (only the last ${KEEP_REVISIONS} are kept)` }, 404);
+      }
+      return json(snap.value);
+    }
     const entry = await kv.get<Doc>(KEY);
     return json(entry.value ?? emptyDoc());
+  }
+
+  /* ---- GET /revisions: the kept restore points, newest first ---- */
+  if (url.pathname === "/revisions" && req.method === "GET") {
+    const revisions: { rev: number; updatedAt: string | null }[] = [];
+    for await (const e of kv.list<Doc>({ prefix: KEY })) {
+      if (e.value) revisions.push({ rev: e.value.rev, updatedAt: e.value.updatedAt });
+    }
+    revisions.sort((a, b) => b.rev - a.rev);
+    return json({ revisions });
+  }
+
+  /* ---- POST /state/restore: re-land a snapshot as a new head rev ----
+   * Undo without rewinding: the old board becomes the newest rev, so clients
+   * pull it back through the normal rev>SYNC.rev path. Same atomic + retry
+   * shape as the ticket writers. */
+  if (url.pathname === "/state/restore" && req.method === "POST") {
+    const body = await req.json().catch(() => null);
+    if (!body || typeof body.rev !== "number" || !Number.isInteger(body.rev)) {
+      return json({ error: "rev (integer) is required" }, 400);
+    }
+    const snap = await kv.get<Doc>([...KEY, body.rev]);
+    if (!snap.value) {
+      return json({ error: `no snapshot for rev ${body.rev} (only the last ${KEEP_REVISIONS} are kept)` }, 404);
+    }
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const entry = await kv.get<Doc>(KEY);
+      const cur = entry.value ?? emptyDoc();
+      const doc: Doc = {
+        rev: cur.rev + 1,
+        updatedAt: new Date().toISOString(),
+        board: snap.value.board,
+      };
+      const res = await commitDoc(entry, doc);
+      if (res.ok) return json({ rev: doc.rev, restoredFrom: body.rev, updatedAt: doc.updatedAt });
+    }
+    return json({ error: "write contention, retry" }, 503);
   }
 
   /* ---- PUT /state: full-board write, conditional on baseRev ---- */
@@ -180,7 +258,7 @@ Deno.serve(async (req: Request) => {
       updatedAt: new Date().toISOString(),
       board: body.board,
     };
-    const res = await kv.atomic().check(entry).set(KEY, doc).commit();
+    const res = await commitDoc(entry, doc);
     if (!res.ok) return json({ error: "conflict: concurrent write, retry" }, 409);
     return json({ rev: doc.rev, updatedAt: doc.updatedAt });
   }
@@ -233,7 +311,7 @@ Deno.serve(async (req: Request) => {
         updatedAt: new Date().toISOString(),
         board: cur.board,
       };
-      const res = await kv.atomic().check(entry).set(KEY, doc).commit();
+      const res = await commitDoc(entry, doc);
       if (res.ok) return json({ card, column: body.column, rev: doc.rev });
     }
     return json({ error: "write contention, retry" }, 503);
@@ -276,7 +354,7 @@ Deno.serve(async (req: Request) => {
         updatedAt: new Date().toISOString(),
         board: cur.board,
       };
-      const res = await kv.atomic().check(entry).set(KEY, doc).commit();
+      const res = await commitDoc(entry, doc);
       if (res.ok) return json({ card, rev: doc.rev }, 201);
     }
     return json({ error: "write contention, retry" }, 503);
