@@ -47,6 +47,7 @@ To enable sync, copy `js/config.example.js` to `js/config.local.js`
 | `sw.js` | Service worker — offline caching + update flow |
 | `manifest.webmanifest` | Makes the app installable |
 | `js/projects.json` | Generated project list (don't edit by hand) |
+| `js/config.example.js` | Template for `config.local.js` — copy and fill in |
 | `js/config.local.js` | Your sync server URL + token (gitignored) |
 | `server/main.ts` | The whole backend: 3 endpoints, Deno KV |
 | `scripts/gen-projects.sh` | Regenerates `projects.json` from folders in `Code/` |
@@ -93,8 +94,10 @@ mkdir -p ~/.claude/skills && cp -r skills/koder-ticket ~/.claude/skills/
    `display: standalone` so it opens without browser chrome when installed.
 2. **Service Worker** — `sw.js`. Pre-caches the app shell on install, serves it
    cache-first (offline boot); `projects.json` and `config.local.js` are
-   network-first because they change out-of-band. Read the lifecycle comments:
-   install → activate → fetch.
+   network-first because they change out-of-band; `/state`, `/tickets`, and
+   `/revisions` are never cached at all — same-origin API calls always hit the
+   network so a ticket added elsewhere shows up without a hard reload. Read
+   the lifecycle comments: install → activate → fetch.
 3. **Registration + install UX** — `js/pwa.js`. Version-update "Reload"
    toast, custom Install button via `beforeinstallprompt`. The SW is disabled
    on localhost so development never fights stale caches.
@@ -121,8 +124,6 @@ mkdir -p ~/.claude/skills && cp -r skills/koder-ticket ~/.claude/skills/
 
 ## Stretch goals (roughly in order of learning value)
 
-- Host the frontend itself (second Deno Deploy app in static mode) so the board
-  works from any device, not just this machine
 - Migrate ticket storage from localStorage to **IndexedDB** (async, larger
   quota, accessible from the service worker)
 - **Background Sync** — queue pushes in the SW so they survive tab closes
