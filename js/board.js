@@ -180,7 +180,8 @@ const HOLD_MS = 250;      // press duration before a touch picks a card up
  *   card: import('./store.js').Card, colId: string, el: HTMLElement,
  *   pointerId: number, startX: number, startY: number, touch: boolean,
  *   active: boolean, clone: HTMLElement|null, overCol: HTMLElement|null,
- *   holdTimer: any, offsetX: number, offsetY: number }} */
+ *   holdTimer: any, offsetX: number, offsetY: number,
+ *   lastX: number, lastY: number, rafId: number|null }} */
 let drag = null;
 /* Set for one tick after a real drag so the trailing click doesn't open the
  * editor. Module-scoped because the card's click listener reads it. */
@@ -200,6 +201,7 @@ function beginDrag(e, card, colId, el) {
     touch: e.pointerType !== 'mouse',
     active: false, clone: null, overCol: null,
     holdTimer: null, offsetX: 0, offsetY: 0,
+    lastX: e.clientX, lastY: e.clientY, rafId: null,
   };
   // Touch: arm a hold timer. If the finger moves first (onMove), it's a scroll
   // and we bail. Mouse: no delay — onMove starts the drag past the threshold.
@@ -247,7 +249,61 @@ function onDragMove(e) {
   }
   e.preventDefault(); // suppress scroll / text selection while dragging
   positionClone(e.clientX, e.clientY);
+  // Cache the last-known pointer position so the auto-scroll rAF loop can keep
+  // scrolling even while the finger is held still inside an edge band (no
+  // pointermove fires then, so the loop can't read the event directly).
+  drag.lastX = e.clientX;
+  drag.lastY = e.clientY;
   highlightColumnAt(e.clientX, e.clientY);
+  updateAutoScroll();
+}
+
+/* ---------- edge auto-scroll ----------
+ * On a phone the board is one tall column and the drag clone is position:fixed,
+ * so reaching an off-screen column means scrolling the *page* under the held
+ * clone. When the pointer sits in a top/bottom edge band we run a self-
+ * rescheduling rAF loop that scrolls the window proportionally to how deep into
+ * the band the pointer is, re-highlighting the column under the moved content
+ * each frame. Driven by the cached drag.lastY (not pointermove) so a finger
+ * held still in the band keeps scrolling. */
+const SCROLL_BAND = 72;     // px edge band at top and bottom that triggers scroll
+const SCROLL_MAX_V = 14;    // px/frame at the very edge (~840 px/s at 60fps)
+
+/* Start or stop the rAF loop based on whether the cached pointer Y is currently
+ * inside an edge band. Only meaningful once the drag is active. */
+function updateAutoScroll() {
+  if (!drag || !drag.active) return;
+  if (autoScrollVelocity() !== 0) {
+    if (drag.rafId == null) drag.rafId = requestAnimationFrame(autoScrollTick);
+  } else if (drag.rafId != null) {
+    cancelAnimationFrame(drag.rafId);
+    drag.rafId = null;
+  }
+}
+
+/* Velocity for this frame from the cached pointer position: 0 outside both
+ * bands, ramping linearly to ±SCROLL_MAX_V at the very edge. Negative scrolls
+ * up (top band), positive scrolls down (bottom band). */
+function autoScrollVelocity() {
+  if (!drag) return 0;
+  const band = Math.min(SCROLL_BAND, window.innerHeight * 0.12);
+  const y = drag.lastY;
+  if (y < band) return -SCROLL_MAX_V * ((band - y) / band);
+  const fromBottom = window.innerHeight - y;
+  if (fromBottom < band) return SCROLL_MAX_V * ((band - fromBottom) / band);
+  return 0;
+}
+
+/* One frame of the loop: scroll, re-find the drop target under the now-moved
+ * content, and reschedule while still in a band. scrollBy no-ops past the
+ * document's scroll bounds, so no manual clamp is needed. */
+function autoScrollTick() {
+  if (!drag || !drag.active) { if (drag) drag.rafId = null; return; }
+  const v = autoScrollVelocity();
+  if (v === 0) { drag.rafId = null; return; }
+  window.scrollBy(0, v);
+  highlightColumnAt(drag.lastX, drag.lastY);
+  drag.rafId = requestAnimationFrame(autoScrollTick);
 }
 
 /** @param {number} x @param {number} y */
@@ -279,6 +335,7 @@ function onDragEnd(e) {
 function endDrag() {
   if (!drag) return;
   clearTimeout(drag.holdTimer);
+  if (drag.rafId != null) cancelAnimationFrame(drag.rafId);
   if (drag.clone) drag.clone.remove();
   if (drag.overCol) drag.overCol.classList.remove('drag-over');
   drag.el.classList.remove('dragging');

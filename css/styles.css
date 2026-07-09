@@ -104,7 +104,27 @@ h1 { font-size: 18px; margin: 0; font-weight: 650; }
   .tabs { padding: 8px 14px 0; }
   .main { padding: 14px 14px 24px; gap: 14px; }
   h1 { font-size: 16px; }
+
+  /* Modal → bottom sheet: dock it to the bottom edge (native iOS pattern,
+   * thumb-reachable) instead of floating centered. Overrides the base
+   * .overlay/.modal rules by source order at this width. */
+  .overlay { align-items: flex-end; }              /* dock the sheet to the bottom edge */
+  .modal {
+    width: 100vw;                                   /* edge-to-edge; overrides min(420px,…) */
+    max-width: none;
+    border-radius: 16px 16px 0 0;                   /* round the top, square the bottom */
+    /* clear the iOS home indicator; falls back to 20px where env() is unsupported */
+    padding: 20px 20px calc(20px + env(safe-area-inset-bottom));
+    animation: sheet-up .22s ease-out;              /* CSS-only slide-up affordance */
+  }
+  /* Grabber handle above the title — a small pull-tab, pure CSS. */
+  .modal::before {
+    content: ''; align-self: center;
+    width: 36px; height: 4px; border-radius: 2px;
+    background: var(--border); margin: -6px 0 4px;
+  }
 }
+@keyframes sheet-up { from { transform: translateY(100%); } to { transform: translateY(0); } }
 
 /* Life dashboard sidebar — left of the board (order:-1 puts it first
  * regardless of flex-direction, so it's also on top on mobile), Life tab
@@ -175,6 +195,32 @@ h1 { font-size: 18px; margin: 0; font-weight: 650; }
 .sticky .side-del { position: absolute; top: 2px; right: 4px; color: rgba(58,51,32,.5); }
 .sticky:hover .side-del { opacity: 1; }
 .sticky .side-del:hover { color: #b91c1c; }
+
+/* Touch: always-visible, finger-sized delete targets. `.side-del` is
+ * opacity:0 and only revealed on hover (above), so on a phone the focus/date/
+ * sticky `×` is invisible and untappable. This block comes AFTER the hover
+ * rules so it wins by source order on touch; desktop is hover:hover and never
+ * matches it, leaving hover behavior untouched. */
+@media (hover: none), (pointer: coarse) {
+  .side-del {
+    opacity: 1;                 /* defeat the hover gate — always shown on touch */
+    /* Grow the tap target to ~44px without bloating the row: ~14px vertical +
+     * ~12px horizontal padding around the 15px glyph. Rows are align-items
+     * centered, so the extra vertical padding overlaps the row height and does
+     * NOT push rows taller; the negative margin cancels the layout footprint. */
+    padding: 14px 12px;
+    margin: -6px -8px;
+    min-width: 44px; min-height: 44px;
+    display: inline-flex; align-items: center; justify-content: center;
+  }
+  /* Sticky notes position .side-del absolutely (above); keep it pinned in the
+   * corner but still finger-sized. Nudge origin to absorb the new padding. */
+  .sticky .side-del {
+    top: -4px; right: -2px;
+    padding: 12px;
+    margin: 0;
+  }
+}
 
 .sticky[data-color="yellow"] { background: #fdf3a6; }
 .sticky[data-color="pink"]   { background: #ffd0dd; }
@@ -265,7 +311,7 @@ body.dragging-active { cursor: grabbing; }
 .modal label { font-size: 12px; font-weight: 600; color: var(--muted); display: block; margin-bottom: 4px; }
 .modal input[type=text], .modal textarea, .modal select {
   width: 100%; border: 1px solid var(--border); border-radius: 8px;
-  padding: 8px 10px; font-size: 14px; font-family: inherit; background: var(--bg); color: var(--text);
+  padding: 8px 10px; font-size: 16px; font-family: inherit; background: var(--bg); color: var(--text);
 }
 .modal textarea { resize: vertical; min-height: 64px; }
 .modal input:focus, .modal textarea:focus, .modal select:focus { outline: 2px solid var(--accent); border-color: transparent; }
