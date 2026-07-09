@@ -196,6 +196,32 @@ h1 { font-size: 18px; margin: 0; font-weight: 650; }
 .sticky:hover .side-del { opacity: 1; }
 .sticky .side-del:hover { color: #b91c1c; }
 
+/* Touch: always-visible, finger-sized delete targets. `.side-del` is
+ * opacity:0 and only revealed on hover (above), so on a phone the focus/date/
+ * sticky `×` is invisible and untappable. This block comes AFTER the hover
+ * rules so it wins by source order on touch; desktop is hover:hover and never
+ * matches it, leaving hover behavior untouched. */
+@media (hover: none), (pointer: coarse) {
+  .side-del {
+    opacity: 1;                 /* defeat the hover gate — always shown on touch */
+    /* Grow the tap target to ~44px without bloating the row: ~14px vertical +
+     * ~12px horizontal padding around the 15px glyph. Rows are align-items
+     * centered, so the extra vertical padding overlaps the row height and does
+     * NOT push rows taller; the negative margin cancels the layout footprint. */
+    padding: 14px 12px;
+    margin: -6px -8px;
+    min-width: 44px; min-height: 44px;
+    display: inline-flex; align-items: center; justify-content: center;
+  }
+  /* Sticky notes position .side-del absolutely (above); keep it pinned in the
+   * corner but still finger-sized. Nudge origin to absorb the new padding. */
+  .sticky .side-del {
+    top: -4px; right: -2px;
+    padding: 12px;
+    margin: 0;
+  }
+}
+
 .sticky[data-color="yellow"] { background: #fdf3a6; }
 .sticky[data-color="pink"]   { background: #ffd0dd; }
 .sticky[data-color="blue"]   { background: #bfe3ff; }
