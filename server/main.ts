@@ -152,20 +152,6 @@ function isApiPath(p: string): boolean {
     p === "/tickets" || p.startsWith("/tickets/");
 }
 
-/* Generate the gitignored js/config.local.js so the token lives in env, not
- * git. base is this same origin — board and API are one app, so the browser's
- * calls are same-origin and never hit CORS. TOKEN is guaranteed set by the
- * time this runs (the handler 500s earlier otherwise). */
-function configJs(origin: string): Response {
-  const cfg = { base: origin, token: TOKEN };
-  return new Response(`window.KODER_API = ${JSON.stringify(cfg)};\n`, {
-    headers: {
-      "Content-Type": "text/javascript; charset=utf-8",
-      "Cache-Control": "no-store", // token/URL can change without a shell redeploy
-    },
-  });
-}
-
 Deno.serve(async (req: Request) => {
   const url = new URL(req.url);
 
@@ -175,11 +161,14 @@ Deno.serve(async (req: Request) => {
 
   /* ---- Static frontend (no auth) ----
    * Any GET that isn't an API path serves the PWA's files, so this one app is
-   * also the board a phone loads over HTTPS. js/config.local.js is generated
-   * from env; everything else comes off disk. API paths fall through to the
-   * token gate below. */
+   * also the board a phone loads over HTTPS. The static files are public by
+   * design (the repo is public); the board data only moves through the token-
+   * gated API. The token itself is NEVER served: it used to be handed out via
+   * a generated /js/config.local.js, which gave full read/write to anyone who
+   * found the URL. Now each device gets it once via the app's "Connect sync"
+   * flow (js/config.local.js remains a gitignored local-dev override, served
+   * off disk if present). */
   if (req.method === "GET" && !isApiPath(url.pathname)) {
-    if (url.pathname === "/js/config.local.js") return configJs(url.origin);
     return serveDir(req, { fsRoot: ROOT, quiet: true });
   }
 

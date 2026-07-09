@@ -20,6 +20,38 @@
 import { normalize, allCardIds, lifeMetaIds, mergeBoards, boardHasContent } from './store.js';
 import { STORE_KEY, state, setState, writeCache, onSave } from './state.js';
 
+/* ---- API config resolution ----
+ * Two sources, checked in order:
+ *  1. js/config.local.js (gitignored classic script) sets window.KODER_API
+ *     directly — the local-dev override, loaded before any module runs.
+ *  2. A token pasted into the header's "Connect sync" flow, persisted in
+ *     localStorage. The API base is this same origin — frontend and API are
+ *     one Deno app — so only the token needs storing.
+ * The server never serves the token: handing it to whoever GETs a URL would
+ * make the bearer auth pointless (see server/main.ts). Each device gets the
+ * token pasted once instead. */
+const TOKEN_KEY = STORE_KEY + ':apiToken';
+{
+  const w = /** @type {any} */ (window);
+  const token = localStorage.getItem(TOKEN_KEY);
+  if (!w.KODER_API && token) w.KODER_API = { base: location.origin, token };
+}
+
+/* Validate a pasted token against this origin's API; persist it on success.
+ * The caller reloads so the app boots through the normal sync path. A wrong
+ * token, or a host with no API behind it (npx serve), returns false. */
+/** @param {string} token @returns {Promise<boolean>} */
+export async function connectSync(token) {
+  token = token.trim();
+  if (!token) return false;
+  try {
+    const res = await fetch('/state', { headers: { 'Authorization': 'Bearer ' + token } });
+    if (!res.ok) return false;
+  } catch (e) { return false; }
+  localStorage.setItem(TOKEN_KEY, token);
+  return true;
+}
+
 export const SYNC = {
   rev: parseInt(localStorage.getItem(STORE_KEY + ':rev') || '0', 10),
   dirty: localStorage.getItem(STORE_KEY + ':dirty') === '1',
