@@ -27,6 +27,8 @@
     <div class="header-right">
       <!-- Shown only when the browser fires `beforeinstallprompt` (see js/pwa.js) -->
       <button id="installBtn" class="btn btn-install" hidden>Install app</button>
+      <!-- Shown only when sync isn't configured yet (see js/connect.js) -->
+      <button id="connectBtn" class="btn btn-install" hidden>Connect sync</button>
       <!-- Shown when server sync fails with an HTTP error (see js/sync.js) -->
       <span id="syncBadge" class="sync-badge" hidden></span>
       <span id="offlineBadge" class="offline-badge" hidden>Offline</span>
@@ -79,6 +81,22 @@
         <button class="btn btn-danger" id="btnDelete" hidden>Delete</button>
         <button class="btn btn-ghost" id="btnCancel">Cancel</button>
         <button class="btn btn-primary" id="btnSave">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Connect-sync modal: paste a token to link this device (see js/connect.js) -->
+  <div class="overlay" id="syncOverlay">
+    <div class="modal">
+      <h2>Connect sync</h2>
+      <div>
+        <label for="fSyncToken">Sync token</label>
+        <input type="text" id="fSyncToken" placeholder="Paste your token" autocomplete="off">
+      </div>
+      <p class="sync-error" id="syncError" hidden>That token didn't work. Check it and try again.</p>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" id="btnSyncCancel">Cancel</button>
+        <button class="btn btn-primary" id="btnSyncConnect">Connect</button>
       </div>
     </div>
   </div>

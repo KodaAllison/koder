@@ -13,6 +13,7 @@
  * This file just wires them together: load projects, first paint, start sync. */
 
 import './pwa.js';
+import './connect.js';
 import { loadProjects } from './state.js';
 import { initSync } from './sync.js';
 import { render } from './board.js';

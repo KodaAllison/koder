@@ -278,6 +278,8 @@ body.dragging-active { cursor: grabbing; }
 .btn-danger:hover { background: var(--high); }
 .btn-install { background: var(--accent-soft); color: var(--accent); }
 
+.sync-error { margin: -4px 0 0; font-size: 13px; color: var(--high-t); }
+
 .empty-hint { font-size: 12px; color: var(--muted); text-align: center; padding: 8px 0; }
 
 /* update toast */
