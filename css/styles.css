@@ -91,9 +91,12 @@ h1 { font-size: 18px; margin: 0; font-weight: 650; }
 @media (max-width: 900px) {
   .board { grid-template-columns: repeat(2, 1fr); }
   .main { flex-direction: column; }
-  .life-sidebar { width: auto; position: static; max-height: none; }
-  /* Sidebar is no longer sticky here, so clipping x is safe — keeps a card
-   * clone dragged near the edge from adding a horizontal scrollbar. */
+  /* Clipping x is only safe because the sidebar drops out of sticky at this
+   * same breakpoint — see the .life-sidebar override further down, which has
+   * to live below the base rule to win. body{overflow-x:hidden} makes the body
+   * a scroll container, which would break position:sticky if it still applied.
+   * The clip keeps a card clone dragged near the edge from adding a
+   * horizontal scrollbar. */
   body { overflow-x: hidden; }
 }
 @media (max-width: 520px) {
@@ -141,6 +144,33 @@ h1 { font-size: 18px; margin: 0; font-weight: 650; }
   max-height: calc(100vh - 32px); overflow-y: auto;
 }
 .life-sidebar[hidden] { display: none; }
+
+/* Mobile: stop being a sticky rail, become a normal stacked panel.
+ *
+ * This override used to live in the @media (max-width:900px) block near the
+ * top of the file and silently did nothing: both selectors are plain
+ * `.life-sidebar` (0,1,0) and a media query adds no specificity, so the base
+ * rule above — being later in the file — won every declaration. The sidebar
+ * therefore pinned itself to the top of the viewport on phones and covered the
+ * board. Placing the block AFTER the base rule is the whole fix; same idiom as
+ * the touch block further down, and why !important isn't needed.
+ *
+ * All four declarations matter now that they actually apply:
+ *  - position/width: back to a full-bleed panel in the stacked column.
+ *  - align-self: the base sets flex-start (correct for a rail beside the
+ *    board); once .main is a column that's the cross axis, so it would leave
+ *    the panel shrink-to-fit and narrower than the board below it.
+ *  - max-height/overflow-y: dropping max-height alone isn't enough. An
+ *    overflow-y of auto forces overflow-x to compute to auto too, making a
+ *    nested scrollport that traps scroll and can show its own horizontal bar
+ *    (the stickies are rotated). Back to visible so the page just scrolls. */
+@media (max-width: 900px) {
+  .life-sidebar {
+    width: auto; align-self: stretch;
+    position: static;
+    max-height: none; overflow-y: visible;
+  }
+}
 
 .side-sec { display: flex; flex-direction: column; gap: 8px; }
 .side-sec + .side-sec { border-top: 1px solid var(--border); padding-top: 20px; }
