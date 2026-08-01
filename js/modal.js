@@ -10,6 +10,12 @@ import { render } from './render.js';
 /** @type {{ card: import('./store.js').Card|null, colId: string }|null} */
 let editing = null;
 
+/* Snapshot of the form as it was opened. Escape and a backdrop click are easy
+ * to hit by accident mid-sentence, and they used to discard silently — so we
+ * compare against this to tell "nothing typed" (close instantly, as before)
+ * from "real edits" (worth one confirm). */
+let pristine = '';
+
 const overlay = /** @type {HTMLElement} */ (document.getElementById('overlay'));
 const fTitle = /** @type {HTMLInputElement} */ (document.getElementById('fTitle'));
 const fNote = /** @type {HTMLTextAreaElement} */ (document.getElementById('fNote'));
@@ -36,6 +42,21 @@ function option(value, label) {
   o.value = value;
   o.textContent = label;
   return o;
+}
+
+/* The fields saveModal would actually persist, in the shape it would persist
+ * them: title/note trimmed (so trailing whitespace isn't "an edit"), and the
+ * project select ignored unless it's the visible projects-board field — it
+ * keeps a stale value while hidden, which would read as dirty on every Life
+ * ticket otherwise. */
+function formSnapshot() {
+  return JSON.stringify([
+    fTitle.value.trim(),
+    fNote.value.trim(),
+    fPriority.value,
+    fCol.value,
+    projectField.hidden ? '' : fProject.value,
+  ]);
 }
 
 /**
@@ -70,11 +91,19 @@ export function openModal(card, colId) {
   fPriority.value = card ? card.priority : 'med';
   fCol.value = colId;
   btnDelete.hidden = !card;
+  pristine = formSnapshot();   // after every field is populated, before the user can touch it
   overlay.classList.add('open');
   fTitle.focus();
 }
 
 function closeModal() { overlay.classList.remove('open'); editing = null; }
+
+/* Every discard path (Cancel, backdrop, Escape) goes through here; save and
+ * delete call closeModal directly since they aren't losing anything. */
+function dismissModal() {
+  if (formSnapshot() !== pristine && !confirm('Discard your changes to this ticket?')) return;
+  closeModal();
+}
 
 function saveModal() {
   if (!editing) return;
@@ -111,11 +140,13 @@ function saveModal() {
 /* Static wiring — these elements exist for the lifetime of the page. */
 const btnCancel = /** @type {HTMLButtonElement} */ (document.getElementById('btnCancel'));
 const btnSave = /** @type {HTMLButtonElement} */ (document.getElementById('btnSave'));
-btnCancel.onclick = closeModal;
+btnCancel.onclick = dismissModal;
 btnSave.onclick = saveModal;
-overlay.addEventListener('click', e => { if (e.target === overlay) closeModal(); });
+overlay.addEventListener('click', e => { if (e.target === overlay) dismissModal(); });
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') closeModal();
+  /* Escape is document-wide, so it also fires with the modal shut — where the
+   * form still holds the last ticket's values and would prompt about them. */
+  if (e.key === 'Escape' && overlay.classList.contains('open')) dismissModal();
   if (e.key === 'Enter' && overlay.classList.contains('open') && e.target === fTitle) saveModal();
 });
 
