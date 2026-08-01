@@ -6,16 +6,23 @@
 #   ./scripts/koder-ticket.sh "Fix login bug" [options]     add a ticket
 #   ./scripts/koder-ticket.sh list [options]                list tickets
 #   ./scripts/koder-ticket.sh move <id> <column>            move a ticket
+#   ./scripts/koder-ticket.sh edit <id> [options]           edit a ticket
 #
-# Options (add / list):
+# Options (add / list / edit):
+#   --title "<text>"     ticket title (edit only — add takes it positionally)
 #   --project <id>       project id (a folder name under Code/)
 #   --column <id>        backlog | todo | doing | review | done   (add default: backlog)
 #   --priority <level>   low | med | high                (add default: med)
-#   --note "<text>"      optional details (add only)
+#   --note "<text>"      optional details (add / edit)
+#
+# `edit` needs at least one option and leaves every field you don't pass
+# alone. An empty value clears the field: --note "" wipes the note,
+# --project "" unassigns the ticket.
 #
 # Examples:
 #   ./scripts/koder-ticket.sh list --project holitrackr --column todo
 #   ./scripts/koder-ticket.sh move t_abc123_x1y2z doing
+#   ./scripts/koder-ticket.sh edit t_abc123_x1y2z --priority high --note "repro in #42"
 #
 # Config: KODER_API (server base URL) and KODER_TOKEN, from the environment
 # or from scripts/.koder.env (gitignored).
@@ -32,7 +39,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${KODER_TOKEN:?set KODER_TOKEN in the environment or scripts/.koder.env}"
 BASE="${KODER_API%/}"
 
-usage() { sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+usage() { sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
 
 # request <method> <path> [json-body] → body on stdout; exits 1 on HTTP error.
 request() {
@@ -81,16 +88,25 @@ case "$cmd" in
     OUT="$(request GET "/tickets${QS:+?$QS}")"
     # One ticket per line: id | column | priority | [project] title — agents and
     # humans both read this; the raw JSON is available with the API directly.
-    # NB: printf '%s\n' — without the newline, `read` drops the final line.
-    printf '%s\n' "$OUT" | sed 's/},{/}\n{/g; s/{"tickets":\[//; s/\]}$//; s/^\[//' | while IFS= read -r line; do
-      [ -n "$line" ] || continue
-      id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
-      title=$(printf '%s' "$line" | sed -n 's/.*"title":"\([^"]*\)".*/\1/p')
-      col=$(printf '%s' "$line" | sed -n 's/.*"column":"\([^"]*\)".*/\1/p')
-      pri=$(printf '%s' "$line" | sed -n 's/.*"priority":"\([^"]*\)".*/\1/p')
-      proj=$(printf '%s' "$line" | sed -n 's/.*"project":"\([^"]*\)".*/\1/p')
-      [ -n "$id" ] && printf '%s | %-7s | %-4s | %s%s\n' "$id" "$col" "$pri" "${proj:+[$proj] }" "$title"
-    done
+    # Parsed with node (already a dependency, for `node --test`) rather than sed:
+    # the old regex split records on `},{` and pulled fields out with greedy
+    # patterns, so any title or note containing a quote or `},{` silently lost
+    # its column/priority. node also does the padding, so the format is unchanged
+    # (`%-7s`/`%-4s` → padEnd(7)/padEnd(4)) and it emits a trailing newline per
+    # line, which the old `read` loop needed printf '%s\n' to get right.
+    printf '%s' "$OUT" | node -e '
+      let raw = "";
+      process.stdin.on("data", (chunk) => { raw += chunk; });
+      process.stdin.on("end", () => {
+        const tickets = JSON.parse(raw).tickets || [];
+        for (const t of tickets) {
+          const col = String(t.column ?? "").padEnd(7);
+          const pri = String(t.priority ?? "").padEnd(4);
+          const proj = t.project ? "[" + t.project + "] " : "";
+          console.log(t.id + " | " + col + " | " + pri + " | " + proj + (t.title ?? ""));
+        }
+      });
+    '
     ;;
 
   move)
@@ -98,6 +114,31 @@ case "$cmd" in
     COLUMN="${3:?usage: koder-ticket.sh move <id> <column>}"
     request PATCH "/tickets/$ID" "{\"column\":\"$(json_escape "$COLUMN")\"}" > /dev/null
     echo "moved $ID to $COLUMN"
+    ;;
+
+  edit)
+    shift
+    ID="${1:?usage: koder-ticket.sh edit <id> [--title|--note|--priority|--project|--column <value>]}"
+    shift
+    # Only the options actually given go into the body; the server leaves
+    # everything else on the ticket untouched. `${2?...}` rather than the
+    # `${2:?...}` used elsewhere: an empty value is meaningful here (it's how
+    # you clear a note or unassign a project), but a missing one is still an
+    # error.
+    FIELDS=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --title)    FIELDS="$FIELDS,\"title\":\"$(json_escape "${2?--title needs a value}")\"";       shift 2 ;;
+        --note)     FIELDS="$FIELDS,\"note\":\"$(json_escape "${2?--note needs a value}")\"";         shift 2 ;;
+        --priority) FIELDS="$FIELDS,\"priority\":\"$(json_escape "${2?--priority needs a value}")\""; shift 2 ;;
+        --project)  FIELDS="$FIELDS,\"project\":\"$(json_escape "${2?--project needs a value}")\"";   shift 2 ;;
+        --column)   FIELDS="$FIELDS,\"column\":\"$(json_escape "${2?--column needs a value}")\"";     shift 2 ;;
+        *) echo "unknown option: $1" >&2; usage ;;
+      esac
+    done
+    [ -n "$FIELDS" ] || { echo "edit: pass at least one of --title/--note/--priority/--project/--column" >&2; exit 1; }
+    request PATCH "/tickets/$ID" "{${FIELDS#,}}" > /dev/null
+    echo "updated $ID"
     ;;
 
   -h|--help)

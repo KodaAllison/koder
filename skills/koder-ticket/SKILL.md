@@ -1,6 +1,6 @@
 ---
 name: koder-ticket
-description: Read, add, and move tickets on Koda's personal kanban board (Koder). Use whenever Koda asks to file/track/log a ticket or todo on "the board", "koder", or "my kanban" — or asks to look at, pick up, or work on tickets for a project (e.g. "grab a ticket from holitrackr and work on it").
+description: Read, add, edit, and move tickets on Koda's personal kanban board (Koder). Use whenever Koda asks to file/track/log a ticket or todo on "the board", "koder", or "my kanban" — or asks to look at, pick up, or work on tickets for a project (e.g. "grab a ticket from holitrackr and work on it").
 ---
 
 # Work with tickets on the Koder board
@@ -41,6 +41,20 @@ inside one of the `~/Code` repos, default `--project` to that folder's name.
 ~/Code/koder/scripts/koder-ticket.sh move t_abc123_x1y2z doing
 ```
 
+**Edit a ticket** — fix a title, note, priority, project or column after the
+fact. Pass any subset of the options; anything you leave out stays as it is:
+
+```bash
+~/Code/koder/scripts/koder-ticket.sh edit t_abc123_x1y2z \
+  --title "Fix flaky auth test in CI" --priority high \
+  --note "Only fails on the Windows runner; clock mock is the suspect."
+```
+
+At least one option is required. An empty value clears the field: `--note ""`
+wipes the note, `--project ""` unassigns the ticket. Use this instead of
+re-filing a ticket when the wording or metadata is wrong — re-filing loses the
+id other work already refers to. `--column` does the same thing as `move`.
+
 ## The "pick up work" workflow
 
 When Koda says "look at the tickets on X and work on one":
@@ -76,6 +90,8 @@ curl -sS -X POST -H "Authorization: Bearer $KODER_TOKEN" -H 'Content-Type: appli
   -d '{"title":"...","project":"...","column":"backlog"}' "${KODER_API%/}/tickets"
 curl -sS -X PATCH -H "Authorization: Bearer $KODER_TOKEN" -H 'Content-Type: application/json' \
   -d '{"column":"doing"}' "${KODER_API%/}/tickets/<id>"
+curl -sS -X PATCH -H "Authorization: Bearer $KODER_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"title":"Better title","priority":"high"}' "${KODER_API%/}/tickets/<id>"
 ```
 
 Full API docs: `~/Code/koder/server/README.md`.

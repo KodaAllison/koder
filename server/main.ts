@@ -38,7 +38,9 @@
  *   POST  /state/restore → { rev } → re-lands that snapshot as a new head rev
  *   POST  /tickets      → { title, note?, project?, column?, priority? } → { card, rev }
  *   GET   /tickets      → compact list; filters: ?project=<id>&column=<id>
- *   PATCH /tickets/:id  → { column } → moves the ticket → { card, column, rev }
+ *   PATCH /tickets/:id  → any subset of { title, note, priority, project, column }
+ *                         → edits the ticket in place; `column` moves it
+ *                         → { card, column, rev }
  *
  * Env: KODER_TOKEN (required), KODER_ORIGIN (optional — lock CORS to the
  * deployed board origin instead of "*" once you know it).
@@ -69,6 +71,21 @@ const ROOT = (() => {
 
 const PROJECT_COLUMNS = ["backlog", "todo", "doing", "review", "done"];
 const PRIORITIES = ["low", "med", "high"];
+
+// Field caps, applied identically on create and edit.
+const TITLE_MAX = 300;
+const NOTE_MAX = 5000;
+
+// The parts of a ticket a caller may set. Four of them live on the card;
+// `column` is the board key the card sits under, not a field on the card.
+const SETTABLE_FIELDS = ["title", "note", "priority", "project", "column"] as const;
+type TicketFields = {
+  title?: string;
+  note?: string;
+  priority?: string;
+  project?: string | null;
+  column?: string;
+};
 
 type Card = {
   id: string;
@@ -129,6 +146,61 @@ function isBoardShaped(b: unknown): b is Board {
   }
   if (o.lifeMeta != null && typeof o.lifeMeta !== "object") return false;
   return true;
+}
+
+/* Validate the settable ticket fields present in a request body. POST /tickets
+ * and PATCH /tickets/:id both go through here, so the caps and allowed values
+ * live in one place and an edit can never store something a create would have
+ * rejected. Fields absent from the body are absent from the result: PATCH
+ * treats what comes back as the partial update to apply, while POST fills its
+ * defaults into the body first (which is also how POST keeps its long-standing
+ * leniency — see there). Returns the cleaned values, or the body for a 400. */
+function cleanTicketFields(
+  body: Record<string, unknown>,
+): { fields: TicketFields } | { error: Record<string, unknown> } {
+  const fields: TicketFields = {};
+  for (const name of SETTABLE_FIELDS) {
+    if (!(name in body)) continue;
+    const v = body[name];
+    switch (name) {
+      case "title":
+        if (typeof v !== "string" || !v.trim()) {
+          return { error: { error: "title must be a non-empty string" } };
+        }
+        if (v.length > TITLE_MAX) {
+          return { error: { error: `title too long (max ${TITLE_MAX} chars)` } };
+        }
+        fields.title = v.trim();
+        break;
+      case "note":
+        if (typeof v !== "string") return { error: { error: "note must be a string" } };
+        if (v.length > NOTE_MAX) {
+          return { error: { error: `note too long (max ${NOTE_MAX} chars)` } };
+        }
+        fields.note = v.trim();
+        break;
+      case "priority":
+        if (typeof v !== "string" || !PRIORITIES.includes(v)) {
+          return { error: { error: `invalid priority "${v}"`, valid: PRIORITIES } };
+        }
+        fields.priority = v;
+        break;
+      case "project":
+        // null and "" both mean unassigned — that's how the client stores it.
+        if (v !== null && typeof v !== "string") {
+          return { error: { error: "project must be a string or null" } };
+        }
+        fields.project = v ? v : null;
+        break;
+      case "column":
+        if (typeof v !== "string" || !PROJECT_COLUMNS.includes(v)) {
+          return { error: { error: `invalid column "${v}"`, valid: PROJECT_COLUMNS } };
+        }
+        fields.column = v;
+        break;
+    }
+  }
+  return { fields };
 }
 
 const CORS: Record<string, string> = {
@@ -287,41 +359,65 @@ Deno.serve(async (req: Request) => {
     return json({ tickets });
   }
 
-  /* ---- PATCH /tickets/:id: move a ticket between columns ----
-   * The agent workflow: move to "doing" when picking work up, "review" once
-   * a PR is raised. "done" is reserved for after merge — a human or a
-   * separate reviewing agent moves it there, not the implementing agent.
-   * Same atomic read-modify-write pattern as POST. The `rev` in the response
-   * is the board's new head after this move, not a revision of the ticket
-   * itself — tickets don't have their own version number. */
-  const moveMatch = url.pathname.match(/^\/tickets\/([^/]+)$/);
-  if (moveMatch && req.method === "PATCH") {
-    const id = moveMatch[1];
+  /* ---- PATCH /tickets/:id: move and/or edit a ticket ----
+   * Takes any subset of { title, note, priority, project, column }; whatever
+   * you leave out is left alone.
+   *
+   * `column` moves the card, which is the agent workflow: move to "doing"
+   * when picking work up, "review" once a PR is raised. "done" is reserved
+   * for after merge — a human or a separate reviewing agent moves it there,
+   * not the implementing agent.
+   *
+   * The other four edit the card where it sits, so a title, note, priority or
+   * project that was wrong at creation can be fixed from the CLI or by an
+   * agent, instead of needing a whole-board PUT /state (which means reading
+   * and re-sending the board, and racing the open browser tab for it).
+   *
+   * Values go through cleanTicketFields, the same validation POST uses, and
+   * the write goes through the same atomic read-modify-write. The `rev` in
+   * the response is the board's new head after this write, not a revision of
+   * the ticket itself — tickets don't have their own version number. */
+  const ticketMatch = url.pathname.match(/^\/tickets\/([^/]+)$/);
+  if (ticketMatch && req.method === "PATCH") {
+    const id = ticketMatch[1];
     const body = await req.json().catch(() => null);
-    if (!body || !PROJECT_COLUMNS.includes(body.column)) {
-      return json({ error: "column is required", valid: PROJECT_COLUMNS }, 400);
+    if (!body || typeof body !== "object") {
+      return json({ error: "expected a JSON object body", settable: SETTABLE_FIELDS }, 400);
+    }
+    const cleaned = cleanTicketFields(body);
+    if ("error" in cleaned) return json(cleaned.error, 400);
+    const { column, ...edits } = cleaned.fields;
+    if (column === undefined && Object.keys(edits).length === 0) {
+      return json({ error: "nothing to patch", settable: SETTABLE_FIELDS }, 400);
     }
     for (let attempt = 0; attempt < 5; attempt++) {
       const entry = await kv.get<Doc>(KEY);
       const cur = structuredClone(entry.value ?? emptyDoc());
       let card: Card | null = null;
-      for (const cards of Object.values(cur.board.projects ?? {})) {
+      let from: string | null = null;
+      for (const [col, cards] of Object.entries(cur.board.projects ?? {})) {
         const i = (cards ?? []).findIndex((c) => c.id === id);
         if (i !== -1) {
-          card = cards.splice(i, 1)[0];
+          from = col;
+          // Only lift the card out when we're moving it — an edit with no
+          // `column` must not reshuffle the column it already sits in.
+          card = column === undefined ? cards[i] : cards.splice(i, 1)[0];
           break;
         }
       }
-      if (!card) return json({ error: `no ticket with id "${id}"` }, 404);
-      cur.board.projects ??= {};
-      (cur.board.projects[body.column] ??= []).push(card);
+      if (!card || from === null) return json({ error: `no ticket with id "${id}"` }, 404);
+      Object.assign(card, edits);
+      if (column !== undefined) {
+        cur.board.projects ??= {};
+        (cur.board.projects[column] ??= []).push(card);
+      }
       const doc: Doc = {
         rev: cur.rev + 1,
         updatedAt: new Date().toISOString(),
         board: cur.board,
       };
       const res = await commitDoc(entry, doc);
-      if (res.ok) return json({ card, column: body.column, rev: doc.rev });
+      if (res.ok) return json({ card, column: column ?? from, rev: doc.rev });
     }
     return json({ error: "write contention, retry" }, 503);
   }
@@ -333,26 +429,36 @@ Deno.serve(async (req: Request) => {
    * number, they just ride along with whatever the board's head is. */
   if (url.pathname === "/tickets" && req.method === "POST") {
     const body = await req.json().catch(() => null);
-    if (!body || typeof body.title !== "string" || !body.title.trim()) {
+    if (!body || typeof body !== "object") {
       return json({ error: "title (non-empty string) is required" }, 400);
     }
-    if (body.title.length > 300 || (typeof body.note === "string" && body.note.length > 5000)) {
-      return json({ error: "too long: title max 300 chars, note max 5000" }, 400);
+    /* Fill POST's defaults in BEFORE validating, so create and edit judge the
+     * same values through cleanTicketFields. This is also what preserves the
+     * leniency POST has always had: an unrecognised priority, or a non-string
+     * note/project/column, falls back to the default rather than 400ing.
+     * PATCH has no defaults to fall back to and so rejects instead — an edit
+     * that silently ignored the value you asked for is worse than an error. */
+    if (!PRIORITIES.includes(body.priority)) body.priority = "med";
+    if (typeof body.note !== "string") body.note = "";
+    if (typeof body.project !== "string" || !body.project) body.project = null;
+    if (typeof body.column !== "string" || !body.column) body.column = "backlog";
+
+    const cleaned = cleanTicketFields(body);
+    if ("error" in cleaned) return json(cleaned.error, 400);
+    const fields = cleaned.fields;
+    if (typeof fields.title !== "string") {
+      return json({ error: "title (non-empty string) is required" }, 400);
     }
-    const column = typeof body.column === "string" && body.column ? body.column : "backlog";
-    if (!PROJECT_COLUMNS.includes(column)) {
-      return json({ error: `invalid column "${column}"`, valid: PROJECT_COLUMNS }, 400);
-    }
-    const priority = PRIORITIES.includes(body.priority) ? body.priority : "med";
+    const column = fields.column ?? "backlog";
 
     // Matches the client's card shape (saveModal in js/app.js) exactly.
     const card: Card = {
       id: `t_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 5)}`,
-      title: body.title.trim(),
-      note: typeof body.note === "string" ? body.note.trim() : "",
-      priority,
+      title: fields.title,
+      note: fields.note ?? "",
+      priority: fields.priority ?? "med",
       created: Date.now(),
-      project: typeof body.project === "string" && body.project ? body.project : null,
+      project: fields.project ?? null,
     };
 
     // Atomic append with a few retries in case a client PUT lands mid-flight.
