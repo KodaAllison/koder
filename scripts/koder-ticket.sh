@@ -6,16 +6,23 @@
 #   ./scripts/koder-ticket.sh "Fix login bug" [options]     add a ticket
 #   ./scripts/koder-ticket.sh list [options]                list tickets
 #   ./scripts/koder-ticket.sh move <id> <column>            move a ticket
+#   ./scripts/koder-ticket.sh edit <id> [options]           edit a ticket
 #
-# Options (add / list):
+# Options (add / list / edit):
+#   --title "<text>"     ticket title (edit only — add takes it positionally)
 #   --project <id>       project id (a folder name under Code/)
 #   --column <id>        backlog | todo | doing | review | done   (add default: backlog)
 #   --priority <level>   low | med | high                (add default: med)
-#   --note "<text>"      optional details (add only)
+#   --note "<text>"      optional details (add / edit)
+#
+# `edit` needs at least one option and leaves every field you don't pass
+# alone. An empty value clears the field: --note "" wipes the note,
+# --project "" unassigns the ticket.
 #
 # Examples:
 #   ./scripts/koder-ticket.sh list --project holitrackr --column todo
 #   ./scripts/koder-ticket.sh move t_abc123_x1y2z doing
+#   ./scripts/koder-ticket.sh edit t_abc123_x1y2z --priority high --note "repro in #42"
 #
 # Config: KODER_API (server base URL) and KODER_TOKEN, from the environment
 # or from scripts/.koder.env (gitignored).
@@ -32,7 +39,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${KODER_TOKEN:?set KODER_TOKEN in the environment or scripts/.koder.env}"
 BASE="${KODER_API%/}"
 
-usage() { sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+usage() { sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
 
 # request <method> <path> [json-body] → body on stdout; exits 1 on HTTP error.
 request() {
@@ -107,6 +114,31 @@ case "$cmd" in
     COLUMN="${3:?usage: koder-ticket.sh move <id> <column>}"
     request PATCH "/tickets/$ID" "{\"column\":\"$(json_escape "$COLUMN")\"}" > /dev/null
     echo "moved $ID to $COLUMN"
+    ;;
+
+  edit)
+    shift
+    ID="${1:?usage: koder-ticket.sh edit <id> [--title|--note|--priority|--project|--column <value>]}"
+    shift
+    # Only the options actually given go into the body; the server leaves
+    # everything else on the ticket untouched. `${2?...}` rather than the
+    # `${2:?...}` used elsewhere: an empty value is meaningful here (it's how
+    # you clear a note or unassign a project), but a missing one is still an
+    # error.
+    FIELDS=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --title)    FIELDS="$FIELDS,\"title\":\"$(json_escape "${2?--title needs a value}")\"";       shift 2 ;;
+        --note)     FIELDS="$FIELDS,\"note\":\"$(json_escape "${2?--note needs a value}")\"";         shift 2 ;;
+        --priority) FIELDS="$FIELDS,\"priority\":\"$(json_escape "${2?--priority needs a value}")\""; shift 2 ;;
+        --project)  FIELDS="$FIELDS,\"project\":\"$(json_escape "${2?--project needs a value}")\"";   shift 2 ;;
+        --column)   FIELDS="$FIELDS,\"column\":\"$(json_escape "${2?--column needs a value}")\"";     shift 2 ;;
+        *) echo "unknown option: $1" >&2; usage ;;
+      esac
+    done
+    [ -n "$FIELDS" ] || { echo "edit: pass at least one of --title/--note/--priority/--project/--column" >&2; exit 1; }
+    request PATCH "/tickets/$ID" "{${FIELDS#,}}" > /dev/null
+    echo "updated $ID"
     ;;
 
   -h|--help)

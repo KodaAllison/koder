@@ -141,15 +141,28 @@ curl -sS -H "Authorization: Bearer $KODER_TOKEN" "$KODER_API/tickets?project=hol
 # → { "tickets": [ { "id": "t_...", "title": "...", "column": "todo", ... } ] }
 ```
 
-### PATCH /tickets/:id — move a ticket
+### PATCH /tickets/:id — move and/or edit a ticket
 
-Body: `{ "column": "backlog" | "todo" | "doing" | "review" | "done" }`. Finds the ticket
-anywhere on the projects board and moves it atomically. 404 if the id doesn't
-exist.
+Body: any subset of `{ title, note, priority, project, column }`. Finds the
+ticket anywhere on the projects board and applies the change atomically;
+fields you omit are left alone. 404 if the id doesn't exist, 400 on an empty
+body (nothing to patch). Response: `{ card, column, rev }`, where `column` is
+where the ticket ended up.
+
+`column` moves the card — one of `backlog | todo | doing | review | done`. The
+other four edit it in place, so a wrong title, note, priority or project can be
+fixed without a whole-board `PUT /state`. Values are validated exactly as
+`POST /tickets` validates them (title max 300 chars, note max 5000, priority
+one of `low | med | high`); `project: null` or `""` unassigns.
 
 ```bash
+# move it
 curl -sS -X PATCH -H "Authorization: Bearer $KODER_TOKEN" -H 'Content-Type: application/json' \
   -d '{"column":"doing"}' "$KODER_API/tickets/t_abc123_x1y2z"
+
+# edit it (and move it, if you like)
+curl -sS -X PATCH -H "Authorization: Bearer $KODER_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"title":"Fix login bug on mobile","priority":"high"}' "$KODER_API/tickets/t_abc123_x1y2z"
 ```
 
 Or use the wrapper for all of the above:
@@ -158,6 +171,7 @@ Or use the wrapper for all of the above:
 ./scripts/koder-ticket.sh "Fix login bug" --project holitrackr --priority high
 ./scripts/koder-ticket.sh list --project holitrackr --column todo
 ./scripts/koder-ticket.sh move t_abc123_x1y2z doing
+./scripts/koder-ticket.sh edit t_abc123_x1y2z --title "Fix login bug on mobile" --priority high
 ```
 
 ## Security note
