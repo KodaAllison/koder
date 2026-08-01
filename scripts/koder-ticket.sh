@@ -81,16 +81,25 @@ case "$cmd" in
     OUT="$(request GET "/tickets${QS:+?$QS}")"
     # One ticket per line: id | column | priority | [project] title — agents and
     # humans both read this; the raw JSON is available with the API directly.
-    # NB: printf '%s\n' — without the newline, `read` drops the final line.
-    printf '%s\n' "$OUT" | sed 's/},{/}\n{/g; s/{"tickets":\[//; s/\]}$//; s/^\[//' | while IFS= read -r line; do
-      [ -n "$line" ] || continue
-      id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
-      title=$(printf '%s' "$line" | sed -n 's/.*"title":"\([^"]*\)".*/\1/p')
-      col=$(printf '%s' "$line" | sed -n 's/.*"column":"\([^"]*\)".*/\1/p')
-      pri=$(printf '%s' "$line" | sed -n 's/.*"priority":"\([^"]*\)".*/\1/p')
-      proj=$(printf '%s' "$line" | sed -n 's/.*"project":"\([^"]*\)".*/\1/p')
-      [ -n "$id" ] && printf '%s | %-7s | %-4s | %s%s\n' "$id" "$col" "$pri" "${proj:+[$proj] }" "$title"
-    done
+    # Parsed with node (already a dependency, for `node --test`) rather than sed:
+    # the old regex split records on `},{` and pulled fields out with greedy
+    # patterns, so any title or note containing a quote or `},{` silently lost
+    # its column/priority. node also does the padding, so the format is unchanged
+    # (`%-7s`/`%-4s` → padEnd(7)/padEnd(4)) and it emits a trailing newline per
+    # line, which the old `read` loop needed printf '%s\n' to get right.
+    printf '%s' "$OUT" | node -e '
+      let raw = "";
+      process.stdin.on("data", (chunk) => { raw += chunk; });
+      process.stdin.on("end", () => {
+        const tickets = JSON.parse(raw).tickets || [];
+        for (const t of tickets) {
+          const col = String(t.column ?? "").padEnd(7);
+          const pri = String(t.priority ?? "").padEnd(4);
+          const proj = t.project ? "[" + t.project + "] " : "";
+          console.log(t.id + " | " + col + " | " + pri + " | " + proj + (t.title ?? ""));
+        }
+      });
+    '
     ;;
 
   move)
