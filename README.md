@@ -43,7 +43,7 @@ To enable sync, copy `js/config.example.js` to `js/config.local.js`
 | `js/pwa.js` | SW registration, update toast, install button, offline badge |
 | `js/render.js` | Repaint indirection (keeps the module graph acyclic) |
 | `css/styles.css` | All styling |
-| `tests/` | `node --test` (from the repo root) — covers `js/store.js` |
+| `tests/` | `node --test` (from the repo root) — covers `js/store.js` + the SW guards |
 | `sw.js` | Service worker — offline caching + update flow |
 | `manifest.webmanifest` | Makes the app installable |
 | `js/projects.json` | Generated project list (don't edit by hand) |
@@ -51,6 +51,7 @@ To enable sync, copy `js/config.example.js` to `js/config.local.js`
 | `js/config.local.js` | Your sync server URL + token (gitignored) |
 | `server/main.ts` | The whole backend: 3 endpoints, Deno KV |
 | `scripts/gen-projects.sh` | Regenerates `projects.json` from folders in `Code/` |
+| `scripts/stamp-sw.mjs` | Stamps `sw.js`'s `CACHE_NAME` from a hash of the shell |
 | `scripts/koder-ticket.sh` | CLI: add a ticket from any terminal |
 | `skills/koder-ticket/` | Claude Code skill so agents can use the CLI |
 
@@ -107,10 +108,31 @@ mkdir -p ~/.claude/skills && cp -r skills/koder-ticket ~/.claude/skills/
 - **Install it**: Chrome/Edge show an "Install app" button in the header.
 - **Go offline**: DevTools → Network → "Offline", reload — shell from the SW
   cache, tickets from localStorage.
-- **Ship an update**: change something visible, bump `CACHE_NAME` in `sw.js`,
+- **Ship an update**: change something visible, run `node scripts/stamp-sw.mjs`,
   reload twice — you'll get the update toast.
 - **Race yourself**: add a ticket via the CLI while dragging cards in the tab —
   watch the 409/merge path reconcile both (Network tab shows it).
+
+## Deploying
+
+Before pushing the frontend, on `main`:
+
+```bash
+node scripts/stamp-sw.mjs      # rewrites sw.js's CACHE_NAME from the shell's content hash
+node scripts/stamp-sw.mjs --check   # exits 1 if you forgot
+```
+
+`CACHE_NAME` keys the service worker's cache, so a stale one means phones keep
+serving the old shell after a deploy. It used to be a hand-bumped `-vN` that was
+easy to forget; now it's a hash of the actual `SHELL_ASSETS` bytes, so it changes
+exactly when the cached files do. Same idiom as `gen-projects.sh` — a regen
+script you run, not a build step.
+
+**Don't stamp on a feature branch.** `SHELL_ASSETS` covers `index.html`,
+`styles.css` and every `js/` module, so any UI branch changes the hash — if each
+branch stamped, they'd all conflict on that one line and the fix would be to
+re-run the script anyway. Stamp once on `main` after merging. For the same
+reason `node --test` doesn't assert freshness; `--check` above is the guard.
 
 ## Development notes
 

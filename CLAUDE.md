@@ -4,7 +4,9 @@ Personal Kanban PWA. Static, no build step. `index.html` + `css/styles.css` + ES
 under `js/` (`app.js` entry → `store.js` pure logic, `state.js` persistence, `sync.js`
 server sync, `board.js`/`sidebar.js`/`modal.js` UI, `pwa.js` SW glue, `render.js` repaint
 seam), data from `js/projects.json`. Service worker in `sw.js` — adding a JS module means
-adding it to `SHELL_ASSETS` and bumping `CACHE_NAME`.
+adding it to `SHELL_ASSETS`. Don't touch `CACHE_NAME`: it's stamped from a content
+hash by `node scripts/stamp-sw.mjs`, run on `main` before deploy and never on a
+feature branch (see "Deploying" in README.md).
 
 Tests: `node --test` from the repo root (covers the pure logic in `js/store.js` — keep store.js free
 of DOM/localStorage so this stays true). JS uses `// @ts-check` + JSDoc types.

@@ -10,9 +10,15 @@
  *   2. activate → old version is gone; clean up outdated caches here.
  *   3. fetch    → fires for EVERY network request; decide cache vs network.
  *
- * Bump this version string whenever you change any cached file
- * A byte-different sw.js is what triggers the browser to install
- * the new version (the "update flow" you'll see in app.js).
+ * A byte-different sw.js is what triggers the browser to install a new
+ * version (the "update flow" you'll see in app.js), and CACHE_NAME keys the
+ * cache so a new version purges the old shell. Don't edit CACHE_NAME by hand:
+ * it's a content hash of SHELL_ASSETS, stamped by `node scripts/stamp-sw.mjs`,
+ * so it changes exactly when the cached files do.
+ *
+ * Stamping happens on main at deploy time, not on feature branches — otherwise
+ * every branch that touches a shell file would conflict on this one line. See
+ * "Deploying" in README.md.
  */
 const CACHE_NAME = 'kanban-shell-v19';
 
