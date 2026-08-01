@@ -91,9 +91,10 @@ h1 { font-size: 18px; margin: 0; font-weight: 650; }
 @media (max-width: 900px) {
   .board { grid-template-columns: repeat(2, 1fr); }
   .main { flex-direction: column; }
-  .life-sidebar { width: auto; position: static; max-height: none; }
-  /* Sidebar is no longer sticky here, so clipping x is safe — keeps a card
-   * clone dragged near the edge from adding a horizontal scrollbar. */
+  /* Safe only because the sidebar drops out of sticky at this breakpoint (see
+   * the .life-sidebar override below) — this would otherwise make body a
+   * scroll container and break it. Keeps a dragged card clone from adding a
+   * horizontal scrollbar. */
   body { overflow-x: hidden; }
 }
 @media (max-width: 520px) {
@@ -141,6 +142,19 @@ h1 { font-size: 18px; margin: 0; font-weight: 650; }
   max-height: calc(100vh - 32px); overflow-y: auto;
 }
 .life-sidebar[hidden] { display: none; }
+
+/* Mobile: a normal stacked panel, not a sticky rail. Must stay BELOW the base
+ * rule — both selectors are plain `.life-sidebar` (0,1,0) and a media query
+ * adds no specificity, so source order decides. This lived in the 900px group
+ * above and silently did nothing. overflow-y back to visible too: `auto`
+ * forces overflow-x to auto, trapping scroll in a nested box. */
+@media (max-width: 900px) {
+  .life-sidebar {
+    width: auto; align-self: stretch;
+    position: static;
+    max-height: none; overflow-y: visible;
+  }
+}
 
 .side-sec { display: flex; flex-direction: column; gap: 8px; }
 .side-sec + .side-sec { border-top: 1px solid var(--border); padding-top: 20px; }
