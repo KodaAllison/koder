@@ -4,7 +4,7 @@
  * Everything re-renders from `state` on each change — simple and correct at
  * this scale; inline editors that must keep focus (sticky notes) opt out. */
 
-import { BOARDS, colsFor, boardFor, cardMatchesView, sortByPriority } from './store.js';
+import { BOARDS, colsFor, boardFor, cardMatchesView, sortByPriority, openCards } from './store.js';
 import { state, activeTab, setActiveTab, PROJECTS, projectIds, projectById, save } from './state.js';
 import { renderSidebar } from './sidebar.js';
 import { openModal } from './modal.js';
@@ -40,8 +40,9 @@ function renderTopTabs() {
   const el = /** @type {HTMLElement} */ (document.getElementById('topTabs'));
   el.innerHTML = '';
   const inProjects = boardFor(activeTab) === 'projects';
-  const lifeCount = Object.values(state.life).flat().length;
-  const projCount = Object.values(state.projects).flat().length;
+  // Open work only — see openCards. Both counts exclude the Done column.
+  const lifeCount = openCards(state, 'life').length;
+  const projCount = openCards(state, 'projects').length;
 
   [
     { active: !inProjects, name: 'Life', count: lifeCount, onclick: () => { setActiveTab('life'); render(); } },
@@ -56,20 +57,27 @@ function renderTabs() {
   if (!inProjects) return;
   el.innerHTML = '';
 
-  const projCards = Object.values(state.projects).flat();
+  // Counts report open work (Done excluded); the Unassigned/Unlinked tabs
+  // appear based on ALL cards, so a bucket whose every card is done still has
+  // a tab to reach it by — it just shows no number.
+  const openProjCards = openCards(state, 'projects');
+  const allProjCards = Object.values(state.projects).flat();
   const ids = projectIds();
 
   // All → each project → (Unassigned) → (Unlinked).
   const tabs = [
-    { id: 'all', name: 'All', count: projCards.length },
+    { id: 'all', name: 'All', count: openProjCards.length },
   ];
   PROJECTS.forEach(p => {
-    tabs.push({ id: p.id, name: p.name, count: projCards.filter(c => c.project === p.id).length });
+    tabs.push({ id: p.id, name: p.name, count: openProjCards.filter(c => c.project === p.id).length });
   });
-  const unassigned = projCards.filter(c => c.project == null).length;
-  if (unassigned) tabs.push({ id: 'unassigned', name: 'Unassigned', count: unassigned });
-  const unlinked = projCards.filter(c => c.project != null && !ids.has(c.project)).length;
-  if (unlinked) tabs.push({ id: 'unlinked', name: 'Unlinked', count: unlinked });
+  /** @param {(c: import('./store.js').Card) => boolean} pred */
+  const bucket = pred => ({ any: allProjCards.some(pred), count: openProjCards.filter(pred).length });
+
+  const unassigned = bucket(c => c.project == null);
+  if (unassigned.any) tabs.push({ id: 'unassigned', name: 'Unassigned', count: unassigned.count });
+  const unlinked = bucket(c => c.project != null && !ids.has(c.project));
+  if (unlinked.any) tabs.push({ id: 'unlinked', name: 'Unlinked', count: unlinked.count });
 
   tabs.forEach(t => appendTabButton(el, 'tab', {
     active: t.id === activeTab, name: t.name, count: t.count, id: t.id,

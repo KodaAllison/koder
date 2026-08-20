@@ -108,6 +108,20 @@ export function sortByPriority(cards) {
   return [...cards].sort((a, b) => PRIORITY_RANK[a.priority] - PRIORITY_RANK[b.priority]);
 }
 
+/* Finished work lives under the same column id on both boards. */
+export const DONE_COLUMN = 'done';
+
+/* Cards on one board with Done left out. This is what the tab counts report:
+ * a tab's number should read as "work outstanding", and Done only ever grows,
+ * so counting it makes every tab drift upward and tells you nothing. Column
+ * headers are unaffected — the Done column still counts its own cards. */
+/** @param {BoardState} s @param {keyof typeof BOARDS} boardId @returns {Card[]} */
+export function openCards(s, boardId) {
+  return Object.entries(s[boardId] || {})
+    .filter(([colId]) => colId !== DONE_COLUMN)
+    .flatMap(([, cards]) => cards);
+}
+
 /* One-time migration: earliest versions gave every tab the same dev-style
  * columns (backlog/todo/doing/done). Life now uses different column ids,
  * so move any existing life cards across instead of silently dropping them.
