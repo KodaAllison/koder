@@ -41,6 +41,15 @@
  *   PATCH /tickets/:id  → any subset of { title, note, priority, project, column }
  *                         → edits the ticket in place; `column` moves it
  *                         → { card, column, rev }
+ *   POST  /archive      → { cards } → lifts finished cards off the board
+ *   GET   /archive      → everything archived so far, newest first
+ *
+ * Archive: the board is ONE KV value, so it can only ever hold ~60KB, and Done
+ * is the only column that only ever grows. The archive is where done cards go
+ * to stop counting against that budget — a separate, append-only, chunked set
+ * of keys under ["archive", n], each sealed well short of the 64KB value cap.
+ * Nothing else reads it; it exists so finishing work can't eventually wedge
+ * sync (see js/archive.js).
  *
  * Env: KODER_TOKEN (required), KODER_ORIGIN (optional — lock CORS to the
  * deployed board origin instead of "*" once you know it).
@@ -60,6 +69,15 @@ const KEY = ["board"];
 // pointer ["board"] equals the prefix and is excluded). Each is a full board
 // copy — cheap, and every write prunes the one this far behind.
 const KEEP_REVISIONS = 20;
+
+// Archived cards live under ["archive", n], separate from the board so they
+// stop counting against its 60_000 budget.
+const ARCHIVE_KEY = ["archive"];
+// Seal a chunk once appending would take it past this. The gap to KV's 64KB
+// value cap is deliberate: one append carries at most a whole board's worth of
+// cards (<60_000, since that's all a PUT can hold), so a chunk that starts
+// empty still lands under the cap.
+const ARCHIVE_CHUNK_MAX = 50_000;
 
 // Repo root (this file is in server/) — where the PWA's static files live, so
 // one app can serve the frontend and the API. Derive from the module URL;
@@ -105,6 +123,9 @@ type Doc = {
   updatedAt: string | null;
   board: Board;
 };
+// A card as it looks once off the board: the client tags it with the board it
+// came from and when it left, so an archive read is legible on its own.
+type ArchivedCard = Card & { board?: string; archivedAt?: number };
 
 function emptyDoc(): Doc {
   return { rev: 0, updatedAt: null, board: { projects: {}, life: {}, lifeMeta: {} } };
@@ -203,6 +224,19 @@ function cleanTicketFields(
   return { fields };
 }
 
+/* Every archive chunk, oldest first. Callers read the whole set: it's how a
+ * POST dedupes by id across chunks, and the volume is a personal board's
+ * finished tickets, not a data warehouse. */
+async function readArchiveChunks(): Promise<{ index: number; cards: ArchivedCard[] }[]> {
+  const chunks: { index: number; cards: ArchivedCard[] }[] = [];
+  for await (const e of kv.list<ArchivedCard[]>({ prefix: ARCHIVE_KEY })) {
+    const index = Number(e.key[e.key.length - 1]);
+    if (Number.isInteger(index) && Array.isArray(e.value)) chunks.push({ index, cards: e.value });
+  }
+  chunks.sort((a, b) => a.index - b.index);
+  return chunks;
+}
+
 const CORS: Record<string, string> = {
   "Access-Control-Allow-Origin": Deno.env.get("KODER_ORIGIN") ?? "*",
   "Access-Control-Allow-Methods": "GET, PUT, POST, PATCH, OPTIONS",
@@ -221,7 +255,7 @@ function json(body: unknown, status = 200): Response {
  * request (the PWA's files) and skips the token gate. */
 function isApiPath(p: string): boolean {
   return p === "/state" || p === "/state/restore" || p === "/revisions" ||
-    p === "/tickets" || p.startsWith("/tickets/");
+    p === "/archive" || p === "/tickets" || p.startsWith("/tickets/");
 }
 
 Deno.serve(async (req: Request) => {
@@ -338,6 +372,62 @@ Deno.serve(async (req: Request) => {
     const res = await commitDoc(entry, doc);
     if (!res.ok) return json({ error: "conflict: concurrent write, retry" }, 409);
     return json({ rev: doc.rev, updatedAt: doc.updatedAt });
+  }
+
+  /* ---- POST /archive: lift finished cards off the board ----
+   * Append-only. The client sends the done cards it is about to drop, and only
+   * removes them locally once this returns ok — so a failure here loses
+   * nothing, and a retry after a half-failed request is safe because ids
+   * already present are skipped rather than duplicated. */
+  if (url.pathname === "/archive" && req.method === "POST") {
+    const body = await req.json().catch(() => null);
+    if (!body || typeof body !== "object" || !Array.isArray(body.cards)) {
+      return json({ error: "expected { cards: [...] }" }, 400);
+    }
+    const incoming: ArchivedCard[] = body.cards.filter((c: unknown) => {
+      if (!c || typeof c !== "object") return false;
+      const card = c as Record<string, unknown>;
+      return typeof card.id === "string" && typeof card.title === "string";
+    });
+    if (!incoming.length) return json({ error: "no id/title-shaped cards in body" }, 400);
+
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const chunks = await readArchiveChunks();
+      const seen = new Set(chunks.flatMap((c) => c.cards.map((card) => card.id)));
+      const fresh = incoming.filter((c) => !seen.has(c.id));
+      // Already archived in full — an idempotent no-op, not an error, so a
+      // client retrying a request that actually landed still gets to move on.
+      if (!fresh.length) {
+        return json({ archived: 0, duplicates: incoming.length, chunks: chunks.length });
+      }
+
+      const last = chunks[chunks.length - 1];
+      // Start a fresh chunk when appending would overflow the current one.
+      const sealed = !last ||
+        JSON.stringify([...last.cards, ...fresh]).length > ARCHIVE_CHUNK_MAX;
+      const index = last ? (sealed ? last.index + 1 : last.index) : 0;
+
+      const entry = await kv.get<ArchivedCard[]>([...ARCHIVE_KEY, index]);
+      const next = [...(entry.value ?? []), ...fresh];
+      const res = await kv.atomic().check(entry)
+        .set([...ARCHIVE_KEY, index], next).commit();
+      if (res.ok) {
+        return json({
+          archived: fresh.length,
+          duplicates: incoming.length - fresh.length,
+          chunk: index,
+        });
+      }
+    }
+    return json({ error: "write contention, retry" }, 503);
+  }
+
+  /* ---- GET /archive: everything lifted off the board, newest first ---- */
+  if (url.pathname === "/archive" && req.method === "GET") {
+    const chunks = await readArchiveChunks();
+    const cards = chunks.flatMap((c) => c.cards);
+    cards.sort((a, b) => (b.archivedAt ?? 0) - (a.archivedAt ?? 0));
+    return json({ count: cards.length, chunks: chunks.length, cards });
   }
 
   /* ---- GET /tickets: compact read for agents ----

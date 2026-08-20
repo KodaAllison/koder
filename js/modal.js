@@ -3,7 +3,7 @@
  * Exports openModal (used by board.js) and editorBusy (used by sync.js to
  * avoid yanking state out from under an open editor). */
 
-import { colsFor, boardFor, uid } from './store.js';
+import { colsFor, boardFor, uid, NOTE_MAX_CHARS } from './store.js';
 import { state, activeTab, PROJECTS, projectIds, save } from './state.js';
 import { render } from './render.js';
 
@@ -24,6 +24,11 @@ const fCol = /** @type {HTMLSelectElement} */ (document.getElementById('fCol'));
 const fProject = /** @type {HTMLSelectElement} */ (document.getElementById('fProject'));
 const projectField = /** @type {HTMLElement} */ (document.getElementById('projectField'));
 const btnDelete = /** @type {HTMLButtonElement} */ (document.getElementById('btnDelete'));
+
+/* Set here rather than in index.html so the cap has one source (store.js,
+ * mirroring the server's NOTE_MAX). Notes are the board's only unbounded
+ * field, and the board has a hard size ceiling on the sync server. */
+fNote.maxLength = NOTE_MAX_CHARS;
 
 /* Don't yank state out from under an open modal or a focused text field. */
 export function editorBusy() {
