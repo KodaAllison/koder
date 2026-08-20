@@ -122,6 +122,50 @@ export function openCards(s, boardId) {
     .flatMap(([, cards]) => cards);
 }
 
+/** Cards sitting in Done on one board. @param {BoardState} s @param {keyof typeof BOARDS} boardId @returns {Card[]} */
+export function doneCards(s, boardId) {
+  return (s[boardId] || {})[DONE_COLUMN] || [];
+}
+
+/* Drop cards by id from ONE board's Done column. Mutates `s`, returns how many
+ * went. Deliberately scoped to Done: the archive flow selects done cards, and
+ * if one got dragged out between the pick and the server's ack, leaving it on
+ * the board (harmlessly duplicated into the archive) beats vanishing it.
+ * Callers run this only after the server has the cards — see js/archive.js. */
+/** @param {BoardState} s @param {keyof typeof BOARDS} boardId @param {Set<string>} ids @returns {number} */
+export function removeDoneCards(s, boardId, ids) {
+  const col = (s[boardId] || {})[DONE_COLUMN];
+  if (!col) return 0;
+  const kept = col.filter(c => !ids.has(c.id));
+  const removed = col.length - kept.length;
+  s[boardId][DONE_COLUMN] = kept;
+  return removed;
+}
+
+/* ---------- size ceiling ----------
+ * The whole board rides in one PUT /state, and the server rejects a body over
+ * 60_000 because Deno KV caps a value at 64KB (server/main.ts). Past that line
+ * every push 413s and the board just sits dirty, so the size is worth watching
+ * before it's fatal rather than after. */
+export const BOARD_SIZE_LIMIT = 60_000;
+
+/* Warn at 80%, which leaves ~12_000 of headroom — enough that the shrunk board
+ * still pushes cleanly once done cards are archived off it. */
+export const BOARD_SIZE_WARN = BOARD_SIZE_LIMIT * 0.8;
+
+/* Measured the same way the server measures the request it arrives in: String
+ * .length, not UTF-8 bytes. The wire body wraps this in {"baseRev":N,"board":…},
+ * a couple of dozen characters that the warn headroom absorbs. */
+/** @param {BoardState} s @returns {number} */
+export function boardSize(s) {
+  return JSON.stringify(s).length;
+}
+
+/* Mirrors NOTE_MAX in server/main.ts. The server enforces it on agent writes
+ * only; the UI's own note fields are capped here so a long paste can't push
+ * the board over the ceiling in a place nothing validates. */
+export const NOTE_MAX_CHARS = 5000;
+
 /* One-time migration: earliest versions gave every tab the same dev-style
  * columns (backlog/todo/doing/done). Life now uses different column ids,
  * so move any existing life cards across instead of silently dropping them.

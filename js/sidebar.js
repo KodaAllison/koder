@@ -5,7 +5,7 @@
  * (placeholder for now). Built with textContent throughout so user text is
  * never interpreted as HTML. */
 
-import { uid } from './store.js';
+import { uid, NOTE_MAX_CHARS } from './store.js';
 import { state, activeTab, save, saveSoon } from './state.js';
 import { render } from './render.js';
 
@@ -239,6 +239,9 @@ function renderNotesSection(meta) {
     const ta = document.createElement('textarea');
     ta.className = 'sticky-text';
     ta.placeholder = 'Note…';
+    // Same cap as ticket notes: stickies ride in the same size-limited board
+    // PUT, and the server only validates notes on agent writes.
+    ta.maxLength = NOTE_MAX_CHARS;
     ta.value = note.text;
     // Autosave WITHOUT re-rendering, or typing would lose focus each keystroke.
     // saveSoon debounces the (whole-board) localStorage stringify per keypress;

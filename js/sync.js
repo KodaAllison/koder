@@ -17,7 +17,8 @@
  * UI hooks (render / editorBusy / onStatus) are injected via initSync() so
  * this module never imports the render layer. */
 
-import { normalize, allCardIds, lifeMetaIds, mergeBoards, boardHasContent } from './store.js';
+import { normalize, allCardIds, lifeMetaIds, mergeBoards, boardHasContent,
+         boardSize, BOARD_SIZE_LIMIT, BOARD_SIZE_WARN } from './store.js';
 import { STORE_KEY, state, setState, writeCache, onSave } from './state.js';
 
 /* ---- API config resolution ----
@@ -74,8 +75,10 @@ export function apiEnabled() {
   return !!(cfg && cfg.base && cfg.token);
 }
 
+/* The authenticated request helper. Exported because js/archive.js posts to
+ * /archive through the same base+token config. */
 /** @param {string} method @param {string} path @param {unknown} [body] */
-function api(method, path, body) {
+export function apiRequest(method, path, body) {
   const { base, token } = /** @type {any} */ (window).KODER_API;
   return fetch(base.replace(/\/+$/, '') + path, {
     method,
@@ -86,6 +89,11 @@ function api(method, path, body) {
     body: body ? JSON.stringify(body) : undefined,
   });
 }
+
+/* The header badge, reached by other modules (archive.js) without them having
+ * to know how app.js wired it up. */
+/** @param {string|null} msg */
+export function syncStatus(msg) { hooks.onStatus(msg); }
 
 export function markDirty() { SYNC.dirty = true; localStorage.setItem(STORE_KEY + ':dirty', '1'); }
 
@@ -108,13 +116,26 @@ function knownIds() {
   return new Set(synced);
 }
 
+/* Success-path status. Not simply "clear the badge": a board approaching the
+ * server's 60_000 ceiling gets a heads-up here, while pushes still work, so
+ * the first 413 isn't also the first warning. */
+function statusOk() { hooks.onStatus(sizeWarning()); }
+
+/** @returns {string|null} */
+function sizeWarning() {
+  const size = boardSize(state);
+  if (size < BOARD_SIZE_WARN) return null;
+  const pct = Math.round((size / BOARD_SIZE_LIMIT) * 100);
+  return `Board at ${pct}% of the sync limit — archive done cards`;
+}
+
 /* Map a failed response to a user-facing status message. Network errors are
  * NOT surfaced here — the offline badge already covers "no connectivity",
  * and the persisted dirty flag means those retry safely. HTTP errors are
  * different: they'll never self-heal, so the user must be told. */
 /** @param {Response} res */
 function reportHttpError(res) {
-  if (res.status === 413) hooks.onStatus('Sync failing: board too large for the server');
+  if (res.status === 413) hooks.onStatus('Board too large to sync — archive done cards');
   else if (res.status === 401) hooks.onStatus('Sync failing: token rejected');
   else hooks.onStatus(`Sync failing (HTTP ${res.status})`);
 }
@@ -132,7 +153,7 @@ export async function pushState() {
   if (SYNC.pushing) { schedulePush(); return; }
   SYNC.pushing = true;
   try {
-    let res = await api('PUT', '/state', { baseRev: SYNC.rev, board: state });
+    let res = await apiRequest('PUT', '/state', { baseRev: SYNC.rev, board: state });
     // A 409 means someone wrote since our baseRev — usually agent tickets via
     // POST /tickets, which can arrive in a burst that bumps rev several times.
     // Merge their additions and retry on the fresh rev, looping because another
@@ -140,18 +161,18 @@ export async function pushState() {
     // enough. Mirrors the server's own 5-attempt commit loop; each GET's
     // round-trip is the natural backoff, so no explicit sleep is needed.
     for (let attempt = 0; res.status === 409 && attempt < 5; attempt++) {
-      const cur = await api('GET', '/state');
+      const cur = await apiRequest('GET', '/state');
       // A failed re-GET means we didn't merge, so baseRev is unchanged and the
       // next PUT would just 409 again — bail and surface the GET's real error
       // below instead of masking it as an unresolved conflict.
       if (!cur.ok) { res = cur; break; }
       mergeRemote(await cur.json());
-      res = await api('PUT', '/state', { baseRev: SYNC.rev, board: state });
+      res = await apiRequest('PUT', '/state', { baseRev: SYNC.rev, board: state });
     }
     if (res.ok) {
       const j = await res.json();
       adoptRev(j.rev);
-      hooks.onStatus(null);
+      statusOk();
     } else {
       // Non-409 failure (or a 409 that survived the merge+retry): the board
       // stays dirty and would otherwise diverge silently — surface it.
@@ -176,11 +197,11 @@ export async function pullState() {
   if (SYNC.dirty || SYNC.pushing) { schedulePush(0); return; } // our edits go first (409-merge picks up remote adds)
   if (hooks.editorBusy()) return;
   try {
-    const res = await api('GET', '/state');
+    const res = await apiRequest('GET', '/state');
     if (!res.ok) { reportHttpError(res); return; }
     const doc = await res.json();
     if (!doc || typeof doc.rev !== 'number') return;
-    hooks.onStatus(null);
+    statusOk();
     if (doc.rev === 0) {
       // Empty server + non-empty local board → first run: seed the server.
       if (boardHasContent(state)) {
@@ -202,6 +223,7 @@ export async function pullState() {
     setState(normalize(doc.board || {}));
     writeCache();
     adoptRev(doc.rev);
+    statusOk();   // re-check: the board we just adopted is the one that matters
     hooks.render();
   } catch (e) { /* offline — keep the local cache */ }
 }

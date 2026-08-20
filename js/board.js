@@ -4,11 +4,12 @@
  * Everything re-renders from `state` on each change — simple and correct at
  * this scale; inline editors that must keep focus (sticky notes) opt out. */
 
-import { BOARDS, colsFor, boardFor, cardMatchesView, sortByPriority, openCards } from './store.js';
+import { BOARDS, colsFor, boardFor, cardMatchesView, sortByPriority, openCards, DONE_COLUMN } from './store.js';
 import { state, activeTab, setActiveTab, PROJECTS, projectIds, projectById, save } from './state.js';
 import { renderSidebar } from './sidebar.js';
 import { openModal } from './modal.js';
 import { setRenderImpl } from './render.js';
+import { archiveDone, canArchive } from './archive.js';
 
 const PRI_LABEL = { low: 'Low', med: 'Med', high: 'High' };
 
@@ -107,6 +108,19 @@ function renderBoard() {
     head.className = 'col-head';
     head.innerHTML = `<span class="col-title"></span><span class="count">${cards.length}</span>`;
     /** @type {HTMLElement} */ (head.querySelector('.col-title')).textContent = col.name;
+
+    /* Done is the one column that only ever grows, and the board has a hard
+     * size ceiling on the sync server — so it's the one column with a way to
+     * drain it. Archives exactly what's on screen: on a project tab that's
+     * that project's done work, not every project's. */
+    if (col.id === DONE_COLUMN && cards.length && canArchive()) {
+      const archive = document.createElement('button');
+      archive.className = 'col-action';
+      archive.textContent = 'Archive';
+      archive.title = `Archive the ${cards.length} done ticket${cards.length === 1 ? '' : 's'} shown here`;
+      archive.onclick = () => archiveDone(cards);
+      head.appendChild(archive);
+    }
     colEl.appendChild(head);
 
     cards.forEach(card => colEl.appendChild(renderCard(card, col.id, showProject)));

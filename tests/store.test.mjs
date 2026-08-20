@@ -8,7 +8,8 @@ import {
   BOARDS, boardFor, colsFor, cardMatchesView,
   normalize, migrateLifeColumns, migrateLifeToDashboard, sortByPriority,
   allCardIds, lifeMetaIds, mergeBoards, boardHasContent, uid,
-  openCards, DONE_COLUMN,
+  openCards, doneCards, removeDoneCards, boardSize,
+  DONE_COLUMN, BOARD_SIZE_LIMIT, BOARD_SIZE_WARN,
 } from '../js/store.js';
 
 function card(id, extra = {}) {
@@ -277,6 +278,62 @@ test('openCards works on the life board and tolerates a missing board', () => {
   const s = normalize({ life: { todo: [card('a')], done: [card('b')] } });
   assert.deepEqual(openCards(s, 'life').map(c => c.id), ['a']);
   assert.deepEqual(openCards(/** @type {any} */ ({}), 'projects'), []);
+});
+
+test('doneCards returns the Done column, empty when there is none', () => {
+  const s = normalize({ projects: { done: [card('a')] } });
+  assert.deepEqual(doneCards(s, 'projects').map(c => c.id), ['a']);
+  assert.deepEqual(doneCards(/** @type {any} */ ({}), 'projects'), []);
+});
+
+/* ---------- removeDoneCards (the archive flow's local half) ---------- */
+
+test('removeDoneCards drops the named cards and reports how many went', () => {
+  const s = normalize({ projects: { done: [card('a'), card('b'), card('c')] } });
+  assert.equal(removeDoneCards(s, 'projects', new Set(['a', 'c'])), 2);
+  assert.deepEqual(s.projects.done.map(c => c.id), ['b']);
+});
+
+test('removeDoneCards ignores ids that are not in Done', () => {
+  const s = normalize({ projects: { todo: [card('a')], done: [card('b')] } });
+  // 'a' was archived, then dragged out of Done before the server acked: it
+  // stays on the board rather than vanishing (see the comment in store.js).
+  assert.equal(removeDoneCards(s, 'projects', new Set(['a', 'b'])), 1);
+  assert.deepEqual(s.projects.todo.map(c => c.id), ['a']);
+  assert.deepEqual(s.projects.done, []);
+});
+
+test('removeDoneCards leaves the other board alone', () => {
+  const s = normalize({ projects: { done: [card('a')] }, life: { done: [card('a')] } });
+  removeDoneCards(s, 'projects', new Set(['a']));
+  assert.deepEqual(s.projects.done, []);
+  assert.deepEqual(s.life.done.map(c => c.id), ['a']);
+});
+
+/* ---------- size ceiling ---------- */
+
+test('boardSize measures the serialized board, and the warn line sits below the limit', () => {
+  const s = normalize({});
+  assert.equal(boardSize(s), JSON.stringify(s).length);
+  assert.ok(BOARD_SIZE_WARN < BOARD_SIZE_LIMIT);
+  assert.ok(boardSize(s) < BOARD_SIZE_WARN);
+});
+
+test('boardSize grows with the board', () => {
+  const empty = normalize({});
+  const full = normalize({ projects: { done: [card('a', { note: 'x'.repeat(1000) })] } });
+  assert.ok(boardSize(full) > boardSize(empty) + 1000);
+});
+
+test('archiving a fat Done column brings the board back under the warn line', () => {
+  const done = [];
+  for (let i = 0; i < 80; i++) done.push(card(`d${i}`, { note: 'x'.repeat(900) }));
+  const s = normalize({ projects: { todo: [card('keep')], done } });
+  assert.ok(boardSize(s) > BOARD_SIZE_LIMIT, 'setup: board should start over the limit');
+
+  removeDoneCards(s, 'projects', new Set(doneCards(s, 'projects').map(c => c.id)));
+  assert.ok(boardSize(s) < BOARD_SIZE_WARN);
+  assert.deepEqual(openCards(s, 'projects').map(c => c.id), ['keep']);
 });
 
 test('DONE_COLUMN is a real column on both boards', () => {

@@ -85,6 +85,44 @@ Full-board write, used by the PWA. Body: `{ baseRev, board }`. `baseRev` must
 equal the current server rev, otherwise you get `409 { rev }` — re-GET, merge,
 retry. Success: `{ rev, updatedAt }`.
 
+A body over **60,000 characters** is rejected with `413`, because the whole
+board is one Deno KV value and KV caps a value at 64KB. See *Archive* below for
+what keeps it under that.
+
+### Archive
+
+The board only grows in one place: Done. Left alone it eventually crosses the
+60KB line, and then every push 413s and the board sits dirty forever behind a
+badge. The archive is where finished cards go so they stop counting against
+that budget — separate, append-only KV keys under `["archive", n]`, each chunk
+sealed well short of the value cap.
+
+The PWA drives this from the **Archive** button on the Done column (it appears
+only when sync is configured — with no server there's nowhere to archive *to*).
+It posts the cards first and removes them from the board only once this returns
+ok, so a failed request loses nothing.
+
+**`POST /archive`** — body `{ cards: [...] }`. Cards need at minimum a string
+`id` and `title`; the PWA also tags each with `board` and `archivedAt`. Ids
+already in the archive are skipped rather than duplicated, so retrying a
+request that actually landed is safe:
+
+```bash
+curl -X POST -H "Authorization: Bearer $KODER_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"cards":[{"id":"t_abc123_x1y2z","title":"Ship the thing"}]}' "$KODER_API/archive"
+# → { "archived": 1, "duplicates": 0, "chunk": 0 }
+```
+
+**`GET /archive`** — everything archived so far, newest first:
+
+```bash
+curl -H "Authorization: Bearer $KODER_TOKEN" "$KODER_API/archive"
+# → { "count": 34, "chunks": 1, "cards": [ ... ] }
+```
+
+There is no un-archive: archiving is one-way, and the confirm dialog says so.
+Getting a card back means reading it out of `GET /archive` and re-filing it.
+
 ### History / undo
 
 Every write snapshots the resulting board under `["board", rev]` and prunes the
