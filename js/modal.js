@@ -4,6 +4,7 @@
  * avoid yanking state out from under an open editor). */
 
 import { colsFor, boardFor, uid, NOTE_MAX_CHARS } from './store.js';
+import { ticketRef } from './ref.js';
 import { state, activeTab, PROJECTS, projectIds, save } from './state.js';
 import { render } from './render.js';
 
@@ -24,6 +25,36 @@ const fCol = /** @type {HTMLSelectElement} */ (document.getElementById('fCol'));
 const fProject = /** @type {HTMLSelectElement} */ (document.getElementById('fProject'));
 const projectField = /** @type {HTMLElement} */ (document.getElementById('projectField'));
 const btnDelete = /** @type {HTMLButtonElement} */ (document.getElementById('btnDelete'));
+const modalRef = /** @type {HTMLButtonElement} */ (document.getElementById('modalRef'));
+
+/* The ref chip, click-to-copy. Quoting a ref somewhere else is the whole point
+ * of having one, and on a phone there is no other way to get the text off a
+ * card. It lives here rather than in board.js because board.js already imports
+ * this module for openModal — putting the shared widget the other way round
+ * would close a board <-> modal cycle, which render.js exists to avoid.
+ * @param {string} ref @returns {HTMLButtonElement} */
+export function refButton(ref) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = 'card-ref';
+  b.textContent = ref;
+  b.title = `Copy ${ref}`;
+  // pointerdown would start a card drag and click would open the editor, so
+  // the chip has to swallow both to be tappable at all.
+  b.addEventListener('pointerdown', e => e.stopPropagation());
+  b.addEventListener('click', async e => {
+    e.stopPropagation();
+    try {
+      await navigator.clipboard.writeText(ref);
+      b.textContent = 'Copied';
+      setTimeout(() => { b.textContent = ref; }, 1000);
+    } catch (err) {
+      /* No clipboard (insecure context, or permission refused) — the ref is
+       * still on screen to read, so there's nothing useful to say here. */
+    }
+  });
+  return b;
+}
 
 /* Set here rather than in index.html so the cap has one source (store.js,
  * mirroring the server's NOTE_MAX). Notes are the board's only unbounded
@@ -91,6 +122,13 @@ export function openModal(card, colId) {
 
   const modalTitle = /** @type {HTMLElement} */ (document.getElementById('modalTitle'));
   modalTitle.textContent = card ? 'Edit ticket' : 'New ticket';
+  // A new ticket has no id yet, so no ref to show — it gets one on save.
+  modalRef.hidden = !card;
+  if (card) {
+    const ref = ticketRef(card, boardId);
+    modalRef.textContent = ref;
+    modalRef.title = `Copy ${ref}`;
+  }
   fTitle.value = card ? card.title : '';
   fNote.value = card ? (card.note || '') : '';
   fPriority.value = card ? card.priority : 'med';
