@@ -36,11 +36,13 @@
  *   PUT   /state→ { baseRev, board } → { rev, updatedAt } | 409
  *   GET   /revisions     → kept snapshots: [{ rev, updatedAt }], newest first
  *   POST  /state/restore → { rev } → re-lands that snapshot as a new head rev
- *   POST  /tickets      → { title, note?, project?, column?, priority? } → { card, rev }
- *   GET   /tickets      → compact list; filters: ?project=<id>&column=<id>
- *   PATCH /tickets/:id  → any subset of { title, note, priority, project, column }
+ *   POST  /tickets      → { title, note?, project?, column?, priority? } → { card, ref, rev }
+ *   GET   /tickets      → compact list (each ticket carries its derived `ref`);
+ *                         filters: ?project=<id>&column=<id>
+ *   PATCH /tickets/:id  → :id is either the raw id or the board's ref (KODER-8CDA);
+ *                         any subset of { title, note, priority, project, column }
  *                         → edits the ticket in place; `column` moves it
- *                         → { card, column, rev }
+ *                         → { card, ref, column, rev }
  *   POST  /archive      → { cards } → lifts finished cards off the board
  *   GET   /archive      → everything archived so far, newest first
  *
@@ -59,6 +61,11 @@
 
 import { serveDir } from "jsr:@std/http/file-server";
 import { fromFileUrl } from "jsr:@std/path";
+/* The SAME derivation the board renders with — js/ref.js is dependency-free
+ * plain ESM precisely so this import works and the two can't drift on what a
+ * ref means. Deno does not type-check imported .js (no checkJs in deno.json),
+ * so the JSDoc types there are advisory here. */
+import { ticketRef } from "../js/ref.js";
 
 const kv = await Deno.openKv();
 const TOKEN = Deno.env.get("KODER_TOKEN") ?? "";
@@ -235,6 +242,39 @@ async function readArchiveChunks(): Promise<{ index: number; cards: ArchivedCard
   }
   chunks.sort((a, b) => a.index - b.index);
   return chunks;
+}
+
+/* Resolve a caller-supplied identifier to a card id, accepting either form:
+ * the raw id (t_msa8scco_632be) or the ref the board shows (KODER-632B).
+ *
+ * Exact id match wins outright. Ids are unique and authoritative — they're the
+ * merge key — so checking them first keeps every existing caller working
+ * unchanged and means a ref can never shadow a real id.
+ *
+ * A ref is a truncation, so it CAN match more than one ticket. That's refused
+ * rather than resolved arbitrarily: silently patching one of two tickets that
+ * share a ref is the one failure mode worse than not patching at all. */
+function resolveTicketId(
+  board: Board,
+  given: string,
+): { id: string } | { error: Record<string, unknown>; status: number } {
+  const allCards = Object.values(board.projects ?? {}).flatMap((cards) => cards ?? []);
+  const byId = allCards.find((c) => c.id === given);
+  if (byId) return { id: byId.id };
+
+  const wanted = given.trim().toUpperCase();
+  const matches = allCards.filter((c) => ticketRef(c).toUpperCase() === wanted);
+  if (matches.length === 1) return { id: matches[0].id };
+  if (matches.length > 1) {
+    return {
+      status: 409,
+      error: {
+        error: `ref "${given}" matches ${matches.length} tickets — use the id instead`,
+        ids: matches.map((c) => c.id),
+      },
+    };
+  }
+  return { status: 404, error: { error: `no ticket with id or ref "${given}"` } };
 }
 
 const CORS: Record<string, string> = {
@@ -438,12 +478,15 @@ Deno.serve(async (req: Request) => {
     const board = (entry.value ?? emptyDoc()).board;
     const project = url.searchParams.get("project");
     const column = url.searchParams.get("column");
-    const tickets: (Card & { column: string })[] = [];
+    const tickets: (Card & { column: string; ref: string })[] = [];
     for (const [col, cards] of Object.entries(board.projects ?? {})) {
       if (column && col !== column) continue;
       for (const c of cards ?? []) {
         if (project && c.project !== project) continue;
-        tickets.push({ ...c, column: col });
+        // `ref` is derived per response, never stored — see js/ref.js. Callers
+        // get it for free, so the CLI doesn't reimplement the rule and neither
+        // does any agent hitting this endpoint directly.
+        tickets.push({ ...c, column: col, ref: ticketRef(c) });
       }
     }
     return json({ tickets });
@@ -469,7 +512,11 @@ Deno.serve(async (req: Request) => {
    * the ticket itself — tickets don't have their own version number. */
   const ticketMatch = url.pathname.match(/^\/tickets\/([^/]+)$/);
   if (ticketMatch && req.method === "PATCH") {
-    const id = ticketMatch[1];
+    // Not decoded: ids are alphanumeric + underscore and refs are A-Z0-9 with
+    // one hyphen, so neither is ever percent-encoded — and decodeURIComponent
+    // throws on malformed input like "/tickets/%", turning what should be a
+    // 404 into an uncaught 500.
+    const given = ticketMatch[1];
     const body = await req.json().catch(() => null);
     if (!body || typeof body !== "object") {
       return json({ error: "expected a JSON object body", settable: SETTABLE_FIELDS }, 400);
@@ -483,6 +530,12 @@ Deno.serve(async (req: Request) => {
     for (let attempt = 0; attempt < 5; attempt++) {
       const entry = await kv.get<Doc>(KEY);
       const cur = structuredClone(entry.value ?? emptyDoc());
+      // Resolved inside the retry loop, against the board this attempt will
+      // actually write: a ref could start matching a second ticket between
+      // attempts, and that has to be caught rather than raced past.
+      const resolved = resolveTicketId(cur.board, given);
+      if ("error" in resolved) return json(resolved.error, resolved.status);
+      const id = resolved.id;
       let card: Card | null = null;
       let from: string | null = null;
       for (const [col, cards] of Object.entries(cur.board.projects ?? {})) {
@@ -495,7 +548,7 @@ Deno.serve(async (req: Request) => {
           break;
         }
       }
-      if (!card || from === null) return json({ error: `no ticket with id "${id}"` }, 404);
+      if (!card || from === null) return json({ error: `no ticket with id or ref "${given}"` }, 404);
       Object.assign(card, edits);
       if (column !== undefined) {
         cur.board.projects ??= {};
@@ -507,7 +560,7 @@ Deno.serve(async (req: Request) => {
         board: cur.board,
       };
       const res = await commitDoc(entry, doc);
-      if (res.ok) return json({ card, column: column ?? from, rev: doc.rev });
+      if (res.ok) return json({ card, ref: ticketRef(card), column: column ?? from, rev: doc.rev });
     }
     return json({ error: "write contention, retry" }, 503);
   }
@@ -563,7 +616,7 @@ Deno.serve(async (req: Request) => {
         board: cur.board,
       };
       const res = await commitDoc(entry, doc);
-      if (res.ok) return json({ card, rev: doc.rev }, 201);
+      if (res.ok) return json({ card, ref: ticketRef(card), rev: doc.rev }, 201);
     }
     return json({ error: "write contention, retry" }, 503);
   }
