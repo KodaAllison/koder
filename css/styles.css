@@ -313,6 +313,19 @@ body.dragging-active { cursor: grabbing; }
 .chip.project { max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chip.project.unlinked { background: var(--bg); color: var(--muted); border: 1px solid var(--border); }
 .card-date { font-size: 11px; color: var(--muted); margin-left: auto; }
+/* Ticket ref chip: click-to-copy, so it has to read as a control without
+ * competing with the priority chip. Monospace keeps the 4-char tail scannable
+ * when you're matching it against something an agent quoted. */
+.card-ref {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 10px; letter-spacing: .3px; white-space: nowrap;
+  background: none; border: 1px solid transparent; border-radius: 6px;
+  padding: 1px 5px; color: var(--muted); cursor: pointer;
+}
+.card-ref:hover { border-color: var(--border); color: var(--accent); }
+/* In the modal it sits under the title, so it needs to not stretch to the
+ * flex column's full width the way the form fields do. */
+.modal-ref { align-self: flex-start; margin-top: -6px; }
 
 .add-btn {
   border: 1px dashed var(--border); background: none; border-radius: 8px;

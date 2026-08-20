@@ -5,9 +5,10 @@
  * this scale; inline editors that must keep focus (sticky notes) opt out. */
 
 import { BOARDS, colsFor, boardFor, cardMatchesView, sortByPriority, openCards, DONE_COLUMN } from './store.js';
+import { ticketRef } from './ref.js';
 import { state, activeTab, setActiveTab, PROJECTS, projectIds, projectById, save } from './state.js';
 import { renderSidebar } from './sidebar.js';
-import { openModal } from './modal.js';
+import { openModal, refButton } from './modal.js';
 import { setRenderImpl } from './render.js';
 import { archiveDone, canArchive } from './archive.js';
 
@@ -123,7 +124,7 @@ function renderBoard() {
     }
     colEl.appendChild(head);
 
-    cards.forEach(card => colEl.appendChild(renderCard(card, col.id, showProject)));
+    cards.forEach(card => colEl.appendChild(renderCard(card, col.id, showProject, boardId)));
 
     if (!cards.length) {
       const hint = document.createElement('div');
@@ -146,8 +147,9 @@ function renderBoard() {
  * @param {import('./store.js').Card} card
  * @param {string} colId
  * @param {boolean} showProject
+ * @param {keyof typeof BOARDS} boardId   decides the ref prefix for project-less cards
  */
-function renderCard(card, colId, showProject) {
+function renderCard(card, colId, showProject, boardId) {
   const el = document.createElement('div');
   el.className = 'card';
   const proj = showProject ? projectById(card.project) : null;
@@ -174,6 +176,12 @@ function renderCard(card, colId, showProject) {
       chip.textContent = card.project == null ? 'Unassigned' : card.project;
     }
   }
+
+  /* Built with createElement, not folded into the innerHTML above: the ref
+   * derives from card.id, and ids arrive from the sync server like any other
+   * field — so it gets the same textContent treatment as title and note. */
+  /** @type {HTMLElement} */ (el.querySelector('.card-meta'))
+    .appendChild(refButton(ticketRef(card, boardId)));
 
   el.addEventListener('pointerdown', e => beginDrag(e, card, colId, el));
   el.addEventListener('click', () => {

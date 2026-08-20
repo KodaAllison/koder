@@ -34,6 +34,7 @@ const SHELL_ASSETS = [
   './js/pwa.js',
   './js/connect.js',
   './js/store.js',
+  './js/ref.js',
   './js/archive.js',
   './js/state.js',
   './js/sync.js',

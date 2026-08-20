@@ -1,4 +1,4 @@
-/* Tests for the pure board logic in js/store.js.
+/* Tests for the pure board logic in js/store.js and js/ref.js.
  * Run with:  node --test   (from the repo root)
  * No browser, no build step — store.js is dependency-free by design. */
 
@@ -11,6 +11,10 @@ import {
   openCards, doneCards, removeDoneCards, boardSize,
   DONE_COLUMN, BOARD_SIZE_LIMIT, BOARD_SIZE_WARN,
 } from '../js/store.js';
+import {
+  projectPrefix, ticketRef, prefixCollisions, LIFE_PREFIX, UNASSIGNED_PREFIX,
+} from '../js/ref.js';
+import { readFileSync } from 'node:fs';
 
 function card(id, extra = {}) {
   return { id, title: `card ${id}`, note: '', priority: 'med', created: 1, project: null, ...extra };
@@ -340,4 +344,58 @@ test('DONE_COLUMN is a real column on both boards', () => {
   for (const boardId of Object.keys(BOARDS)) {
     assert.ok(BOARDS[boardId].some(c => c.id === DONE_COLUMN));
   }
+});
+
+/* ---------- ticket refs ---------- */
+
+test('projectPrefix takes 3 of the first segment and 2 of the second', () => {
+  assert.equal(projectPrefix('portfolio-website'), 'PORWE');
+  assert.equal(projectPrefix('strava-worker'), 'STRWO');
+  assert.equal(projectPrefix('crook-community'), 'CROCO');
+});
+
+test('projectPrefix separates the pairs plain truncation collides on', () => {
+  // The reason this rule exists at all — first-5 gives PORTF/PORTF, STRAV/STRAV.
+  assert.notEqual(projectPrefix('portfolio-new'), projectPrefix('portfolio-website'));
+  assert.notEqual(projectPrefix('strava-insights'), projectPrefix('strava-worker'));
+});
+
+test('projectPrefix falls back to the first 5 chars of a single-segment id', () => {
+  assert.equal(projectPrefix('koder'), 'KODER');
+  assert.equal(projectPrefix('holitrackr'), 'HOLIT');
+  assert.equal(projectPrefix('weatherapp'), 'WEATH');
+});
+
+test('projectPrefix splits camelCase, so SwiftPlan is two segments', () => {
+  assert.equal(projectPrefix('SwiftPlan'), 'SWIPL');
+});
+
+test('projectPrefix is stable regardless of what other projects exist', () => {
+  // A "shortest unique prefix" rule would rewrite this the day a similar name
+  // appears; refs get quoted into commits, so they must not move.
+  assert.equal(projectPrefix('portfolio-website'), 'PORWE');
+  assert.equal(projectPrefix('portfolio-website'), projectPrefix('portfolio-website'));
+});
+
+test('ticketRef appends the uppercased last 4 of the id', () => {
+  assert.equal(ticketRef(card('t_msa7ti8f_08cda', { project: 'koder' })), 'KODER-8CDA');
+});
+
+test('ticketRef distinguishes life cards from unassigned project cards', () => {
+  assert.equal(ticketRef(card('mrdnx8ncddlos'), 'life'), LIFE_PREFIX + '-DLOS');
+  assert.equal(ticketRef(card('t_mr884oi0_56da3', { project: null })), UNASSIGNED_PREFIX + '-6DA3');
+});
+
+test('prefixCollisions is empty for the real project list', () => {
+  // The guard the derivation trades for stability: adding a colliding project
+  // fails here rather than quietly giving two projects the same refs.
+  const ids = JSON.parse(readFileSync(new URL('../js/projects.json', import.meta.url), 'utf8'))
+    .projects.map(/** @param {{id: string}} p */ p => p.id);
+  assert.deepEqual(prefixCollisions(ids), {});
+});
+
+test('prefixCollisions reports a genuine clash and a reserved-prefix clash', () => {
+  assert.deepEqual(prefixCollisions(['portfolio-web', 'portfolio-website']),
+    { PORWE: ['portfolio-web', 'portfolio-website'] });
+  assert.deepEqual(prefixCollisions(['life']), { LIFE: ['(reserved)', 'life'] });
 });

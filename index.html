@@ -50,6 +50,9 @@
   <div class="overlay" id="overlay">
     <div class="modal">
       <h2 id="modalTitle">New ticket</h2>
+      <!-- Ticket ref (e.g. KODER-8CDA) — click to copy. Hidden for a new
+           ticket, which has no id to derive one from yet (see js/modal.js). -->
+      <button type="button" class="card-ref modal-ref" id="modalRef" hidden></button>
       <div>
         <label for="fTitle">Title</label>
         <input type="text" id="fTitle" placeholder="What needs doing?" maxlength="140">
