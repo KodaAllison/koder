@@ -8,6 +8,7 @@ import {
   BOARDS, boardFor, colsFor, cardMatchesView,
   normalize, migrateLifeColumns, migrateLifeToDashboard, sortByPriority,
   allCardIds, lifeMetaIds, mergeBoards, boardHasContent, uid,
+  openCards, DONE_COLUMN,
 } from '../js/store.js';
 
 function card(id, extra = {}) {
@@ -252,4 +253,34 @@ test('allCardIds spans both boards', () => {
 test('uid produces unique-ish ids', () => {
   const ids = new Set(Array.from({ length: 1000 }, uid));
   assert.equal(ids.size, 1000);
+});
+
+/* ---------- open vs done (tab counts) ---------- */
+
+test('openCards spans every column except Done', () => {
+  const s = normalize({
+    projects: {
+      backlog: [card('a')], todo: [card('b')], doing: [card('c')],
+      review: [card('d')], done: [card('e'), card('f')],
+    },
+  });
+  assert.deepEqual(openCards(s, 'projects').map(c => c.id), ['a', 'b', 'c', 'd']);
+});
+
+test('openCards counts nothing when every card is done', () => {
+  const s = normalize({ projects: { done: [card('a'), card('b')] } });
+  assert.equal(openCards(s, 'projects').length, 0);
+  assert.equal(Object.values(s.projects).flat().length, 2);   // still on the board
+});
+
+test('openCards works on the life board and tolerates a missing board', () => {
+  const s = normalize({ life: { todo: [card('a')], done: [card('b')] } });
+  assert.deepEqual(openCards(s, 'life').map(c => c.id), ['a']);
+  assert.deepEqual(openCards(/** @type {any} */ ({}), 'projects'), []);
+});
+
+test('DONE_COLUMN is a real column on both boards', () => {
+  for (const boardId of Object.keys(BOARDS)) {
+    assert.ok(BOARDS[boardId].some(c => c.id === DONE_COLUMN));
+  }
 });
