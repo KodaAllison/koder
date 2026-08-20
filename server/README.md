@@ -12,6 +12,14 @@ cd server
 KODER_TOKEN=dev deno task dev     # http://localhost:8000, KV in a local file
 ```
 
+PowerShell doesn't take the `VAR=value cmd` prefix — set it first:
+
+```powershell
+cd server
+$env:KODER_TOKEN = "dev"
+deno task dev
+```
+
 ## Deploy (free) on Deno Deploy
 
 1. https://dash.deno.com → New App → link this GitHub repo.
@@ -57,6 +65,32 @@ cd server
 KODER_TOKEN=dev deno task dev
 # open http://localhost:8000 — frontend + API from one process
 ```
+
+```powershell
+# PowerShell: no VAR=value prefix, and env vars read back as $env:NAME
+cd server
+$env:KODER_TOKEN = "dev"
+deno task dev
+```
+
+Without `KODER_TOKEN` in the *server's* environment every request answers
+`{"error":"server misconfigured: KODER_TOKEN not set"}` with a 500 — that's
+the server describing itself, before it ever looks at your `Authorization`
+header, so it means the token is missing where `deno task dev` ran rather
+than in your request.
+
+Calling it, with the same difference:
+
+```bash
+curl -H "Authorization: Bearer $KODER_TOKEN" localhost:8000/tickets
+```
+
+```powershell
+curl.exe -H "Authorization: Bearer $env:KODER_TOKEN" localhost:8000/tickets
+```
+
+The local KV is its own store, separate from the deployed board, so it starts
+empty — `/tickets` returns `{"tickets":[]}` until you file something into it.
 
 ## API
 
