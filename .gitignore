@@ -12,3 +12,6 @@ desktop.ini
 .env
 js/config.local.js
 scripts/.koder.env
+
+# koder skill credentials must never be committed
+.claude/skills/koder-ticket/.koder.env

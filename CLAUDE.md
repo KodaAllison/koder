@@ -11,6 +11,14 @@ feature branch (see "Deploying" in README.md).
 Tests: `node --test` from the repo root (covers the pure logic in `js/store.js` — keep store.js free
 of DOM/localStorage so this stays true). JS uses `// @ts-check` + JSDoc types.
 
+## koder-ticket skill
+
+The koder-ticket skill is mastered here (`.claude/skills/koder-ticket/SKILL.md`;
+the CLI's source of truth is `scripts/koder-ticket.sh`) and synced to
+`~/.claude/skills/` and the sibling repos so cloud/mobile sessions can use the
+board. After editing either file, run `scripts/sync-skill.sh` and commit the
+changed copies in each repo. Never edit a synced copy in place.
+
 ## Working preferences
 
 - **Don't spin up headless browsers / screenshot tooling to validate my work.** No
