@@ -162,8 +162,11 @@ curl -sS -X POST \
   -H 'Content-Type: application/json' \
   -d '{"title":"Fix login bug","project":"holitrackr","column":"todo","priority":"high"}' \
   "$KODER_API/tickets"
-# → 201 { "card": { "id": "t_...", ... }, "rev": 42 }
+# → 201 { "card": { "id": "t_...", ... }, "ref": "HOLIT-1B2C", "rev": 42 }
 ```
+
+`ref` is the ticket's human-readable name — the same one shown on the card on
+the board. Quote it to Koda; an id names nothing they can see.
 
 The `rev` here is the *board's* new head revision after this write landed — not a
 version number on the ticket itself (tickets don't have one). You can ignore it
@@ -171,21 +174,39 @@ unless you're also polling `/state` and want to know a write has been folded in.
 
 ### GET /tickets — read tickets
 
-Flattens the projects board into one list; each ticket gains a `column` field.
-Optional filters: `?project=<id>` and/or `?column=<id>`.
+Flattens the projects board into one list; each ticket gains a `column` field
+and its derived `ref`. Optional filters: `?project=<id>` and/or `?column=<id>`.
 
 ```bash
 curl -sS -H "Authorization: Bearer $KODER_TOKEN" "$KODER_API/tickets?project=holitrackr&column=todo"
-# → { "tickets": [ { "id": "t_...", "title": "...", "column": "todo", ... } ] }
+# → { "tickets": [ { "id": "t_...", "ref": "HOLIT-1B2C", "title": "...", "column": "todo", ... } ] }
 ```
+
+### Refs
+
+A ref is `<PROJECT-PREFIX>-<last 4 of the id>`, e.g. `HOLIT-1B2C`. It is
+**derived on read, never stored** — `js/ref.js` holds the rule and both this
+server and the board import it, so the name on a card and the name in an API
+response can't drift apart. The id stays the ticket's real identity: it's the
+key `mergeBoards` uses to decide what a sync conflict keeps, so it never
+changes.
+
+Because the ref truncates the id, two tickets in one project could in
+principle derive the same one. `PATCH` refuses that case rather than guessing
+(see below); `GET` just reports whatever each ticket derives.
 
 ### PATCH /tickets/:id — move and/or edit a ticket
 
+`:id` is **either the raw id or the ref** (`t_abc123_x1y2z` or `HOLIT-1B2C`).
+An exact id match always wins, so a ref can never shadow a real id and every
+existing caller keeps working unchanged.
+
 Body: any subset of `{ title, note, priority, project, column }`. Finds the
 ticket anywhere on the projects board and applies the change atomically;
-fields you omit are left alone. 404 if the id doesn't exist, 400 on an empty
-body (nothing to patch). Response: `{ card, column, rev }`, where `column` is
-where the ticket ended up.
+fields you omit are left alone. 404 if neither an id nor a ref matches, 409 if
+a ref matches more than one ticket (the response lists the ids — pass one of
+them), 400 on an empty body (nothing to patch). Response:
+`{ card, ref, column, rev }`, where `column` is where the ticket ended up.
 
 `column` moves the card — one of `backlog | todo | doing | review | done`. The
 other four edit it in place, so a wrong title, note, priority or project can be
@@ -194,9 +215,9 @@ fixed without a whole-board `PUT /state`. Values are validated exactly as
 one of `low | med | high`); `project: null` or `""` unassigns.
 
 ```bash
-# move it
+# move it — by ref
 curl -sS -X PATCH -H "Authorization: Bearer $KODER_TOKEN" -H 'Content-Type: application/json' \
-  -d '{"column":"doing"}' "$KODER_API/tickets/t_abc123_x1y2z"
+  -d '{"column":"doing"}' "$KODER_API/tickets/HOLIT-1B2C"
 
 # edit it (and move it, if you like)
 curl -sS -X PATCH -H "Authorization: Bearer $KODER_TOKEN" -H 'Content-Type: application/json' \
