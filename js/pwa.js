@@ -60,6 +60,38 @@ if ('serviceWorker' in navigator && IS_LOCAL) {
         refreshing = true;
         location.reload();
       });
+
+      /* ---- Asking the browser to go looking ----
+       * register() above checks for a changed sw.js, but that's the only
+       * automatic check tied to anything we control: the browser's own
+       * re-check is tied to navigation, and a PWA launched from the home
+       * screen doesn't navigate — it gets backgrounded, not closed. So a
+       * deploy can sit unnoticed for an unpredictable stretch while the
+       * device keeps serving the cached shell. (Seen on 2026-08-20: three
+       * merged PRs were live server-side for over an hour before the shell
+       * moved.) The waiting/skipWaiting flow above was never broken; nothing
+       * was prompting the browser to discover there was something to wait
+       * for.
+       *
+       * So re-check when the app comes back to the foreground. Throttled,
+       * because visibilitychange fires on every app switch and focus fires
+       * on every tab click — without it a phone in normal use would issue a
+       * request per glance. */
+      const UPDATE_CHECK_MS = 15 * 60 * 1000;
+      let lastUpdateCheck = Date.now();   // register() just checked, so start the clock here
+
+      function checkForUpdate() {
+        if (document.visibilityState !== 'visible') return;
+        if (Date.now() - lastUpdateCheck < UPDATE_CHECK_MS) return;
+        // Stamped before awaiting, not after: a slow or failing check must
+        // not let the next foreground event start a second one.
+        lastUpdateCheck = Date.now();
+        // Rejects when offline — swallow it, the next foreground pass retries.
+        reg.update().catch(() => {});
+      }
+
+      document.addEventListener('visibilitychange', checkForUpdate);
+      window.addEventListener('focus', checkForUpdate);
     } catch (err) {
       console.warn('[PWA] service worker registration failed:', err);
     }
