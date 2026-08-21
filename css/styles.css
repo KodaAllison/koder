@@ -88,43 +88,6 @@ h1 { font-size: 18px; margin: 0; font-weight: 650; }
   display: grid; grid-template-columns: repeat(var(--board-cols, 4), 1fr); gap: 14px;
   align-items: start;
 }
-@media (max-width: 900px) {
-  .board { grid-template-columns: repeat(2, 1fr); }
-  .main { flex-direction: column; }
-  /* Safe only because the sidebar drops out of sticky at this breakpoint (see
-   * the .life-sidebar override below) — this would otherwise make body a
-   * scroll container and break it. Keeps a dragged card clone from adding a
-   * horizontal scrollbar. */
-  body { overflow-x: hidden; }
-}
-@media (max-width: 520px) {
-  /* Single column: the projects board's 4 cols and Life's 5 all stack. */
-  .board { grid-template-columns: 1fr; gap: 12px; }
-  header { padding: 14px 14px; }
-  .top-tabs { padding: 12px 14px 0; }
-  .tabs { padding: 8px 14px 0; }
-  .main { padding: 14px 14px 24px; gap: 14px; }
-  h1 { font-size: 16px; }
-
-  /* Modal → bottom sheet: dock it to the bottom edge (native iOS pattern,
-   * thumb-reachable) instead of floating centered. Overrides the base
-   * .overlay/.modal rules by source order at this width. */
-  .overlay { align-items: flex-end; }              /* dock the sheet to the bottom edge */
-  .modal {
-    width: 100vw;                                   /* edge-to-edge; overrides min(420px,…) */
-    max-width: none;
-    border-radius: 16px 16px 0 0;                   /* round the top, square the bottom */
-    /* clear the iOS home indicator; falls back to 20px where env() is unsupported */
-    padding: 20px 20px calc(20px + env(safe-area-inset-bottom));
-    animation: sheet-up .22s ease-out;              /* CSS-only slide-up affordance */
-  }
-  /* Grabber handle above the title — a small pull-tab, pure CSS. */
-  .modal::before {
-    content: ''; align-self: center;
-    width: 36px; height: 4px; border-radius: 2px;
-    background: var(--border); margin: -6px 0 4px;
-  }
-}
 @keyframes sheet-up { from { transform: translateY(100%); } to { transform: translateY(0); } }
 
 /* Life dashboard sidebar — left of the board (order:-1 puts it first
@@ -148,14 +111,6 @@ h1 { font-size: 18px; margin: 0; font-weight: 650; }
  * adds no specificity, so source order decides. This lived in the 900px group
  * above and silently did nothing. overflow-y back to visible too: `auto`
  * forces overflow-x to auto, trapping scroll in a nested box. */
-@media (max-width: 900px) {
-  .life-sidebar {
-    width: auto; align-self: stretch;
-    position: static;
-    max-height: none; overflow-y: visible;
-  }
-}
-
 .side-sec { display: flex; flex-direction: column; gap: 8px; }
 .side-sec + .side-sec { border-top: 1px solid var(--border); padding-top: 20px; }
 .side-title { font-size: 12.5px; font-weight: 650; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); }
@@ -215,27 +170,6 @@ h1 { font-size: 18px; margin: 0; font-weight: 650; }
  * sticky `×` is invisible and untappable. This block comes AFTER the hover
  * rules so it wins by source order on touch; desktop is hover:hover and never
  * matches it, leaving hover behavior untouched. */
-@media (hover: none), (pointer: coarse) {
-  .side-del {
-    opacity: 1;                 /* defeat the hover gate — always shown on touch */
-    /* Grow the tap target to ~44px without bloating the row: ~14px vertical +
-     * ~12px horizontal padding around the 15px glyph. Rows are align-items
-     * centered, so the extra vertical padding overlaps the row height and does
-     * NOT push rows taller; the negative margin cancels the layout footprint. */
-    padding: 14px 12px;
-    margin: -6px -8px;
-    min-width: 44px; min-height: 44px;
-    display: inline-flex; align-items: center; justify-content: center;
-  }
-  /* Sticky notes position .side-del absolutely (above); keep it pinned in the
-   * corner but still finger-sized. Nudge origin to absorb the new padding. */
-  .sticky .side-del {
-    top: -4px; right: -2px;
-    padding: 12px;
-    margin: 0;
-  }
-}
-
 .sticky[data-color="yellow"] { background: #fdf3a6; }
 .sticky[data-color="pink"]   { background: #ffd0dd; }
 .sticky[data-color="blue"]   { background: #bfe3ff; }
@@ -374,3 +308,91 @@ body.dragging-active { cursor: grabbing; }
   box-shadow: 0 8px 24px rgba(0,0,0,.45); z-index: 20;
 }
 .toast[hidden] { display: none; }
+
+
+/* ==================== Responsive overrides ====================
+ * Every @media block lives here, at the END of the file, and nothing but
+ * media blocks may follow. That is not tidiness — it is the only thing
+ * making these rules work.
+ *
+ * A media query adds NO specificity. `@media (max-width:520px) { .modal {…} }`
+ * and a plain `.modal {…}` are both one class, so whichever comes LAST in the
+ * file wins. These blocks used to sit near the top, above the base rules they
+ * claimed to override, which meant the base rules silently undid them: the
+ * mobile bottom sheet was dead code from the day it shipped, and the
+ * Life-sidebar sticky fix before it failed the same way.
+ *
+ * The blocks below are in their original relative order, which matters twice
+ * over: the 520px block must still be overridable by the second 900px block
+ * exactly as it was, and (hover:none)/(pointer:coarse) must stay last so it
+ * still beats the hover rules it exists to replace.
+ *
+ * So: add new base rules above this banner, never below it. */
+
+@media (max-width: 900px) {
+  .board { grid-template-columns: repeat(2, 1fr); }
+  .main { flex-direction: column; }
+  /* Safe only because the sidebar drops out of sticky at this breakpoint (see
+   * the .life-sidebar override below) — this would otherwise make body a
+   * scroll container and break it. Keeps a dragged card clone from adding a
+   * horizontal scrollbar. */
+  body { overflow-x: hidden; }
+}
+
+@media (max-width: 520px) {
+  /* Single column: the projects board's 4 cols and Life's 5 all stack. */
+  .board { grid-template-columns: 1fr; gap: 12px; }
+  header { padding: 14px 14px; }
+  .top-tabs { padding: 12px 14px 0; }
+  .tabs { padding: 8px 14px 0; }
+  .main { padding: 14px 14px 24px; gap: 14px; }
+  h1 { font-size: 16px; }
+
+  /* Modal → bottom sheet: dock it to the bottom edge (native iOS pattern,
+   * thumb-reachable) instead of floating centered. Overrides the base
+   * .overlay/.modal rules by source order at this width. */
+  .overlay { align-items: flex-end; }              /* dock the sheet to the bottom edge */
+  .modal {
+    width: 100vw;                                   /* edge-to-edge; overrides min(420px,…) */
+    max-width: none;
+    border-radius: 16px 16px 0 0;                   /* round the top, square the bottom */
+    /* clear the iOS home indicator; falls back to 20px where env() is unsupported */
+    padding: 20px 20px calc(20px + env(safe-area-inset-bottom));
+    animation: sheet-up .22s ease-out;              /* CSS-only slide-up affordance */
+  }
+  /* Grabber handle above the title — a small pull-tab, pure CSS. */
+  .modal::before {
+    content: ''; align-self: center;
+    width: 36px; height: 4px; border-radius: 2px;
+    background: var(--border); margin: -6px 0 4px;
+  }
+}
+
+@media (max-width: 900px) {
+  .life-sidebar {
+    width: auto; align-self: stretch;
+    position: static;
+    max-height: none; overflow-y: visible;
+  }
+}
+
+@media (hover: none), (pointer: coarse) {
+  .side-del {
+    opacity: 1;                 /* defeat the hover gate — always shown on touch */
+    /* Grow the tap target to ~44px without bloating the row: ~14px vertical +
+     * ~12px horizontal padding around the 15px glyph. Rows are align-items
+     * centered, so the extra vertical padding overlaps the row height and does
+     * NOT push rows taller; the negative margin cancels the layout footprint. */
+    padding: 14px 12px;
+    margin: -6px -8px;
+    min-width: 44px; min-height: 44px;
+    display: inline-flex; align-items: center; justify-content: center;
+  }
+  /* Sticky notes position .side-del absolutely (above); keep it pinned in the
+   * corner but still finger-sized. Nudge origin to absorb the new padding. */
+  .sticky .side-del {
+    top: -4px; right: -2px;
+    padding: 12px;
+    margin: 0;
+  }
+}
