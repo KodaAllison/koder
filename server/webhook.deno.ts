@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { nextWebhookRevision } from "./workflow.ts";
 
 const TOKEN = "webhook-test-token";
 const SECRET = "webhook-test-secret";
@@ -75,8 +76,24 @@ async function seedBoard(
   baseUrl: string,
   projects: Record<string, Card[]>,
 ): Promise<Doc> {
-  const current = await getState(baseUrl);
-  const response = await fetch(`${baseUrl}/state`, {
+  // Tests deliberately reset through the public sync seam. Delete old IDs in
+  // one revision first so server-owned workflow metadata cannot bleed between
+  // otherwise independent scenarios or be forged by the next PUT.
+  let current = await getState(baseUrl);
+  let response = await fetch(`${baseUrl}/state`, {
+    method: "PUT",
+    headers: {
+      Authorization: `Bearer ${TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      baseRev: current.rev,
+      board: { projects: {}, life: {}, lifeMeta: {} },
+    }),
+  });
+  assert.equal(response.status, 200);
+  current = await getState(baseUrl);
+  response = await fetch(`${baseUrl}/state`, {
     method: "PUT",
     headers: {
       Authorization: `Bearer ${TOKEN}`,
@@ -86,6 +103,20 @@ async function seedBoard(
       baseRev: current.rev,
       board: { projects, life: {}, lifeMeta: {} },
     }),
+  });
+  assert.equal(response.status, 200);
+  return await getState(baseUrl);
+}
+
+async function putBoard(baseUrl: string, board: Doc["board"]): Promise<Doc> {
+  const current = await getState(baseUrl);
+  const response = await fetch(`${baseUrl}/state`, {
+    method: "PUT",
+    headers: {
+      Authorization: `Bearer ${TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ baseRev: current.rev, board }),
   });
   assert.equal(response.status, 200);
   return await getState(baseUrl);
@@ -419,6 +450,94 @@ Deno.test({
       );
 
       await t.step(
+        "repository identity requires exact canonical casing and deduplicates variants",
+        async () => {
+          const before = await seedBoard(baseUrl, { doing: [card()] });
+          const delivery = freshDelivery();
+          const variant = {
+            action: "opened",
+            repository: { full_name: "kodaallison/koder" },
+            pull_request: {
+              number: 8,
+              title: "KODER-1A2B casing must be canonical",
+              body: null,
+              merged: false,
+              head: { repo: { full_name: "kodaallison/koder" } },
+            },
+          };
+          assert.equal(
+            (await postWebhook(baseUrl, variant, { delivery })).status,
+            202,
+          );
+          assert.deepEqual((await getState(baseUrl)).board, before.board);
+
+          const canonical = structuredClone(variant);
+          canonical.repository.full_name = "KodaAllison/koder";
+          canonical.pull_request.head.repo.full_name = "KodaAllison/koder";
+          const replay = await postWebhook(baseUrl, canonical, { delivery });
+          assert.equal(
+            (await replay.json() as { redelivered?: boolean }).redelivered,
+            true,
+          );
+          assert.deepEqual((await getState(baseUrl)).board, before.board);
+        },
+      );
+
+      await t.step(
+        "full-board PUT cannot forge, strip, or replace workflow metadata",
+        async () => {
+          const forged = card("t_ticket_1a2b", "koder", {
+            pr: "KodaAllison/koder#40",
+            prRev: 1,
+          });
+          let state = await seedBoard(baseUrl, { doing: [forged] });
+          assert.equal(state.board.projects.doing[0].pr, undefined);
+          assert.equal(state.board.projects.doing[0].prRev, undefined);
+
+          const opened = await postWebhook(baseUrl, {
+            action: "opened",
+            repository: { full_name: "KodaAllison/koder" },
+            pull_request: {
+              number: 41,
+              title: "KODER-1A2B establish server metadata",
+              body: null,
+              merged: false,
+            },
+          });
+          assert.equal(opened.status, 200);
+          state = await getState(baseUrl);
+          assert.equal(state.board.projects.review[0].prRev, 1);
+
+          const stripped = structuredClone(state.board);
+          delete stripped.projects.review[0].pr;
+          delete stripped.projects.review[0].prRev;
+          stripped.projects.review[0].title = "browser edit without metadata";
+          state = await putBoard(baseUrl, stripped);
+          assert.equal(state.board.projects.review[0].pr, "KodaAllison/koder#41");
+          assert.equal(state.board.projects.review[0].prRev, 1);
+
+          const forgedEqual = structuredClone(state.board);
+          forgedEqual.projects.review[0].pr = "KodaAllison/koder#999";
+          forgedEqual.projects.review[0].prRev = 1;
+          state = await putBoard(baseUrl, forgedEqual);
+          assert.equal(state.board.projects.review[0].pr, "KodaAllison/koder#41");
+          assert.equal(state.board.projects.review[0].prRev, 1);
+        },
+      );
+
+      await t.step(
+        "webhook markers increment safely and recover from legacy values",
+        () => {
+          assert.equal(nextWebhookRevision(0), 1);
+          assert.equal(nextWebhookRevision(41), 42);
+          assert.equal(nextWebhookRevision(Number.MAX_SAFE_INTEGER), 1);
+          assert.equal(nextWebhookRevision(Number.MAX_SAFE_INTEGER + 1), 1);
+          assert.equal(nextWebhookRevision(-1), 1);
+          assert.equal(nextWebhookRevision("41"), 1);
+        },
+      );
+
+      await t.step(
         "fork pull requests cannot mutate and their delivery is deduplicated",
         async () => {
           const before = await seedBoard(baseUrl, { doing: [card()] });
@@ -579,7 +698,14 @@ Deno.test({
           ];
 
           for (const scenario of cases) {
-            const before = await seedBoard(baseUrl, scenario.projects);
+            let before = await seedBoard(baseUrl, scenario.projects);
+            if (scenario.name === "unchanged transition") {
+              assert.equal(
+                (await postWebhook(baseUrl, mutatingPayload)).status,
+                200,
+              );
+              before = await getState(baseUrl);
+            }
             const delivery = freshDelivery();
             const first = await postWebhook(baseUrl, scenario.payload, {
               ...scenario.options,
@@ -692,9 +818,7 @@ Deno.test({
         "done is terminal for delayed or replacement open events",
         async () => {
           await seedBoard(baseUrl, {
-            review: [
-              card("t_ticket_1a2b", "koder", { pr: "KodaAllison/koder#20" }),
-            ],
+            review: [card()],
           });
           const merged = await postWebhook(baseUrl, {
             action: "closed",
@@ -749,11 +873,18 @@ Deno.test({
       await t.step(
         "only a newer same-repo PR can replace an active PR association",
         async () => {
-          const before = await seedBoard(baseUrl, {
-            review: [
-              card("t_ticket_1a2b", "koder", { pr: "KodaAllison/koder#30" }),
-            ],
-          });
+          await seedBoard(baseUrl, { review: [card()] });
+          assert.equal((await postWebhook(baseUrl, {
+            action: "opened",
+            repository: { full_name: "KodaAllison/koder" },
+            pull_request: {
+              number: 30,
+              title: "Current KODER-1A2B",
+              body: null,
+              merged: false,
+            },
+          })).status, 200);
+          const before = await getState(baseUrl);
           const stale = await postWebhook(baseUrl, {
             action: "opened",
             repository: { full_name: "KodaAllison/koder" },

@@ -224,6 +224,34 @@ test('mergeBoards preserves a same-PR server transition with a newer webhook mar
   assert.equal(local.projects.done[0].prRev, 2);
 });
 
+test('mergeBoards treats any authoritative server marker mismatch as server-wins', () => {
+  const local = normalize({
+    projects: { doing: [card('a', { title: 'local', pr: 'KodaAllison/koder#21', prRev: 2 })] },
+  });
+  const server = normalize({
+    projects: { done: [card('a', { title: 'server', pr: 'KodaAllison/koder#21', prRev: 'legacy' })] },
+  });
+
+  mergeBoards(local, server, new Set(['a']));
+  assert.equal(local.projects.doing.length, 0);
+  assert.equal(local.projects.done[0].title, 'server');
+  assert.equal(local.projects.done[0].prRev, 'legacy');
+});
+
+test('mergeBoards treats authoritative marker absence as server-wins', () => {
+  const local = normalize({
+    projects: { doing: [card('a', { pr: 'KodaAllison/koder#999', prRev: 1 })] },
+  });
+  const server = normalize({
+    projects: { todo: [card('a', { title: 'server without workflow metadata' })] },
+  });
+
+  mergeBoards(local, server, new Set(['a']));
+  assert.deepEqual(local.projects.doing, []);
+  assert.equal(local.projects.todo[0].pr, undefined);
+  assert.equal(local.projects.todo[0].prRev, undefined);
+});
+
 test('mergeBoards resumes local wins after observing the same webhook marker', () => {
   const local = normalize({
     projects: {

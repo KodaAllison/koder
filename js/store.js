@@ -334,7 +334,7 @@ export function mergeBoards(local, server, knownIds) {
         if (current) {
           const unseenWebhookState =
             (card.pr && current.card.pr !== card.pr) ||
-            (Number.isInteger(card.prRev) && current.card.prRev !== card.prRev);
+            current.card.prRev !== card.prRev;
           if (unseenWebhookState) {
             local[current.boardId][current.colId] =
               local[current.boardId][current.colId].filter(c => c.id !== card.id);

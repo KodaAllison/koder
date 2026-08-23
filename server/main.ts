@@ -73,6 +73,7 @@ import { timingSafeEqual } from "node:crypto";
  * ref means. Deno does not type-check imported .js (no checkJs in deno.json),
  * so the JSDoc types there are advisory here. */
 import { ticketRef } from "../js/ref.js";
+import { nextWebhookRevision } from "./workflow.ts";
 
 const KV_PATH = Deno.env.get("KODER_KV_PATH") || undefined;
 const kv = await Deno.openKv(KV_PATH);
@@ -83,11 +84,11 @@ const KEY = ["board"];
 const GITHUB_DELIVERY_KEY = ["github-delivery"];
 const GITHUB_BODY_MAX = 256 * 1024;
 
-const GITHUB_REPOS = new Map([
-  ["kodaallison/koder", "KodaAllison/koder"],
-  ["kodaallison/crook-community", "KodaAllison/crook-community"],
-  ["kodaallison/holitrackr", "KodaAllison/holitrackr"],
-  ["kodaallison/portfolio-website", "KodaAllison/portfolio-website"],
+const GITHUB_REPOS = new Set([
+  "KodaAllison/koder",
+  "KodaAllison/crook-community",
+  "KodaAllison/holitrackr",
+  "KodaAllison/portfolio-website",
 ]);
 
 // How many past revisions to keep as restore points. Snapshots live under
@@ -313,6 +314,35 @@ function resolveTicketId(
   return { status: 404, error: { error: `no ticket with id or ref "${given}"` } };
 }
 
+const hasOwn = (value: object, key: PropertyKey) =>
+  Object.prototype.hasOwnProperty.call(value, key);
+
+/* pr/prRev are workflow state, not browser-editable card fields. A full-board
+ * sync may move or edit a card, but it must carry the current server values
+ * exactly. New cards (and legacy cards without workflow state) cannot acquire
+ * either field from an untrusted PUT. */
+function preserveWorkflowMetadata(incoming: Board, current: Board): Board {
+  const board = structuredClone(incoming);
+  const currentCards = new Map<string, Card>();
+  for (const boardId of ["projects", "life"] as const) {
+    for (const cards of Object.values(current[boardId] ?? {})) {
+      for (const card of cards ?? []) currentCards.set(card.id, card);
+    }
+  }
+  for (const boardId of ["projects", "life"] as const) {
+    for (const cards of Object.values(board[boardId] ?? {})) {
+      for (const card of cards ?? []) {
+        const authoritative = currentCards.get(card.id);
+        delete card.pr;
+        delete card.prRev;
+        if (authoritative && hasOwn(authoritative, "pr")) card.pr = authoritative.pr;
+        if (authoritative && hasOwn(authoritative, "prRev")) card.prRev = authoritative.prRev;
+      }
+    }
+  }
+  return board;
+}
+
 async function validGithubSignature(raw: Uint8Array<ArrayBuffer>, signature: string): Promise<boolean> {
   const key = await crypto.subtle.importKey(
     "raw",
@@ -489,8 +519,8 @@ Deno.serve({ port: PORT }, async (req: Request) => {
     const repository = payload.repository as Record<string, unknown> | null;
     const pullRequest = payload.pull_request as Record<string, unknown> | null;
     const baseRepoName = typeof repository?.full_name === "string" ? repository.full_name : null;
-    const repo = baseRepoName
-      ? GITHUB_REPOS.get(baseRepoName.toLowerCase())
+    const repo = baseRepoName && GITHUB_REPOS.has(baseRepoName)
+      ? baseRepoName
       : undefined;
     if (!repo) {
       return await recordGithubNoop(deliveryId, { ignored: "untrusted repository" }, 202);
@@ -511,7 +541,7 @@ Deno.serve({ port: PORT }, async (req: Request) => {
     if (typeof headRepo?.full_name !== "string") {
       return await recordGithubNoop(deliveryId, { error: "invalid pull_request head repository" }, 400);
     }
-    if (!baseRepoName || headRepo.full_name.toLowerCase() !== baseRepoName.toLowerCase()) {
+    if (headRepo.full_name !== repo) {
       return await recordGithubNoop(
         deliveryId,
         { ignored: "pull request head repository does not match base repository" },
@@ -583,7 +613,7 @@ Deno.serve({ port: PORT }, async (req: Request) => {
         return json({ updated: false, ref: resolved.ref, column: from, pr, rev: cur.rev });
       }
       card.pr = pr;
-      card.prRev = (Number.isInteger(card.prRev) && Number(card.prRev) >= 0 ? Number(card.prRev) : 0) + 1;
+      card.prRev = nextWebhookRevision(card.prRev);
       if (from !== target) {
         fromCards.splice(cardIndex, 1);
         (cur.board.projects[target] ??= []).push(card);
@@ -705,7 +735,7 @@ Deno.serve({ port: PORT }, async (req: Request) => {
     const doc: Doc = {
       rev: cur.rev + 1,
       updatedAt: new Date().toISOString(),
-      board: body.board,
+      board: preserveWorkflowMetadata(body.board, cur.board),
     };
     const res = await commitDoc(entry, doc);
     if (!res.ok) return json({ error: "conflict: concurrent write, retry" }, 409);

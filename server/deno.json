@@ -1,7 +1,7 @@
 {
   "tasks": {
     "dev": "deno run --watch --unstable-kv --allow-net --allow-env --allow-read main.ts",
-    "check": "deno check main.ts webhook.deno.ts",
+    "check": "deno check main.ts workflow.ts webhook.deno.ts",
     "test": "deno test --allow-run --allow-net --allow-read --allow-write --allow-env --unstable-kv webhook.deno.ts"
   }
 }
