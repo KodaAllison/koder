@@ -8,6 +8,9 @@ desktop.ini
 .idea/
 *.swp
 
+# npm
+node_modules/
+
 # Environment / secrets
 .env
 js/config.local.js

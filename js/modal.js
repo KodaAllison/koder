@@ -27,7 +27,7 @@ const projectField = /** @type {HTMLElement} */ (document.getElementById('projec
 const btnDelete = /** @type {HTMLButtonElement} */ (document.getElementById('btnDelete'));
 const modalRef = /** @type {HTMLButtonElement} */ (document.getElementById('modalRef'));
 
-/* The ref chip, click-to-copy. Quoting a ref somewhere else is the whole point
+/** The ref chip, click-to-copy. Quoting a ref somewhere else is the whole point
  * of having one, and on a phone there is no other way to get the text off a
  * card. It lives here rather than in board.js because board.js already imports
  * this module for openModal — putting the shared widget the other way round
@@ -195,8 +195,9 @@ document.addEventListener('keydown', e => {
 
 btnDelete.onclick = () => {
   if (!editing || !editing.card) return;
-  const src = state[boardFor(activeTab)][editing.colId];
-  const i = src.findIndex(x => x.id === editing.card.id);
+  const { card, colId } = editing;
+  const src = state[boardFor(activeTab)][colId];
+  const i = src.findIndex(x => x.id === card.id);
   if (i !== -1) src.splice(i, 1);
   save(); closeModal(); render();
 };

@@ -28,7 +28,7 @@ export function canArchive() { return apiEnabled(); }
 /** @param {number} n */
 function label(n) { return n === 1 ? '1 done ticket' : `${n} done tickets`; }
 
-/* Archive the given done cards: confirm, hand them to the server, then take
+/** Archive the given done cards: confirm, hand them to the server, then take
  * them off the board. `cards` is whatever the Done column is currently showing
  * — so on a project tab it archives that project's done work, not everyone's.
  * @param {import('./store.js').Card[]} cards */
