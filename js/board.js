@@ -87,6 +87,42 @@ function renderTabs() {
   }));
 }
 
+function renderProjectBar() {
+  document.getElementById('projectBar')?.remove();
+  const project = /** @type {(import('./store.js').Project & {repo?: string, url?: string})|null} */
+    (projectById(activeTab));
+  if (!project) return;
+
+  const board = document.getElementById('board');
+  if (!board) return;
+  const bar = document.createElement('div');
+  bar.id = 'projectBar';
+  bar.className = 'project-bar';
+
+  const name = document.createElement('span');
+  name.className = 'chip project project-bar-name';
+  name.textContent = project.name;
+  name.style.background = project.color;
+  name.style.color = project.text;
+  bar.appendChild(name);
+
+  [
+    { label: 'Repo', href: project.repo },
+    { label: 'Live', href: project.url },
+  ].forEach(link => {
+    if (!link.href) return;
+    const anchor = document.createElement('a');
+    anchor.className = 'project-link';
+    anchor.href = link.href;
+    anchor.target = '_blank';
+    anchor.rel = 'noopener noreferrer';
+    anchor.textContent = `${link.label} ↗`;
+    bar.appendChild(anchor);
+  });
+
+  board.parentElement?.insertBefore(bar, board);
+}
+
 function renderBoard() {
   const board = /** @type {HTMLElement} */ (document.getElementById('board'));
   board.innerHTML = '';
@@ -412,7 +448,7 @@ export function render() {
     ids.has(activeTab);
   if (!valid) setActiveTab('all');
   document.body.style.setProperty('--accent', accentForTab(activeTab));
-  renderTopTabs(); renderTabs(); renderBoard(); renderSidebar();
+  renderTopTabs(); renderTabs(); renderProjectBar(); renderBoard(); renderSidebar();
 }
 
 /* Register as the implementation behind render.js, so modal/sidebar/sync can

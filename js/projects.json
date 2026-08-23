@@ -1,15 +1,15 @@
 {
   "generated": "2026-07-07T17:10:41+0100",
   "projects": [
-    { "id": "crook-community", "name": "crook-community", "color": "#eef1fe", "text": "#3b4bb8" },
-    { "id": "holitrackr", "name": "holitrackr", "color": "#ccfbf1", "text": "#0f766e" },
-    { "id": "koder", "name": "koder", "color": "#f3e8ff", "text": "#7e22ce" },
+    { "id": "crook-community", "name": "crook-community", "color": "#eef1fe", "text": "#3b4bb8", "repo": "https://github.com/KodaAllison/crook-community" },
+    { "id": "holitrackr", "name": "holitrackr", "color": "#ccfbf1", "text": "#0f766e", "repo": "https://github.com/KodaAllison/holitrackr" },
+    { "id": "koder", "name": "koder", "color": "#f3e8ff", "text": "#7e22ce", "repo": "https://github.com/KodaAllison/koder" },
     { "id": "portfolio-new", "name": "portfolio-new", "color": "#ede9fe", "text": "#6d28d9" },
-    { "id": "portfolio-website", "name": "portfolio-website", "color": "#fef3c7", "text": "#b45309" },
-    { "id": "SART", "name": "SART", "color": "#fef3c7", "text": "#b45309" },
+    { "id": "portfolio-website", "name": "portfolio-website", "color": "#fef3c7", "text": "#b45309", "repo": "https://github.com/KodaAllison/portfolio-website", "url": "https://koda-allison-portfolio.vercel.app/" },
+    { "id": "SART", "name": "SART", "color": "#fef3c7", "text": "#b45309", "repo": "https://github.com/KodaAllison/SART" },
     { "id": "strava-insights", "name": "strava-insights", "color": "#fee2e2", "text": "#b91c1c" },
-    { "id": "strava-worker", "name": "strava-worker", "color": "#eef1fe", "text": "#3b4bb8" },
-    { "id": "SwiftPlan", "name": "SwiftPlan", "color": "#fef9c3", "text": "#a16207" },
-    { "id": "weatherapp", "name": "weatherapp", "color": "#f3e8ff", "text": "#7e22ce" }
+    { "id": "strava-worker", "name": "strava-worker", "color": "#eef1fe", "text": "#3b4bb8", "repo": "https://github.com/KodaAllison/strava-worker" },
+    { "id": "SwiftPlan", "name": "SwiftPlan", "color": "#fef9c3", "text": "#a16207", "repo": "https://github.com/KodaAllison/SwiftPlan" },
+    { "id": "weatherapp", "name": "weatherapp", "color": "#f3e8ff", "text": "#7e22ce", "repo": "https://github.com/KodaAllison/weatherapp" }
   ]
 }

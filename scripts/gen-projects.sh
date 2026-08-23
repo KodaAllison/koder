@@ -2,68 +2,58 @@
 #
 # gen-projects.sh — regenerate js/projects.json from the folders in Code/.
 #
-# The Kanban board treats each subfolder of C:/Users/Koda/Code as a "project".
-# This script scans that folder and writes the project list the app loads at
-# startup. Re-run it whenever you add/rename/remove a project folder:
-#
-#     ./scripts/gen-projects.sh
-#
-# Each project gets a stable pastel colour derived from a hash of its name, so
-# a project keeps the same colour even as others are added or removed.
+# Override KODER_CODE_DIR and KODER_PROJECTS_FILE to generate from a fixture.
+# Existing repo/url metadata is carried forward for folders that still exist.
 
 set -euo pipefail
 
-# scripts/ lives inside the board (Code/koder/scripts), so Code/ is two levels up.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CODE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-OUT_FILE="$SCRIPT_DIR/../js/projects.json"
+CODE_DIR="${KODER_CODE_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
+OUT_FILE="${KODER_PROJECTS_FILE:-$SCRIPT_DIR/../js/projects.json}"
 
-# Pastel background / dark text pairs, in the app's palette family.
-COLORS=(  '#eef1fe' '#d1fae5' '#fef3c7' '#fee2e2' '#e0f2fe' '#f3e8ff' '#ffe4e6' '#ccfbf1' '#fef9c3' '#ede9fe' '#fce7f3' '#dcfce7' )
-TEXTS=(   '#3b4bb8' '#047857' '#b45309' '#b91c1c' '#0369a1' '#7e22ce' '#be123c' '#0f766e' '#a16207' '#6d28d9' '#be185d' '#15803d' )
+node - "$CODE_DIR" "$OUT_FILE" <<'NODE'
+const fs = require('node:fs');
+const path = require('node:path');
 
-# Deterministic palette index from a name (sum of char codes % palette size),
-# so colours stay stable across runs.
-palette_index() {
-  local s="$1" sum=0 i ch
-  for (( i=0; i<${#s}; i++ )); do
-    ch="${s:$i:1}"
-    sum=$(( sum + $(printf '%d' "'$ch") ))
-  done
-  echo $(( sum % ${#COLORS[@]} ))
+const [codeDir, outFile] = process.argv.slice(2);
+const colors = ['#eef1fe', '#d1fae5', '#fef3c7', '#fee2e2', '#e0f2fe', '#f3e8ff', '#ffe4e6', '#ccfbf1', '#fef9c3', '#ede9fe', '#fce7f3', '#dcfce7'];
+const texts = ['#3b4bb8', '#047857', '#b45309', '#b91c1c', '#0369a1', '#7e22ce', '#be123c', '#0f766e', '#a16207', '#6d28d9', '#be185d', '#15803d'];
+const skip = new Set(['node_modules', 'koder-phase1']);
+
+function paletteIndex(name) {
+  return [...name].reduce((sum, char) => sum + char.codePointAt(0), 0) % colors.length;
 }
 
-# JSON-escape backslashes and double quotes (folder names rarely need it).
-json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+function generatedAt(date = new Date()) {
+  const pad = value => String(value).padStart(2, '0');
+  const offset = -date.getTimezoneOffset();
+  const sign = offset >= 0 ? '+' : '-';
+  const offsetHours = pad(Math.floor(Math.abs(offset) / 60));
+  const offsetMinutes = pad(Math.abs(offset) % 60);
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}` +
+    `T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}${sign}${offsetHours}${offsetMinutes}`;
+}
 
-# Collect subfolder names (glob skips dotfolders), case-insensitive sort.
-# SKIP excludes non-project dirs. (koder itself is a project now — it has
-# its own tickets on the board.)
-SKIP="node_modules koder-phase1"
-mapfile -t names < <(
-  for d in "$CODE_DIR"/*/; do
-    n="$(basename "$d")"
-    case " $SKIP " in *" $n "*) continue ;; esac
-    printf '%s\n' "$n"
-  done | sort -f
-)
+let existing = { projects: [] };
+if (fs.existsSync(outFile)) existing = JSON.parse(fs.readFileSync(outFile, 'utf8'));
+const metadata = new Map(
+  (Array.isArray(existing.projects) ? existing.projects : []).map(project => [project.id, project]),
+);
 
-entries=""
-for name in "${names[@]}"; do
-  idx="$(palette_index "$name")"
-  esc="$(json_escape "$name")"
-  entry="    { \"id\": \"$esc\", \"name\": \"$esc\", \"color\": \"${COLORS[$idx]}\", \"text\": \"${TEXTS[$idx]}\" }"
-  if [ -z "$entries" ]; then entries="$entry"; else entries="$entries,
-$entry"; fi
-done
+const names = fs.readdirSync(codeDir, { withFileTypes: true })
+  .filter(entry => entry.isDirectory() && !entry.name.startsWith('.') && !skip.has(entry.name))
+  .map(entry => entry.name)
+  .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }) || a.localeCompare(b));
 
-{
-  printf '{\n'
-  printf '  "generated": "%s",\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')"
-  printf '  "projects": [\n'
-  printf '%s\n' "$entries"
-  printf '  ]\n'
-  printf '}\n'
-} > "$OUT_FILE"
+const projects = names.map(name => {
+  const index = paletteIndex(name);
+  const project = { id: name, name, color: colors[index], text: texts[index] };
+  const previous = metadata.get(name);
+  if (typeof previous?.repo === 'string' && previous.repo) project.repo = previous.repo;
+  if (typeof previous?.url === 'string' && previous.url) project.url = previous.url;
+  return project;
+});
 
-echo "wrote js/projects.json (${#names[@]} projects)"
+fs.writeFileSync(outFile, JSON.stringify({ generated: generatedAt(), projects }, null, 2) + '\n');
+console.log(`wrote ${path.normalize(outFile)} (${projects.length} projects)`);
+NODE

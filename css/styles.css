@@ -84,6 +84,14 @@ h1 { font-size: 18px; margin: 0; font-weight: 650; }
  * just applied here too. Also the reason .board-col is its own flex column —
  * a future panel can sit below this one without restructuring .main. */
 .board-panel { padding: 16px; }
+.project-bar { display: flex; align-items: center; gap: 8px; min-width: 0; margin-bottom: 12px; }
+.project-bar-name { flex: 1 1 auto; min-width: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.project-link {
+  flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;
+  min-height: 36px; padding: 6px 12px; border: 1px solid var(--border); border-radius: 8px;
+  color: var(--accent); font-size: 12.5px; font-weight: 650; text-decoration: none;
+}
+.project-link:hover { border-color: var(--accent); background: var(--accent-soft); }
 .board {
   display: grid; grid-template-columns: repeat(var(--board-cols, 4), 1fr); gap: 14px;
   align-items: start;
@@ -346,6 +354,8 @@ body.dragging-active { cursor: grabbing; }
   .top-tabs { padding: 12px 14px 0; }
   .tabs { padding: 8px 14px 0; }
   .main { padding: 14px 14px 24px; gap: 14px; }
+  .project-bar { gap: 6px; }
+  .project-link { min-width: 44px; min-height: 44px; padding: 8px 10px; }
   h1 { font-size: 16px; }
 
   /* Modal → bottom sheet: dock it to the bottom edge (native iOS pattern,
