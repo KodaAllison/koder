@@ -17,6 +17,7 @@ PowerShell doesn't take the `VAR=value cmd` prefix — set it first:
 ```powershell
 cd server
 $env:KODER_TOKEN = "dev"
+$env:KODER_WEBHOOK_SECRET = "local-webhook-secret"
 deno task dev
 ```
 
@@ -27,7 +28,8 @@ deno task dev
    entrypoint `server/main.ts`. (Don't accept the auto-detected "static site"
    preset — the repo's root `index.html` triggers it, and you'd get a file
    server that 404s `/state`.)
-3. Settings → Environment Variables → add `KODER_TOKEN` (e.g. `openssl rand -hex 24`).
+3. Settings → Environment Variables → add `KODER_TOKEN` (e.g. `openssl rand -hex 24`)
+   and `KODER_WEBHOOK_SECRET` (use a separate value, e.g. `openssl rand -hex 32`).
    Optionally `KODER_ORIGIN=https://<your-board-origin>` to lock down CORS.
 4. Create a KV database (org sidebar → Databases) and attach it to the app
    (app Settings → Databases), then redeploy — `Deno.openKv()` fails until
@@ -91,10 +93,58 @@ curl.exe -H "Authorization: Bearer $env:KODER_TOKEN" localhost:8000/tickets
 
 The local KV is its own store, separate from the deployed board, so it starts
 empty — `/tickets` returns `{"tickets":[]}` until you file something into it.
+Tests set the optional `KODER_KV_PATH` environment variable to a fresh temporary
+SQLite file; leave it unset for the normal local database and on Deno Deploy.
 
 ## API
 
-All endpoints require `Authorization: Bearer $KODER_TOKEN`.
+The board endpoints below require `Authorization: Bearer $KODER_TOKEN`. The
+GitHub webhook is the sole exception: it does not accept the bearer token and
+authenticates only with GitHub's HMAC signature.
+
+### POST /webhooks/github — move tickets from pull requests
+
+GitHub sends pull-request events to `/webhooks/github`. The server verifies
+`X-Hub-Signature-256` over the raw request body with `KODER_WEBHOOK_SECRET`
+using a timing-safe comparison. A missing or invalid signature is `401`; there
+is no bearer-token fallback. If the secret is not configured, the route is
+disabled with `500`.
+
+Only these repositories are trusted:
+
+- `KodaAllison/koder`
+- `KodaAllison/crook-community`
+- `KodaAllison/holitrackr`
+- `KodaAllison/portfolio-website`
+
+The PR title or body must contain exactly one resolvable visible ticket ref,
+such as `KODER-8CDA`. A ref that matches multiple cards, or text that names
+multiple cards, is refused with `409` rather than guessed. Accepted events do
+the following atomically:
+
+- `opened` or `reopened`: move the card to `review`.
+- `closed` with `merged: true`: move the card to `done`.
+- `closed` without a merge: leave the board and revision unchanged.
+
+An accepted transition also stores the PR as `KodaAllison/koder#14` in the
+card's `pr` field. Each changed board is committed through the normal monotonic
+revision and snapshot transaction. GitHub delivery IDs are recorded in that
+same transaction for 30 days, so a redelivered older event cannot regress a
+newer card state. Repeating an already-applied state without a delivery ID is
+also a revision-neutral no-op.
+
+Configure the same webhook in each trusted repository under **Settings →
+Webhooks**:
+
+1. Payload URL: `https://<your-board-origin>/webhooks/github`.
+2. Content type: `application/json`.
+3. Secret: exactly the deployed app's `KODER_WEBHOOK_SECRET` value.
+4. Select **Let me select individual events**, enable **Pull requests** only,
+   and leave the webhook active.
+
+After deployment, use GitHub's webhook **Recent Deliveries** page to inspect or
+redeliver a signed event. Untrusted repositories, event types, and actions
+return `202` without reading or changing board state.
 
 ### GET /state
 

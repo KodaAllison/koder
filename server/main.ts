@@ -30,7 +30,7 @@
  *    BOARD's new head rev after that write landed — not a per-ticket
  *    version number. A ticket itself has no revision of its own.
  *
- * Endpoints (all need `Authorization: Bearer $KODER_TOKEN`):
+ * Bearer API endpoints (all need `Authorization: Bearer $KODER_TOKEN`):
  *   GET   /state        → full doc (or an empty rev-0 doc on first run)
  *   GET   /state?rev=N   → the snapshot doc at rev N (404 if pruned)
  *   PUT   /state→ { baseRev, board } → { rev, updatedAt } | 409
@@ -46,6 +46,10 @@
  *   POST  /archive      → { cards } → lifts finished cards off the board
  *   GET   /archive      → everything archived so far, newest first
  *
+ * GitHub webhook (no bearer fallback; requires a valid HMAC made with
+ * `KODER_WEBHOOK_SECRET`):
+ *   POST  /webhooks/github → trusted PR events move a visible-ref ticket
+ *
  * Archive: the board is ONE KV value, so it can only ever hold ~60KB, and Done
  * is the only column that only ever grows. The archive is where done cards go
  * to stop counting against that budget — a separate, append-only, chunked set
@@ -53,23 +57,38 @@
  * Nothing else reads it; it exists so finishing work can't eventually wedge
  * sync (see js/archive.js).
  *
- * Env: KODER_TOKEN (required), KODER_ORIGIN (optional — lock CORS to the
- * deployed board origin instead of "*" once you know it).
+ * Env: KODER_TOKEN (required), KODER_WEBHOOK_SECRET (required for the GitHub
+ * webhook), KODER_ORIGIN (optional — lock CORS to the deployed board origin
+ * instead of "*" once you know it), PORT (optional; defaults to 8000), and
+ * KODER_KV_PATH (optional local/test database path; unset on Deno Deploy).
  *
  * Local dev:  KODER_TOKEN=dev deno task dev   (see deno.json)
  */
 
 import { serveDir } from "jsr:@std/http/file-server";
 import { fromFileUrl } from "jsr:@std/path";
+import { timingSafeEqual } from "node:crypto";
 /* The SAME derivation the board renders with — js/ref.js is dependency-free
  * plain ESM precisely so this import works and the two can't drift on what a
  * ref means. Deno does not type-check imported .js (no checkJs in deno.json),
  * so the JSDoc types there are advisory here. */
 import { ticketRef } from "../js/ref.js";
 
-const kv = await Deno.openKv();
+const KV_PATH = Deno.env.get("KODER_KV_PATH") || undefined;
+const kv = await Deno.openKv(KV_PATH);
 const TOKEN = Deno.env.get("KODER_TOKEN") ?? "";
+const WEBHOOK_SECRET = Deno.env.get("KODER_WEBHOOK_SECRET") ?? "";
+const PORT = Number(Deno.env.get("PORT") ?? "8000");
 const KEY = ["board"];
+const GITHUB_DELIVERY_KEY = ["github-delivery"];
+const GITHUB_DELIVERY_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+const GITHUB_REPOS = new Map([
+  ["kodaallison/koder", "KodaAllison/koder"],
+  ["kodaallison/crook-community", "KodaAllison/crook-community"],
+  ["kodaallison/holitrackr", "KodaAllison/holitrackr"],
+  ["kodaallison/portfolio-website", "KodaAllison/portfolio-website"],
+]);
 
 // How many past revisions to keep as restore points. Snapshots live under
 // ["board", rev]; a prefix list on KEY returns exactly these (the current
@@ -119,6 +138,7 @@ type Card = {
   priority: string;
   created: number;
   project: string | null;
+  pr?: string;
 };
 type Board = {
   projects: Record<string, Card[]>;
@@ -129,6 +149,10 @@ type Doc = {
   rev: number; // the HEAD revision — see the "Terminology" note above
   updatedAt: string | null;
   board: Board;
+};
+type DeliveryGuard = {
+  key: Deno.KvKey;
+  entry: Deno.KvEntryMaybe<boolean>;
 };
 // A card as it looks once off the board: the client tags it with the board it
 // came from and when it left, so an archive read is legible on its own.
@@ -143,12 +167,23 @@ function emptyDoc(): Doc {
  * `check(entry)` guards against a concurrent writer landing on the same rev.
  * All writers (PUT, POST, PATCH, restore) go through here so a snapshot can
  * never diverge from the rev that produced it. */
-function commitDoc(entry: Deno.KvEntryMaybe<Doc>, doc: Doc) {
+function commitDoc(entry: Deno.KvEntryMaybe<Doc>, doc: Doc, delivery?: DeliveryGuard) {
+  const atomic = kv.atomic().check(entry);
+  if (delivery) atomic.check(delivery.entry);
+  atomic.set(KEY, doc)
+    .set([...KEY, doc.rev], doc)
+    .delete([...KEY, doc.rev - KEEP_REVISIONS]);
+  if (delivery) {
+    atomic.set(delivery.key, true, { expireIn: GITHUB_DELIVERY_TTL_MS });
+  }
+  return atomic.commit();
+}
+
+function recordDelivery(entry: Deno.KvEntryMaybe<Doc>, delivery: DeliveryGuard) {
   return kv.atomic()
     .check(entry)
-    .set(KEY, doc)
-    .set([...KEY, doc.rev], doc)
-    .delete([...KEY, doc.rev - KEEP_REVISIONS])
+    .check(delivery.entry)
+    .set(delivery.key, true, { expireIn: GITHUB_DELIVERY_TTL_MS })
     .commit();
 }
 
@@ -277,6 +312,54 @@ function resolveTicketId(
   return { status: 404, error: { error: `no ticket with id or ref "${given}"` } };
 }
 
+async function validGithubSignature(raw: ArrayBuffer, signature: string | null): Promise<boolean> {
+  const match = signature?.match(/^sha256=([0-9a-f]{64})$/i);
+  if (!match || !WEBHOOK_SECRET) return false;
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(WEBHOOK_SECRET),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const expected = new Uint8Array(await crypto.subtle.sign("HMAC", key, raw));
+  const supplied = Uint8Array.from(
+    match[1].match(/.{2}/g) ?? [],
+    (byte) => Number.parseInt(byte, 16),
+  );
+  return timingSafeEqual(expected, supplied);
+}
+
+function resolveVisibleTicket(
+  board: Board,
+  text: string,
+): { id: string; ref: string } | { error: Record<string, unknown>; status: number } | null {
+  const candidates = new Set(
+    Array.from(text.matchAll(/\b[A-Z0-9]+-[A-Z0-9]{4}\b/gi), (match) => match[0].toUpperCase()),
+  );
+  const matches = new Map<string, string>();
+  for (const candidate of candidates) {
+    const resolved = resolveTicketId(board, candidate);
+    if ("error" in resolved) {
+      if (resolved.status === 409) return resolved;
+      continue;
+    }
+    matches.set(resolved.id, candidate);
+  }
+  if (matches.size === 0) return null;
+  if (matches.size > 1) {
+    return {
+      status: 409,
+      error: {
+        error: "PR title/body references more than one ticket",
+        refs: [...matches.values()],
+      },
+    };
+  }
+  const [[id, ref]] = matches;
+  return { id, ref };
+}
+
 const CORS: Record<string, string> = {
   "Access-Control-Allow-Origin": Deno.env.get("KODER_ORIGIN") ?? "*",
   "Access-Control-Allow-Methods": "GET, PUT, POST, PATCH, OPTIONS",
@@ -298,10 +381,112 @@ function isApiPath(p: string): boolean {
     p === "/archive" || p === "/tickets" || p.startsWith("/tickets/");
 }
 
-Deno.serve(async (req: Request) => {
+Deno.serve({ port: PORT }, async (req: Request) => {
   const url = new URL(req.url);
 
   if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
+
+  /* ---- POST /webhooks/github: GitHub's signed PR event entrypoint ----
+   * This route deliberately sits before bearer-token auth. GitHub never gets
+   * KODER_TOKEN; authenticity comes only from the SHA-256 webhook signature. */
+  if (url.pathname === "/webhooks/github") {
+    if (req.method !== "POST") return json({ error: "method not allowed" }, 405);
+    if (!WEBHOOK_SECRET) {
+      return json({ error: "server misconfigured: KODER_WEBHOOK_SECRET not set" }, 500);
+    }
+    const raw = await req.arrayBuffer();
+    if (!await validGithubSignature(raw, req.headers.get("X-Hub-Signature-256"))) {
+      return json({ error: "invalid webhook signature" }, 401);
+    }
+    if (req.headers.get("X-GitHub-Event") !== "pull_request") {
+      return json({ ignored: "unsupported event" }, 202);
+    }
+    let decoded: unknown;
+    try {
+      decoded = JSON.parse(new TextDecoder().decode(raw));
+    } catch {
+      return json({ error: "invalid JSON" }, 400);
+    }
+    if (!decoded || typeof decoded !== "object" || Array.isArray(decoded)) {
+      return json({ error: "invalid webhook payload" }, 400);
+    }
+    const payload = decoded as Record<string, unknown>;
+    const repository = payload.repository as Record<string, unknown> | null;
+    const pullRequest = payload.pull_request as Record<string, unknown> | null;
+    const repo = typeof repository?.full_name === "string"
+      ? GITHUB_REPOS.get(repository.full_name.toLowerCase())
+      : undefined;
+    if (!repo) return json({ ignored: "untrusted repository" }, 202);
+    const deliveryId = req.headers.get("X-GitHub-Delivery");
+    if (deliveryId !== null && !/^[A-Z0-9-]{1,100}$/i.test(deliveryId)) {
+      return json({ error: "invalid X-GitHub-Delivery" }, 400);
+    }
+    const action = payload.action;
+    if (action !== "opened" && action !== "reopened" && action !== "closed") {
+      return json({ ignored: "unsupported action" }, 202);
+    }
+    if (
+      !pullRequest || !Number.isInteger(pullRequest.number) ||
+      typeof pullRequest.title !== "string" ||
+      (pullRequest.body !== null && typeof pullRequest.body !== "string")
+    ) {
+      return json({ error: "invalid pull_request payload" }, 400);
+    }
+    let target: "review" | "done" = "review";
+    if (action === "closed") {
+      if (pullRequest.merged !== true) {
+        return json({ ignored: "pull request closed without merge" }, 202);
+      }
+      target = "done";
+    }
+
+    const pr = `${repo}#${pullRequest.number}`;
+    const text = `${pullRequest.title}\n${pullRequest.body ?? ""}`;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const entry = await kv.get<Doc>(KEY);
+      const delivery = deliveryId
+        ? {
+          key: [...GITHUB_DELIVERY_KEY, deliveryId],
+          entry: await kv.get<boolean>([...GITHUB_DELIVERY_KEY, deliveryId]),
+        }
+        : undefined;
+      if (delivery?.entry.value) {
+        return json({ updated: false, redelivered: true, rev: (entry.value ?? emptyDoc()).rev });
+      }
+      const cur = structuredClone(entry.value ?? emptyDoc());
+      const resolved = resolveVisibleTicket(cur.board, text);
+      if (!resolved) return json({ ignored: "no ticket ref" }, 202);
+      if ("error" in resolved) return json(resolved.error, resolved.status);
+
+      let card: Card | null = null;
+      let from: string | null = null;
+      for (const [column, cards] of Object.entries(cur.board.projects ?? {})) {
+        const index = (cards ?? []).findIndex((candidate) => candidate.id === resolved.id);
+        if (index !== -1) {
+          from = column;
+          card = column === target ? cards[index] : cards.splice(index, 1)[0];
+          break;
+        }
+      }
+      if (!card || from === null) return json({ ignored: "ticket no longer exists" }, 202);
+      if (from === target && card.pr === pr) {
+        if (delivery && !(await recordDelivery(entry, delivery)).ok) continue;
+        return json({ updated: false, ref: resolved.ref, column: from, pr, rev: cur.rev });
+      }
+      card.pr = pr;
+      if (from !== target) (cur.board.projects[target] ??= []).push(card);
+      const doc: Doc = {
+        rev: cur.rev + 1,
+        updatedAt: new Date().toISOString(),
+        board: cur.board,
+      };
+      const result = await commitDoc(entry, doc, delivery);
+      if (result.ok) {
+        return json({ updated: true, ref: resolved.ref, column: target, pr, rev: doc.rev });
+      }
+    }
+    return json({ error: "write contention, retry" }, 503);
+  }
 
   if (!TOKEN) return json({ error: "server misconfigured: KODER_TOKEN not set" }, 500);
 
