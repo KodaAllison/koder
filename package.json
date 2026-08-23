@@ -3,8 +3,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "check": "tsc --noEmit --allowJs --checkJs --target es2022 --module preserve --moduleResolution bundler --lib es2022,dom --project tsconfig.check.json",
-    "test": "node --test"
+    "check": "tsc --noEmit --allowJs --checkJs --target es2022 --moduleResolution bundler --lib es2022,dom --project tsconfig.check.json",
+    "test": "npm run check && node --test"
   },
   "devDependencies": {
     "typescript": "^7.0.2"
