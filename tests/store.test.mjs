@@ -183,6 +183,48 @@ test('mergeBoards does not duplicate a card that moved columns locally', () => {
   assert.deepEqual(local.projects.backlog, []);
 });
 
+test('mergeBoards preserves a newly observed server webhook PR and column', () => {
+  const local = normalize({ projects: { doing: [card('a', { title: 'local edit' })] } });
+  const server = normalize({
+    projects: { review: [card('a', { title: 'server title', pr: 'KodaAllison/koder#21' })] },
+  });
+
+  mergeBoards(local, server, new Set(['a']));
+
+  assert.deepEqual(local.projects.doing, []);
+  assert.equal(local.projects.review[0].pr, 'KodaAllison/koder#21');
+  assert.equal(local.projects.review[0].title, 'server title');
+});
+
+test('mergeBoards preserves a changed server webhook PR and column', () => {
+  const local = normalize({
+    projects: { review: [card('a', { pr: 'KodaAllison/koder#20' })] },
+  });
+  const server = normalize({
+    projects: { done: [card('a', { pr: 'KodaAllison/koder#21' })] },
+  });
+
+  mergeBoards(local, server, new Set(['a']));
+
+  assert.deepEqual(local.projects.review, []);
+  assert.equal(local.projects.done[0].pr, 'KodaAllison/koder#21');
+});
+
+test('mergeBoards resumes local-wins edits after observing the same webhook PR', () => {
+  const local = normalize({
+    projects: { doing: [card('a', { title: 'edited locally', pr: 'KodaAllison/koder#21' })] },
+  });
+  const server = normalize({
+    projects: { review: [card('a', { title: 'stale server title', pr: 'KodaAllison/koder#21' })] },
+  });
+
+  mergeBoards(local, server, new Set(['a']));
+
+  assert.equal(local.projects.doing[0].title, 'edited locally');
+  assert.equal(local.projects.doing[0].pr, 'KodaAllison/koder#21');
+  assert.deepEqual(local.projects.review, []);
+});
+
 test('mergeBoards merges into both boards, creating unknown columns if needed', () => {
   const local = normalize({});
   const server = normalize({});

@@ -81,7 +81,7 @@ const WEBHOOK_SECRET = Deno.env.get("KODER_WEBHOOK_SECRET") ?? "";
 const PORT = Number(Deno.env.get("PORT") ?? "8000");
 const KEY = ["board"];
 const GITHUB_DELIVERY_KEY = ["github-delivery"];
-const GITHUB_DELIVERY_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const GITHUB_BODY_MAX = 256 * 1024;
 
 const GITHUB_REPOS = new Map([
   ["kodaallison/koder", "KodaAllison/koder"],
@@ -174,7 +174,7 @@ function commitDoc(entry: Deno.KvEntryMaybe<Doc>, doc: Doc, delivery?: DeliveryG
     .set([...KEY, doc.rev], doc)
     .delete([...KEY, doc.rev - KEEP_REVISIONS]);
   if (delivery) {
-    atomic.set(delivery.key, true, { expireIn: GITHUB_DELIVERY_TTL_MS });
+    atomic.set(delivery.key, true);
   }
   return atomic.commit();
 }
@@ -183,7 +183,7 @@ function recordDelivery(entry: Deno.KvEntryMaybe<Doc>, delivery: DeliveryGuard) 
   return kv.atomic()
     .check(entry)
     .check(delivery.entry)
-    .set(delivery.key, true, { expireIn: GITHUB_DELIVERY_TTL_MS })
+    .set(delivery.key, true)
     .commit();
 }
 
@@ -312,9 +312,7 @@ function resolveTicketId(
   return { status: 404, error: { error: `no ticket with id or ref "${given}"` } };
 }
 
-async function validGithubSignature(raw: ArrayBuffer, signature: string | null): Promise<boolean> {
-  const match = signature?.match(/^sha256=([0-9a-f]{64})$/i);
-  if (!match || !WEBHOOK_SECRET) return false;
+async function validGithubSignature(raw: Uint8Array<ArrayBuffer>, signature: string): Promise<boolean> {
   const key = await crypto.subtle.importKey(
     "raw",
     new TextEncoder().encode(WEBHOOK_SECRET),
@@ -324,10 +322,46 @@ async function validGithubSignature(raw: ArrayBuffer, signature: string | null):
   );
   const expected = new Uint8Array(await crypto.subtle.sign("HMAC", key, raw));
   const supplied = Uint8Array.from(
-    match[1].match(/.{2}/g) ?? [],
+    signature.slice("sha256=".length).match(/.{2}/g) ?? [],
     (byte) => Number.parseInt(byte, 16),
   );
   return timingSafeEqual(expected, supplied);
+}
+
+async function readGithubBody(
+  req: Request,
+): Promise<{ raw: Uint8Array<ArrayBuffer> } | { status: number; error: string }> {
+  const contentLength = req.headers.get("Content-Length");
+  if (contentLength !== null) {
+    if (!/^(0|[1-9][0-9]*)$/.test(contentLength)) {
+      return { status: 400, error: "invalid Content-Length" };
+    }
+    if (BigInt(contentLength) > BigInt(GITHUB_BODY_MAX)) {
+      return { status: 413, error: `webhook body exceeds ${GITHUB_BODY_MAX} bytes` };
+    }
+  }
+
+  if (!req.body) return { raw: new Uint8Array() };
+  const reader = req.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > GITHUB_BODY_MAX) {
+      await reader.cancel();
+      return { status: 413, error: `webhook body exceeds ${GITHUB_BODY_MAX} bytes` };
+    }
+    chunks.push(value);
+  }
+  const raw = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    raw.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return { raw };
 }
 
 function resolveVisibleTicket(
@@ -360,6 +394,13 @@ function resolveVisibleTicket(
   return { id, ref };
 }
 
+function isNewerSameRepoPr(current: string, incoming: string): boolean {
+  const currentMatch = current.match(/^(.+)#([1-9][0-9]*)$/);
+  const incomingMatch = incoming.match(/^(.+)#([1-9][0-9]*)$/);
+  if (!currentMatch || !incomingMatch || currentMatch[1] !== incomingMatch[1]) return false;
+  return Number(incomingMatch[2]) > Number(currentMatch[2]);
+}
+
 const CORS: Record<string, string> = {
   "Access-Control-Allow-Origin": Deno.env.get("KODER_ORIGIN") ?? "*",
   "Access-Control-Allow-Methods": "GET, PUT, POST, PATCH, OPTIONS",
@@ -372,6 +413,23 @@ function json(body: unknown, status = 200): Response {
     status,
     headers: { ...CORS, "Content-Type": "application/json" },
   });
+}
+
+async function recordGithubNoop(
+  deliveryId: string,
+  body: Record<string, unknown>,
+  status: number,
+): Promise<Response> {
+  const key = [...GITHUB_DELIVERY_KEY, deliveryId];
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const entry = await kv.get<Doc>(KEY);
+    const delivery: DeliveryGuard = { key, entry: await kv.get<boolean>(key) };
+    if (delivery.entry.value) {
+      return json({ updated: false, redelivered: true, rev: (entry.value ?? emptyDoc()).rev });
+    }
+    if ((await recordDelivery(entry, delivery)).ok) return json(body, status);
+  }
+  return json({ error: "write contention, retry" }, 503);
 }
 
 /* The authenticated API surface. A GET to anything else is a static frontend
@@ -394,21 +452,37 @@ Deno.serve({ port: PORT }, async (req: Request) => {
     if (!WEBHOOK_SECRET) {
       return json({ error: "server misconfigured: KODER_WEBHOOK_SECRET not set" }, 500);
     }
-    const raw = await req.arrayBuffer();
-    if (!await validGithubSignature(raw, req.headers.get("X-Hub-Signature-256"))) {
+    const signature = req.headers.get("X-Hub-Signature-256");
+    if (!signature || !/^sha256=[0-9a-f]{64}$/.test(signature)) {
       return json({ error: "invalid webhook signature" }, 401);
     }
+    const suppliedDelivery = req.headers.get("X-GitHub-Delivery");
+    if (!suppliedDelivery || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(suppliedDelivery)) {
+      return json({ error: "invalid X-GitHub-Delivery" }, 400);
+    }
+    const deliveryId = suppliedDelivery.toLowerCase();
+    const body = await readGithubBody(req);
+    if ("error" in body) return json({ error: body.error }, body.status);
+    const raw = body.raw;
+    if (!await validGithubSignature(raw, signature)) {
+      return json({ error: "invalid webhook signature" }, 401);
+    }
+    const deliveryKey = [...GITHUB_DELIVERY_KEY, deliveryId];
+    if ((await kv.get<boolean>(deliveryKey)).value) {
+      const entry = await kv.get<Doc>(KEY);
+      return json({ updated: false, redelivered: true, rev: (entry.value ?? emptyDoc()).rev });
+    }
     if (req.headers.get("X-GitHub-Event") !== "pull_request") {
-      return json({ ignored: "unsupported event" }, 202);
+      return await recordGithubNoop(deliveryId, { ignored: "unsupported event" }, 202);
     }
     let decoded: unknown;
     try {
       decoded = JSON.parse(new TextDecoder().decode(raw));
     } catch {
-      return json({ error: "invalid JSON" }, 400);
+      return await recordGithubNoop(deliveryId, { error: "invalid JSON" }, 400);
     }
     if (!decoded || typeof decoded !== "object" || Array.isArray(decoded)) {
-      return json({ error: "invalid webhook payload" }, 400);
+      return await recordGithubNoop(deliveryId, { error: "invalid webhook payload" }, 400);
     }
     const payload = decoded as Record<string, unknown>;
     const repository = payload.repository as Record<string, unknown> | null;
@@ -416,26 +490,28 @@ Deno.serve({ port: PORT }, async (req: Request) => {
     const repo = typeof repository?.full_name === "string"
       ? GITHUB_REPOS.get(repository.full_name.toLowerCase())
       : undefined;
-    if (!repo) return json({ ignored: "untrusted repository" }, 202);
-    const deliveryId = req.headers.get("X-GitHub-Delivery");
-    if (deliveryId !== null && !/^[A-Z0-9-]{1,100}$/i.test(deliveryId)) {
-      return json({ error: "invalid X-GitHub-Delivery" }, 400);
+    if (!repo) {
+      return await recordGithubNoop(deliveryId, { ignored: "untrusted repository" }, 202);
     }
     const action = payload.action;
     if (action !== "opened" && action !== "reopened" && action !== "closed") {
-      return json({ ignored: "unsupported action" }, 202);
+      return await recordGithubNoop(deliveryId, { ignored: "unsupported action" }, 202);
     }
     if (
-      !pullRequest || !Number.isInteger(pullRequest.number) ||
+      !pullRequest || !Number.isInteger(pullRequest.number) || Number(pullRequest.number) < 1 ||
       typeof pullRequest.title !== "string" ||
       (pullRequest.body !== null && typeof pullRequest.body !== "string")
     ) {
-      return json({ error: "invalid pull_request payload" }, 400);
+      return await recordGithubNoop(deliveryId, { error: "invalid pull_request payload" }, 400);
     }
     let target: "review" | "done" = "review";
     if (action === "closed") {
       if (pullRequest.merged !== true) {
-        return json({ ignored: "pull request closed without merge" }, 202);
+        return await recordGithubNoop(
+          deliveryId,
+          { ignored: "pull request closed without merge" },
+          202,
+        );
       }
       target = "done";
     }
@@ -444,37 +520,59 @@ Deno.serve({ port: PORT }, async (req: Request) => {
     const text = `${pullRequest.title}\n${pullRequest.body ?? ""}`;
     for (let attempt = 0; attempt < 5; attempt++) {
       const entry = await kv.get<Doc>(KEY);
-      const delivery = deliveryId
-        ? {
-          key: [...GITHUB_DELIVERY_KEY, deliveryId],
-          entry: await kv.get<boolean>([...GITHUB_DELIVERY_KEY, deliveryId]),
-        }
-        : undefined;
-      if (delivery?.entry.value) {
+      const delivery: DeliveryGuard = {
+        key: deliveryKey,
+        entry: await kv.get<boolean>(deliveryKey),
+      };
+      if (delivery.entry.value) {
         return json({ updated: false, redelivered: true, rev: (entry.value ?? emptyDoc()).rev });
       }
       const cur = structuredClone(entry.value ?? emptyDoc());
       const resolved = resolveVisibleTicket(cur.board, text);
-      if (!resolved) return json({ ignored: "no ticket ref" }, 202);
-      if ("error" in resolved) return json(resolved.error, resolved.status);
+      if (!resolved) {
+        if (!(await recordDelivery(entry, delivery)).ok) continue;
+        return json({ ignored: "no ticket ref" }, 202);
+      }
+      if ("error" in resolved) {
+        if (!(await recordDelivery(entry, delivery)).ok) continue;
+        return json(resolved.error, resolved.status);
+      }
 
       let card: Card | null = null;
       let from: string | null = null;
+      let fromCards: Card[] | null = null;
+      let cardIndex = -1;
       for (const [column, cards] of Object.entries(cur.board.projects ?? {})) {
         const index = (cards ?? []).findIndex((candidate) => candidate.id === resolved.id);
         if (index !== -1) {
           from = column;
-          card = column === target ? cards[index] : cards.splice(index, 1)[0];
+          fromCards = cards;
+          cardIndex = index;
+          card = cards[index];
           break;
         }
       }
-      if (!card || from === null) return json({ ignored: "ticket no longer exists" }, 202);
+      if (!card || from === null || !fromCards || cardIndex < 0) {
+        if (!(await recordDelivery(entry, delivery)).ok) continue;
+        return json({ ignored: "ticket no longer exists" }, 202);
+      }
+      if (from === "done" && target === "review") {
+        if (!(await recordDelivery(entry, delivery)).ok) continue;
+        return json({ ignored: "done is terminal for webhook events", ref: resolved.ref }, 202);
+      }
+      if (card.pr && card.pr !== pr && !isNewerSameRepoPr(card.pr, pr)) {
+        if (!(await recordDelivery(entry, delivery)).ok) continue;
+        return json({ ignored: "stale or cross-repository PR association", ref: resolved.ref }, 202);
+      }
       if (from === target && card.pr === pr) {
-        if (delivery && !(await recordDelivery(entry, delivery)).ok) continue;
+        if (!(await recordDelivery(entry, delivery)).ok) continue;
         return json({ updated: false, ref: resolved.ref, column: from, pr, rev: cur.rev });
       }
       card.pr = pr;
-      if (from !== target) (cur.board.projects[target] ??= []).push(card);
+      if (from !== target) {
+        fromCards.splice(cardIndex, 1);
+        (cur.board.projects[target] ??= []).push(card);
+      }
       const doc: Doc = {
         rev: cur.rev + 1,
         updatedAt: new Date().toISOString(),

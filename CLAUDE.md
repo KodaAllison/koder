@@ -9,7 +9,8 @@ hash by `node scripts/stamp-sw.mjs`, run on `main` before deploy and never on a
 feature branch (see "Deploying" in README.md).
 
 Tests: `node --test` from the repo root (covers the pure logic in `js/store.js` — keep store.js free
-of DOM/localStorage so this stays true). JS uses `// @ts-check` + JSDoc types.
+of DOM/localStorage so this stays true). Server changes also run `deno task check` and `deno task test`
+from `server/`. JS uses `// @ts-check` + JSDoc types.
 
 ## koder-ticket skill
 

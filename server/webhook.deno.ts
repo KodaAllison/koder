@@ -2,6 +2,13 @@ import assert from "node:assert/strict";
 
 const TOKEN = "webhook-test-token";
 const SECRET = "webhook-test-secret";
+let deliverySequence = 1;
+
+function freshDelivery(): string {
+  return `00000000-0000-4000-8000-${
+    (deliverySequence++).toString(16).padStart(12, "0")
+  }`;
+}
 
 type Card = {
   id: string;
@@ -87,10 +94,16 @@ async function postWebhook(
   baseUrl: string,
   payload: unknown,
   options: {
-    signature?: "valid" | "invalid" | "missing";
+    signature?:
+      | "valid"
+      | "invalid"
+      | "uppercaseHex"
+      | "uppercasePrefix"
+      | "short"
+      | "missing";
     event?: string;
     bearer?: boolean;
-    delivery?: string;
+    delivery?: string | null;
   } = {},
 ): Promise<Response> {
   const body = JSON.stringify(payload);
@@ -98,13 +111,24 @@ async function postWebhook(
     "Content-Type": "application/json",
     "X-GitHub-Event": options.event ?? "pull_request",
   });
-  if (options.delivery) headers.set("X-GitHub-Delivery", options.delivery);
+  const delivery = options.delivery === undefined
+    ? freshDelivery()
+    : options.delivery;
+  if (delivery !== null) headers.set("X-GitHub-Delivery", delivery);
   if (options.signature !== "missing") {
+    const signed = await signature(body);
+    const digest = signed.slice("sha256=".length);
     headers.set(
       "X-Hub-Signature-256",
       options.signature === "invalid"
         ? `sha256=${"0".repeat(64)}`
-        : await signature(body),
+        : options.signature === "uppercaseHex"
+        ? `sha256=${digest.toUpperCase()}`
+        : options.signature === "uppercasePrefix"
+        ? `SHA256=${digest}`
+        : options.signature === "short"
+        ? `sha256=${digest.slice(0, 63)}`
+        : signed,
     );
   }
   if (options.bearer) headers.set("Authorization", `Bearer ${TOKEN}`);
@@ -115,7 +139,86 @@ async function postWebhook(
   });
 }
 
-function card(id = "t_ticket_1a2b", project = "koder"): Card {
+async function postRawWebhook(
+  baseUrl: string,
+  body: BodyInit,
+  delivery = freshDelivery(),
+): Promise<Response> {
+  return await fetch(`${baseUrl}/webhooks/github`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-GitHub-Delivery": delivery,
+      "X-GitHub-Event": "pull_request",
+      "X-Hub-Signature-256": `sha256=${"0".repeat(64)}`,
+    },
+    body,
+  });
+}
+
+async function writeAll(conn: Deno.Conn, bytes: Uint8Array): Promise<void> {
+  let offset = 0;
+  while (offset < bytes.length) {
+    offset += await conn.write(bytes.subarray(offset));
+  }
+}
+
+async function postChunkedOversizedWebhook(baseUrl: string): Promise<number> {
+  const url = new URL(baseUrl);
+  const conn = await Deno.connect({
+    hostname: url.hostname,
+    port: Number(url.port),
+  });
+  const encoder = new TextEncoder();
+  try {
+    await writeAll(
+      conn,
+      encoder.encode([
+        "POST /webhooks/github HTTP/1.1",
+        `Host: ${url.host}`,
+        "Content-Type: application/json",
+        `X-GitHub-Delivery: ${freshDelivery()}`,
+        "X-GitHub-Event: pull_request",
+        `X-Hub-Signature-256: sha256=${"0".repeat(64)}`,
+        "Transfer-Encoding: chunked",
+        "Connection: close",
+        "",
+        "",
+      ].join("\r\n")),
+    );
+    try {
+      for (const chunk of [new Uint8Array(200_000), new Uint8Array(100_000)]) {
+        await writeAll(
+          conn,
+          encoder.encode(`${chunk.length.toString(16)}\r\n`),
+        );
+        await writeAll(conn, chunk);
+        await writeAll(conn, encoder.encode("\r\n"));
+      }
+      await writeAll(conn, encoder.encode("0\r\n\r\n"));
+    } catch {
+      // The server may close its receive side as soon as it emits the 413.
+    }
+
+    const response = new Uint8Array(4096);
+    const size = await conn.read(response);
+    assert.notEqual(size, null);
+    const statusLine =
+      new TextDecoder().decode(response.subarray(0, size ?? 0)).split(
+        "\r\n",
+        1,
+      )[0];
+    return Number(statusLine.split(" ")[1]);
+  } finally {
+    conn.close();
+  }
+}
+
+function card(
+  id = "t_ticket_1a2b",
+  project = "koder",
+  extra: Partial<Card> = {},
+): Card {
   return {
     id,
     title: "Webhook ticket",
@@ -123,6 +226,7 @@ function card(id = "t_ticket_1a2b", project = "koder"): Card {
     priority: "med",
     created: 1,
     project,
+    ...extra,
   };
 }
 
@@ -193,6 +297,70 @@ Deno.test({
         },
       );
 
+      await t.step("a valid GitHub delivery ID is mandatory", async () => {
+        const before = await seedBoard(baseUrl, { doing: [card()] });
+        const payload = {
+          action: "opened",
+          repository: { full_name: "KodaAllison/koder" },
+          pull_request: {
+            number: 14,
+            title: "KODER-1A2B missing delivery",
+            body: null,
+            merged: false,
+          },
+        };
+        const missing = await postWebhook(baseUrl, payload, { delivery: null });
+        const malformed = await postWebhook(baseUrl, payload, {
+          delivery: "not-a-guid",
+        });
+
+        assert.equal(missing.status, 400);
+        assert.equal(malformed.status, 400);
+        assert.equal((await getState(baseUrl)).rev, before.rev);
+      });
+
+      await t.step(
+        "signature grammar accepts lowercase sha256 hex only",
+        async () => {
+          const before = await seedBoard(baseUrl, { doing: [card()] });
+          const payload = {
+            action: "opened",
+            repository: { full_name: "KodaAllison/koder" },
+            pull_request: {
+              number: 14,
+              title: "KODER-1A2B uppercase signature",
+              body: null,
+              merged: false,
+            },
+          };
+
+          for (
+            const signature of [
+              "uppercaseHex",
+              "uppercasePrefix",
+              "short",
+            ] as const
+          ) {
+            assert.equal(
+              (await postWebhook(baseUrl, payload, { signature })).status,
+              401,
+              signature,
+            );
+          }
+          assert.equal((await getState(baseUrl)).rev, before.rev);
+        },
+      );
+
+      await t.step(
+        "oversized fixed and streamed bodies are rejected with 413",
+        async () => {
+          const fixed = await postRawWebhook(baseUrl, "x".repeat(300_000));
+          assert.equal(fixed.status, 413);
+
+          assert.equal(await postChunkedOversizedWebhook(baseUrl), 413);
+        },
+      );
+
       await t.step(
         "only the four active repositories are trusted",
         async () => {
@@ -257,6 +425,148 @@ Deno.test({
       });
 
       await t.step(
+        "every authenticated no-op delivery is permanently deduplicated",
+        async () => {
+          const mutatingPayload = {
+            action: "opened",
+            repository: { full_name: "KodaAllison/koder" },
+            pull_request: {
+              number: 14,
+              title: "KODER-1A2B mutate if delivery was not recorded",
+              body: null,
+              merged: false,
+            },
+          };
+          const cases: Array<{
+            name: string;
+            projects: Record<string, Card[]>;
+            payload: unknown;
+            options: { event?: string };
+            status: number;
+            replay?: unknown;
+          }> = [
+            {
+              name: "unsupported event",
+              projects: { doing: [card()] },
+              payload: mutatingPayload,
+              options: { event: "issues" },
+              status: 202,
+            },
+            {
+              name: "unsupported action",
+              projects: { doing: [card()] },
+              payload: { ...mutatingPayload, action: "synchronize" },
+              options: {},
+              status: 202,
+            },
+            {
+              name: "disallowed repository",
+              projects: { doing: [card()] },
+              payload: {
+                ...mutatingPayload,
+                repository: { full_name: "KodaAllison/inactive-repo" },
+              },
+              options: {},
+              status: 202,
+            },
+            {
+              name: "no matching ref",
+              projects: { doing: [card()] },
+              payload: {
+                ...mutatingPayload,
+                pull_request: {
+                  ...mutatingPayload.pull_request,
+                  title: "KODER-FFFF no match",
+                },
+              },
+              options: {},
+              status: 202,
+            },
+            {
+              name: "ambiguous refs",
+              projects: { doing: [card(), card("t_ticket_3c4d")] },
+              payload: {
+                ...mutatingPayload,
+                pull_request: {
+                  ...mutatingPayload.pull_request,
+                  title: "KODER-1A2B and KODER-3C4D",
+                },
+              },
+              options: {},
+              status: 409,
+            },
+            {
+              name: "closed without merge",
+              projects: { doing: [card()] },
+              payload: {
+                ...mutatingPayload,
+                action: "closed",
+                pull_request: {
+                  ...mutatingPayload.pull_request,
+                  merged: false,
+                },
+              },
+              options: {},
+              status: 202,
+            },
+            {
+              name: "unchanged transition",
+              projects: {
+                review: [
+                  card("t_ticket_1a2b", "koder", {
+                    pr: "KodaAllison/koder#14",
+                  }),
+                ],
+              },
+              payload: mutatingPayload,
+              options: {},
+              status: 200,
+              replay: {
+                ...mutatingPayload,
+                action: "closed",
+                pull_request: { ...mutatingPayload.pull_request, merged: true },
+              },
+            },
+          ];
+
+          for (const scenario of cases) {
+            const before = await seedBoard(baseUrl, scenario.projects);
+            const delivery = freshDelivery();
+            const first = await postWebhook(baseUrl, scenario.payload, {
+              ...scenario.options,
+              delivery,
+            });
+            assert.equal(first.status, scenario.status, scenario.name);
+            assert.equal(
+              (await getState(baseUrl)).rev,
+              before.rev,
+              scenario.name,
+            );
+
+            const replay = await postWebhook(
+              baseUrl,
+              scenario.replay ?? mutatingPayload,
+              { delivery },
+            );
+            assert.equal(replay.status, 200, `${scenario.name} replay`);
+            const replayBody = await replay.json() as { redelivered?: boolean };
+            assert.equal(
+              replayBody.redelivered,
+              true,
+              `${scenario.name} replay`,
+            );
+            const after = await getState(baseUrl);
+            assert.equal(after.rev, before.rev, `${scenario.name} replay`);
+            assert.deepEqual(
+              after.board,
+              before.board,
+              `${scenario.name} replay`,
+            );
+          }
+        },
+      );
+
+      await t.step(
         "opened moves a visible-ref ticket to review and stores the PR",
         async () => {
           await seedBoard(baseUrl, { doing: [card()] });
@@ -285,7 +595,7 @@ Deno.test({
       await t.step(
         "reopened finds a ref in the body and moves the ticket to review",
         async () => {
-          await seedBoard(baseUrl, { done: [card()] });
+          await seedBoard(baseUrl, { todo: [card()] });
           const response = await postWebhook(baseUrl, {
             action: "reopened",
             repository: { full_name: "KodaAllison/koder" },
@@ -299,7 +609,7 @@ Deno.test({
 
           assert.equal(response.status, 200);
           const state = await getState(baseUrl);
-          assert.equal(state.board.projects.done.length, 0);
+          assert.equal(state.board.projects.todo.length, 0);
           assert.equal(state.board.projects.review[0].id, "t_ticket_1a2b");
           assert.equal(
             state.board.projects.review[0].pr,
@@ -327,6 +637,118 @@ Deno.test({
         assert.equal(state.board.projects.done[0].id, "t_ticket_1a2b");
         assert.equal(state.board.projects.done[0].pr, "KodaAllison/koder#16");
       });
+
+      await t.step(
+        "done is terminal for delayed or replacement open events",
+        async () => {
+          await seedBoard(baseUrl, {
+            review: [
+              card("t_ticket_1a2b", "koder", { pr: "KodaAllison/koder#20" }),
+            ],
+          });
+          const merged = await postWebhook(baseUrl, {
+            action: "closed",
+            repository: { full_name: "KodaAllison/koder" },
+            pull_request: {
+              number: 20,
+              title: "Merge KODER-1A2B",
+              body: null,
+              merged: true,
+            },
+          });
+          assert.equal(merged.status, 200);
+          const afterMerged = await getState(baseUrl);
+
+          for (const number of [20, 21]) {
+            const delivery = freshDelivery();
+            const delayed = await postWebhook(baseUrl, {
+              action: number === 20 ? "opened" : "reopened",
+              repository: { full_name: "KodaAllison/koder" },
+              pull_request: {
+                number,
+                title: "KODER-1A2B must stay done",
+                body: null,
+                merged: false,
+              },
+            }, { delivery });
+            assert.equal(delayed.status, 202);
+            assert.deepEqual(
+              (await getState(baseUrl)).board,
+              afterMerged.board,
+            );
+
+            const replay = await postWebhook(baseUrl, {
+              action: "closed",
+              repository: { full_name: "KodaAllison/koder" },
+              pull_request: {
+                number: 21,
+                title: "KODER-1A2B replay must not mutate",
+                body: null,
+                merged: true,
+              },
+            }, { delivery });
+            assert.equal(
+              (await replay.json() as { redelivered?: boolean }).redelivered,
+              true,
+            );
+            assert.equal((await getState(baseUrl)).rev, afterMerged.rev);
+          }
+        },
+      );
+
+      await t.step(
+        "only a newer same-repo PR can replace an active PR association",
+        async () => {
+          const before = await seedBoard(baseUrl, {
+            review: [
+              card("t_ticket_1a2b", "koder", { pr: "KodaAllison/koder#30" }),
+            ],
+          });
+          const stale = await postWebhook(baseUrl, {
+            action: "opened",
+            repository: { full_name: "KodaAllison/koder" },
+            pull_request: {
+              number: 29,
+              title: "Old KODER-1A2B",
+              body: null,
+              merged: false,
+            },
+          });
+          assert.equal(stale.status, 202);
+          assert.equal((await getState(baseUrl)).rev, before.rev);
+
+          const crossRepo = await postWebhook(baseUrl, {
+            action: "opened",
+            repository: { full_name: "KodaAllison/holitrackr" },
+            pull_request: {
+              number: 99,
+              title: "Cross-repo KODER-1A2B",
+              body: null,
+              merged: false,
+            },
+          });
+          assert.equal(crossRepo.status, 202);
+          assert.equal((await getState(baseUrl)).rev, before.rev);
+
+          const replacement = await postWebhook(baseUrl, {
+            action: "opened",
+            repository: { full_name: "KodaAllison/koder" },
+            pull_request: {
+              number: 31,
+              title: "Replacement KODER-1A2B",
+              body: null,
+              merged: false,
+            },
+          });
+          assert.equal(replacement.status, 200);
+          const after = await getState(baseUrl);
+          assert.equal(after.rev, before.rev + 1);
+          assert.equal(
+            after.board.projects.review[0].pr,
+            "KodaAllison/koder#31",
+          );
+        },
+      );
 
       await t.step(
         "closed without merge is a board-revision no-op",
@@ -378,6 +800,8 @@ Deno.test({
         "redelivery is idempotent and the changed revision is snapshotted",
         async () => {
           await seedBoard(baseUrl, { doing: [card()] });
+          const openedDelivery = freshDelivery();
+          const mergedDelivery = freshDelivery();
           const opened = {
             action: "opened",
             repository: { full_name: "KodaAllison/koder" },
@@ -389,7 +813,7 @@ Deno.test({
             },
           };
           const first = await postWebhook(baseUrl, opened, {
-            delivery: "delivery-opened-19",
+            delivery: openedDelivery,
           });
           assert.equal(first.status, 200);
           const firstBody = await first.json() as {
@@ -407,7 +831,7 @@ Deno.test({
             ...opened,
             action: "closed",
             pull_request: { ...opened.pull_request, merged: true },
-          }, { delivery: "delivery-merged-19" });
+          }, { delivery: mergedDelivery });
           assert.equal(merged.status, 200);
           const mergedBody = await merged.json() as {
             updated: boolean;
@@ -416,7 +840,7 @@ Deno.test({
           assert.equal(mergedBody.updated, true);
 
           const second = await postWebhook(baseUrl, opened, {
-            delivery: "delivery-opened-19",
+            delivery: openedDelivery,
           });
           assert.equal(second.status, 200);
           const secondBody = await second.json() as {

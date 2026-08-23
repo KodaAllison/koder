@@ -21,6 +21,13 @@ $env:KODER_WEBHOOK_SECRET = "local-webhook-secret"
 deno task dev
 ```
 
+Run the server type-check and signed-webhook integration suite with:
+
+```powershell
+deno task check
+deno task test
+```
+
 ## Deploy (free) on Deno Deploy
 
 1. https://dash.deno.com → New App → link this GitHub repo.
@@ -108,7 +115,10 @@ GitHub sends pull-request events to `/webhooks/github`. The server verifies
 `X-Hub-Signature-256` over the raw request body with `KODER_WEBHOOK_SECRET`
 using a timing-safe comparison. A missing or invalid signature is `401`; there
 is no bearer-token fallback. If the secret is not configured, the route is
-disabled with `500`.
+disabled with `500`. The signature must have the exact lowercase form
+`sha256=` followed by 64 lowercase hexadecimal characters, and every request
+must carry a valid GUID in `X-GitHub-Delivery`. Bodies are capped at 256 KiB
+for both declared-length and chunked requests; larger bodies return `413`.
 
 Only these repositories are trusted:
 
@@ -126,12 +136,19 @@ the following atomically:
 - `closed` with `merged: true`: move the card to `done`.
 - `closed` without a merge: leave the board and revision unchanged.
 
+Done is terminal for webhook automation, so a delayed open/reopen event cannot
+move completed work back to Review. While a card is active, a different PR may
+replace its stored association only when it has a higher PR number in the same
+repository. Lower-numbered and cross-repository events are recorded as stale
+no-ops. To start replacement work after completion, move the card out of Done
+deliberately before opening the new PR.
+
 An accepted transition also stores the PR as `KodaAllison/koder#14` in the
 card's `pr` field. Each changed board is committed through the normal monotonic
-revision and snapshot transaction. GitHub delivery IDs are recorded in that
-same transaction for 30 days, so a redelivered older event cannot regress a
-newer card state. Repeating an already-applied state without a delivery ID is
-also a revision-neutral no-op.
+revision and snapshot transaction. Every authenticated delivery ID is retained
+without expiry, including ignored and unchanged outcomes. The delivery write
+is atomic with the checked board revision (and with the board write for a real
+transition), so any later redelivery is permanently unable to mutate state.
 
 Configure the same webhook in each trusted repository under **Settings →
 Webhooks**:
