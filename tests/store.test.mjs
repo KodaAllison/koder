@@ -5,7 +5,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  BOARDS, boardFor, colsFor, cardMatchesView,
+  BOARDS, boardFor, colsFor, cardMatchesView, isSingleProjectView, safeProjectLink,
   normalize, migrateLifeColumns, migrateLifeToDashboard, sortByPriority,
   allCardIds, lifeMetaIds, mergeBoards, boardHasContent, uid,
   openCards, doneCards, removeDoneCards, boardSize,
@@ -138,6 +138,21 @@ test('cardMatchesView covers all/unassigned/unlinked/project', () => {
   assert.ok(!cardMatchesView(assigned, 'unlinked', known));
   assert.ok(cardMatchesView(assigned, 'koder', known));
   assert.ok(!cardMatchesView(orphan, 'koder', known));
+});
+
+test('isSingleProjectView rejects reserved tabs before project lookup', () => {
+  for (const view of ['all', 'unassigned', 'unlinked', 'life']) {
+    assert.equal(isSingleProjectView(view), false, view);
+  }
+  assert.equal(isSingleProjectView('koder'), true);
+});
+
+test('safeProjectLink accepts only absolute HTTP and HTTPS URLs', () => {
+  assert.equal(safeProjectLink('https://example.com/repo'), 'https://example.com/repo');
+  assert.equal(safeProjectLink('http://example.com/site'), 'http://example.com/site');
+  for (const value of ['javascript:alert(1)', 'data:text/html,bad', 'file:///tmp/repo', '/relative', 'not a URL', null]) {
+    assert.equal(safeProjectLink(value), null, String(value));
+  }
 });
 
 /* ---------- merge (the code where bugs mean data loss) ---------- */

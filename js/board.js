@@ -4,7 +4,7 @@
  * Everything re-renders from `state` on each change — simple and correct at
  * this scale; inline editors that must keep focus (sticky notes) opt out. */
 
-import { BOARDS, colsFor, boardFor, cardMatchesView, sortByPriority, openCards, DONE_COLUMN } from './store.js';
+import { BOARDS, colsFor, boardFor, cardMatchesView, isSingleProjectView, safeProjectLink, sortByPriority, openCards, DONE_COLUMN } from './store.js';
 import { ticketRef } from './ref.js';
 import { state, activeTab, setActiveTab, PROJECTS, projectIds, projectById, save } from './state.js';
 import { renderSidebar } from './sidebar.js';
@@ -89,8 +89,8 @@ function renderTabs() {
 
 function renderProjectBar() {
   document.getElementById('projectBar')?.remove();
-  const project = /** @type {(import('./store.js').Project & {repo?: string, url?: string})|null} */
-    (projectById(activeTab));
+  if (!isSingleProjectView(activeTab)) return;
+  const project = projectById(activeTab);
   if (!project) return;
 
   const board = document.getElementById('board');
@@ -110,10 +110,11 @@ function renderProjectBar() {
     { label: 'Repo', href: project.repo },
     { label: 'Live', href: project.url },
   ].forEach(link => {
-    if (!link.href) return;
+    const href = safeProjectLink(link.href);
+    if (!href) return;
     const anchor = document.createElement('a');
     anchor.className = 'project-link';
-    anchor.href = link.href;
+    anchor.href = href;
     anchor.target = '_blank';
     anchor.rel = 'noopener noreferrer';
     anchor.textContent = `${link.label} ↗`;

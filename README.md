@@ -46,7 +46,7 @@ To enable sync, copy `js/config.example.js` to `js/config.local.js`
 | `tests/` | `node --test` (from the repo root) — covers `js/store.js` + the SW guards |
 | `sw.js` | Service worker — offline caching + update flow |
 | `manifest.webmanifest` | Makes the app installable |
-| `js/projects.json` | Generated project list (don't edit by hand) |
+| `js/projects.json` | Generated folder list; optional `repo`/`url` fields are hand-set |
 | `js/config.example.js` | Template for `config.local.js` — copy and fill in |
 | `js/config.local.js` | Your sync server URL + token (gitignored) |
 | `server/main.ts` | The whole backend: 3 endpoints, Deno KV |
@@ -59,9 +59,13 @@ To enable sync, copy `js/config.example.js` to `js/config.local.js`
 
 **One state object, one render function.** `state` holds the whole board;
 `render()` rebuilds the DOM from it. Every interaction is
-`mutate state → save() → render()`. Projects aren't configured anywhere — each
-folder under `Code/` *is* a project (run `./scripts/gen-projects.sh` after
-adding/removing one).
+`mutate state → save() → render()`. Each folder under `Code/` *is* a project
+(run `./scripts/gen-projects.sh` after adding/removing one).
+
+**Project links are the editable exception in `projects.json`.** Add or update
+optional `repo` and `url` fields on an existing project entry by hand. The
+generator rebuilds folder-derived fields, preserves those two fields for
+projects that still exist, and drops entries for removed folders.
 
 **Offline-first, server-canonical.** `save()` writes localStorage synchronously
 (instant, works offline) and schedules a debounced push to the server, which

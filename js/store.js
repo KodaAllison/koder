@@ -48,6 +48,8 @@
  * @property {string} name
  * @property {string} color
  * @property {string} text
+ * @property {string} [repo]            repository URL
+ * @property {string} [url]             live site URL
  */
 
 /* The board has two column sets. "projects" is a SINGLE shared board that
@@ -81,6 +83,23 @@ export function colsFor(boardId) { return BOARDS[boardId]; }
  * filtered to the cards that match. */
 /** @param {string} view @returns {keyof typeof BOARDS} */
 export function boardFor(view) { return view === 'life' ? 'life' : 'projects'; }
+
+/** @param {string} view */
+export function isSingleProjectView(view) {
+  if (view === 'all' || view === 'unassigned' || view === 'unlinked') return false;
+  return boardFor(view) === 'projects';
+}
+
+/** @param {unknown} value @returns {string|null} */
+export function safeProjectLink(value) {
+  if (typeof value !== 'string') return null;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'http:' || url.protocol === 'https:' ? url.href : null;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * @param {Card} card

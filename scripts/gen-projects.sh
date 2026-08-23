@@ -8,7 +8,12 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CODE_DIR="${KODER_CODE_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
+if [[ -n "${KODER_CODE_DIR:-}" ]]; then
+  CODE_DIR="$KODER_CODE_DIR"
+else
+  COMMON_DIR="${KODER_GIT_COMMON_DIR:-$(git -C "$SCRIPT_DIR/.." rev-parse --path-format=absolute --git-common-dir)}"
+  CODE_DIR="$(cd "$(dirname "$COMMON_DIR")/.." && pwd)"
+fi
 OUT_FILE="${KODER_PROJECTS_FILE:-$SCRIPT_DIR/../js/projects.json}"
 
 node - "$CODE_DIR" "$OUT_FILE" <<'NODE'
@@ -18,7 +23,7 @@ const path = require('node:path');
 const [codeDir, outFile] = process.argv.slice(2);
 const colors = ['#eef1fe', '#d1fae5', '#fef3c7', '#fee2e2', '#e0f2fe', '#f3e8ff', '#ffe4e6', '#ccfbf1', '#fef9c3', '#ede9fe', '#fce7f3', '#dcfce7'];
 const texts = ['#3b4bb8', '#047857', '#b45309', '#b91c1c', '#0369a1', '#7e22ce', '#be123c', '#0f766e', '#a16207', '#6d28d9', '#be185d', '#15803d'];
-const skip = new Set(['node_modules', 'koder-phase1']);
+const skip = new Set(['node_modules', 'koder-phase1', 'koder-wt']);
 
 function paletteIndex(name) {
   return [...name].reduce((sum, char) => sum + char.codePointAt(0), 0) % colors.length;
