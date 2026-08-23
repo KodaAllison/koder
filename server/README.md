@@ -127,6 +127,10 @@ Only these repositories are trusted:
 - `KodaAllison/holitrackr`
 - `KodaAllison/portfolio-website`
 
+The pull request head repository must equal its allowlisted base repository.
+PRs from forks or outsider-owned branches are recorded as ignored deliveries
+and cannot mutate tickets.
+
 The PR title or body must contain exactly one resolvable visible ticket ref,
 such as `KODER-8CDA`. A ref that matches multiple cards, or text that names
 multiple cards, is refused with `409` rather than guessed. Accepted events do
@@ -149,6 +153,10 @@ revision and snapshot transaction. Every authenticated delivery ID is retained
 without expiry, including ignored and unchanged outcomes. The delivery write
 is atomic with the checked board revision (and with the board write for a real
 transition), so any later redelivery is permanently unable to mutate state.
+Each real webhook transition also increments the card's server-controlled
+`prRev` marker. Browser conflict merges preserve the server card and column
+until the local cache has observed that same marker; normal local-wins edits
+resume afterward.
 
 Configure the same webhook in each trusted repository under **Settings →
 Webhooks**:

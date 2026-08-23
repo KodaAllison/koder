@@ -18,6 +18,7 @@ type Card = {
   created: number;
   project: string | null;
   pr?: string;
+  prRev?: number;
 };
 
 type Doc = {
@@ -106,7 +107,20 @@ async function postWebhook(
     delivery?: string | null;
   } = {},
 ): Promise<Response> {
-  const body = JSON.stringify(payload);
+  const normalized = structuredClone(payload) as Record<string, unknown>;
+  const repository = normalized?.repository as
+    | Record<string, unknown>
+    | undefined;
+  const pullRequest = normalized?.pull_request as
+    | Record<string, unknown>
+    | undefined;
+  if (
+    typeof repository?.full_name === "string" && pullRequest &&
+    !("head" in pullRequest)
+  ) {
+    pullRequest.head = { repo: { full_name: repository.full_name } };
+  }
+  const body = JSON.stringify(normalized);
   const headers = new Headers({
     "Content-Type": "application/json",
     "X-GitHub-Event": options.event ?? "pull_request",
@@ -404,6 +418,41 @@ Deno.test({
         },
       );
 
+      await t.step(
+        "fork pull requests cannot mutate and their delivery is deduplicated",
+        async () => {
+          const before = await seedBoard(baseUrl, { doing: [card()] });
+          const delivery = freshDelivery();
+          const payload = {
+            action: "opened",
+            repository: { full_name: "KodaAllison/koder" },
+            pull_request: {
+              number: 22,
+              title: "KODER-1A2B outsider branch",
+              body: null,
+              merged: false,
+              head: { repo: { full_name: "outsider/koder" } },
+            },
+          };
+          const first = await postWebhook(baseUrl, payload, { delivery });
+          assert.equal(first.status, 202);
+          assert.equal((await getState(baseUrl)).rev, before.rev);
+
+          const replay = await postWebhook(baseUrl, {
+            ...payload,
+            pull_request: {
+              ...payload.pull_request,
+              head: { repo: { full_name: "KodaAllison/koder" } },
+            },
+          }, { delivery });
+          assert.equal(
+            (await replay.json() as { redelivered?: boolean }).redelivered,
+            true,
+          );
+          assert.deepEqual((await getState(baseUrl)).board, before.board);
+        },
+      );
+
       await t.step("untrusted events and actions are ignored", async () => {
         const before = await seedBoard(baseUrl, { todo: [card()] });
         const payload = {
@@ -636,6 +685,7 @@ Deno.test({
         assert.equal(state.board.projects.review.length, 0);
         assert.equal(state.board.projects.done[0].id, "t_ticket_1a2b");
         assert.equal(state.board.projects.done[0].pr, "KodaAllison/koder#16");
+        assert.equal(state.board.projects.done[0].prRev, 1);
       });
 
       await t.step(
@@ -855,6 +905,7 @@ Deno.test({
           const current = await getState(baseUrl);
           assert.equal(current.rev, mergedBody.rev);
           assert.equal(current.board.projects.done[0].id, "t_ticket_1a2b");
+          assert.equal(current.board.projects.done[0].prRev, 2);
           assert.deepEqual(
             await getState(baseUrl, `/state?rev=${mergedBody.rev}`),
             current,

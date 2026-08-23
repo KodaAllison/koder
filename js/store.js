@@ -15,6 +15,7 @@
  * @property {number} created           epoch ms
  * @property {string|null} [project]    projects board only; absent on life cards
  * @property {string} [pr]              GitHub owner/repo#number observed from webhook sync
+ * @property {number} [prRev]           server-owned monotonic webhook transition marker
  *
  * @typedef {Record<string, Card[]>} ColumnMap   column id → cards
  *
@@ -331,7 +332,10 @@ export function mergeBoards(local, server, knownIds) {
       cards.forEach(card => {
         const current = localCards.get(card.id);
         if (current) {
-          if (card.pr && current.card.pr !== card.pr) {
+          const unseenWebhookState =
+            (card.pr && current.card.pr !== card.pr) ||
+            (Number.isInteger(card.prRev) && current.card.prRev !== card.prRev);
+          if (unseenWebhookState) {
             local[current.boardId][current.colId] =
               local[current.boardId][current.colId].filter(c => c.id !== card.id);
             if (!local[boardId][colId]) local[boardId][colId] = [];

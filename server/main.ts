@@ -139,6 +139,7 @@ type Card = {
   created: number;
   project: string | null;
   pr?: string;
+  prRev?: number;
 };
 type Board = {
   projects: Record<string, Card[]>;
@@ -487,8 +488,9 @@ Deno.serve({ port: PORT }, async (req: Request) => {
     const payload = decoded as Record<string, unknown>;
     const repository = payload.repository as Record<string, unknown> | null;
     const pullRequest = payload.pull_request as Record<string, unknown> | null;
-    const repo = typeof repository?.full_name === "string"
-      ? GITHUB_REPOS.get(repository.full_name.toLowerCase())
+    const baseRepoName = typeof repository?.full_name === "string" ? repository.full_name : null;
+    const repo = baseRepoName
+      ? GITHUB_REPOS.get(baseRepoName.toLowerCase())
       : undefined;
     if (!repo) {
       return await recordGithubNoop(deliveryId, { ignored: "untrusted repository" }, 202);
@@ -503,6 +505,18 @@ Deno.serve({ port: PORT }, async (req: Request) => {
       (pullRequest.body !== null && typeof pullRequest.body !== "string")
     ) {
       return await recordGithubNoop(deliveryId, { error: "invalid pull_request payload" }, 400);
+    }
+    const head = pullRequest.head as Record<string, unknown> | null;
+    const headRepo = head?.repo as Record<string, unknown> | null;
+    if (typeof headRepo?.full_name !== "string") {
+      return await recordGithubNoop(deliveryId, { error: "invalid pull_request head repository" }, 400);
+    }
+    if (!baseRepoName || headRepo.full_name.toLowerCase() !== baseRepoName.toLowerCase()) {
+      return await recordGithubNoop(
+        deliveryId,
+        { ignored: "pull request head repository does not match base repository" },
+        202,
+      );
     }
     let target: "review" | "done" = "review";
     if (action === "closed") {
@@ -569,6 +583,7 @@ Deno.serve({ port: PORT }, async (req: Request) => {
         return json({ updated: false, ref: resolved.ref, column: from, pr, rev: cur.rev });
       }
       card.pr = pr;
+      card.prRev = (Number.isInteger(card.prRev) && Number(card.prRev) >= 0 ? Number(card.prRev) : 0) + 1;
       if (from !== target) {
         fromCards.splice(cardIndex, 1);
         (cur.board.projects[target] ??= []).push(card);
