@@ -22,7 +22,9 @@ function load() {
 /** @type {import('./store.js').BoardState} */
 export let state = load();
 
-/** Replace the whole state (used when adopting a fresher server board). */
+/** Replace the whole state (used when adopting a fresher server board).
+ * @param {import('./store.js').BoardState} s
+ */
 export function setState(s) { state = s; }
 
 export let activeTab = localStorage.getItem(STORE_KEY + ':tab') || 'all';

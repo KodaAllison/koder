@@ -97,10 +97,12 @@ export function syncStatus(msg) { hooks.onStatus(msg); }
 
 export function markDirty() { SYNC.dirty = true; localStorage.setItem(STORE_KEY + ':dirty', '1'); }
 
-/* Record a sync point: the rev plus the item ids the server knows about —
+/** Record a sync point: the rev plus the item ids the server knows about —
  * cards on both boards and lifeMeta items (focus/dates/stickies), which merge
  * the same way. The id set is how a 409-merge tells "added remotely" (unknown
- * id → keep) from "deleted locally" (known id → the local deletion wins). */
+ * id → keep) from "deleted locally" (known id → the local deletion wins).
+ * @param {number} rev
+ */
 function adoptRev(rev) {
   SYNC.rev = rev;
   SYNC.dirty = false;
@@ -182,7 +184,9 @@ export async function pushState() {
   finally { SYNC.pushing = false; }
 }
 
-/* Merge a fresher server doc into dirty local state (see store.mergeBoards). */
+/** Merge a fresher server doc into dirty local state (see store.mergeBoards).
+ * @param {{ board?: unknown, rev: number }} doc
+ */
 function mergeRemote(doc) {
   const server = normalize(doc.board || {});
   mergeBoards(state, server, knownIds());

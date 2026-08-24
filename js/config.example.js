@@ -5,7 +5,7 @@
  * NOTE: anything in config.local.js ships to the browser, so this token is
  * only as secret as the origin serving it. Fine for a personal board;
  * rotate it (Deno Deploy env settings) if it ever leaks. */
-window.KODER_API = {
+(/** @type {Window & typeof globalThis & { KODER_API: { base: string, token: string } }} */ (window)).KODER_API = {
   base: 'https://your-app.deno.dev',
   token: 'change-me',
 };
