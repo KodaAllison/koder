@@ -4,7 +4,7 @@
  * Everything re-renders from `state` on each change — simple and correct at
  * this scale; inline editors that must keep focus (sticky notes) opt out. */
 
-import { BOARDS, colsFor, boardFor, cardMatchesView, sortByPriority, openCards, DONE_COLUMN } from './store.js';
+import { BOARDS, colsFor, boardFor, cardMatchesView, isSingleProjectView, safeProjectLink, sortByPriority, openCards, DONE_COLUMN } from './store.js';
 import { ticketRef } from './ref.js';
 import { state, activeTab, setActiveTab, PROJECTS, projectIds, projectById, save } from './state.js';
 import { renderSidebar } from './sidebar.js';
@@ -85,6 +85,43 @@ function renderTabs() {
     active: t.id === activeTab, name: t.name, count: t.count, id: t.id,
     onclick: () => { setActiveTab(t.id); render(); },
   }));
+}
+
+function renderProjectBar() {
+  document.getElementById('projectBar')?.remove();
+  if (!isSingleProjectView(activeTab)) return;
+  const project = projectById(activeTab);
+  if (!project) return;
+
+  const board = document.getElementById('board');
+  if (!board) return;
+  const bar = document.createElement('div');
+  bar.id = 'projectBar';
+  bar.className = 'project-bar';
+
+  const name = document.createElement('span');
+  name.className = 'chip project project-bar-name';
+  name.textContent = project.name;
+  name.style.background = project.color;
+  name.style.color = project.text;
+  bar.appendChild(name);
+
+  [
+    { label: 'Repo', href: project.repo },
+    { label: 'Live', href: project.url },
+  ].forEach(link => {
+    const href = safeProjectLink(link.href);
+    if (!href) return;
+    const anchor = document.createElement('a');
+    anchor.className = 'project-link';
+    anchor.href = href;
+    anchor.target = '_blank';
+    anchor.rel = 'noopener noreferrer';
+    anchor.textContent = `${link.label} ↗`;
+    bar.appendChild(anchor);
+  });
+
+  board.parentElement?.insertBefore(bar, board);
 }
 
 function renderBoard() {
@@ -412,7 +449,7 @@ export function render() {
     ids.has(activeTab);
   if (!valid) setActiveTab('all');
   document.body.style.setProperty('--accent', accentForTab(activeTab));
-  renderTopTabs(); renderTabs(); renderBoard(); renderSidebar();
+  renderTopTabs(); renderTabs(); renderProjectBar(); renderBoard(); renderSidebar();
 }
 
 /* Register as the implementation behind render.js, so modal/sidebar/sync can
