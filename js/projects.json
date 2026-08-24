@@ -1,7 +1,7 @@
 {
   "generated": "2026-07-07T17:10:41+0100",
   "projects": [
-    { "id": "crook-community", "name": "crook-community", "color": "#eef1fe", "text": "#3b4bb8", "repo": "https://github.com/KodaAllison/crook-community" },
+    { "id": "crook-community", "name": "crook-community", "color": "#eef1fe", "text": "#3b4bb8", "repo": "https://github.com/KodaAllison/crook-community", "url": "https://cc-centre.org/" },
     { "id": "holitrackr", "name": "holitrackr", "color": "#ccfbf1", "text": "#0f766e", "repo": "https://github.com/KodaAllison/holitrackr" },
     { "id": "koder", "name": "koder", "color": "#f3e8ff", "text": "#7e22ce", "repo": "https://github.com/KodaAllison/koder" },
     { "id": "portfolio-new", "name": "portfolio-new", "color": "#ede9fe", "text": "#6d28d9" },
