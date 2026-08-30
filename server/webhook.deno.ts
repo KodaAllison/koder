@@ -1006,6 +1006,7 @@ Deno.test({
             ref: string;
             column: string;
             rev: number;
+            board: Doc["board"];
           };
           assert.equal(result.card.id, "t_ticket_1a2b");
           assert.equal(result.ref, "KODER-1A2B");
@@ -1014,6 +1015,7 @@ Deno.test({
 
           const after = await getState(baseUrl);
           assert.equal(after.rev, result.rev);
+          assert.deepEqual(result.board, after.board);
           assert.deepEqual(after.board.projects.doing, []);
           assert.equal(after.board.projects.review[0].id, "t_keep_beef");
           assert.equal(after.board.projects.review[0].pr, "KodaAllison/koder#20");

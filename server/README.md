@@ -342,10 +342,12 @@ Hard-deletes one projects-board ticket by raw id or visible ref. This does not
 mean “done”: completed work should be moved to `done`; deletion is only for a
 ticket that should no longer exist. The server resolves refs with the same
 missing/ambiguous behavior as `PATCH`, removes only that card in an atomic
-read-modify-write, and returns `{ card, ref, column, rev }`. The new head and
-its snapshot omit the ticket, while the preceding retained snapshot can still
-be inspected or restored. Retrying after a successful delete returns 404 and
-does not create another revision. That 404 is deliberate rather than treating
+read-modify-write, and returns `{ card, ref, column, rev, board }`. `board` is
+the exact post-delete canonical board committed and snapshotted at `rev`, so a
+client can reconcile concurrent local edits without a second read. The new
+head and its snapshot omit the ticket, while the preceding retained snapshot
+can still be inspected or restored. Retrying after a successful delete returns
+404 and does not create another revision. That 404 is deliberate rather than treating
 every missing ticket as success: it keeps a typo or arbitrary unknown id
 observable. A caller that lost the first response can reconcile with
 `GET /state`; the deletion itself is already committed and snapshotted.

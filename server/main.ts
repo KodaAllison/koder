@@ -43,7 +43,7 @@
  *                         any subset of { title, note, priority, project, column }
  *                         → edits the ticket in place; `column` moves it
  *   DELETE /tickets/:id → hard-delete an abandoned/superseded ticket
- *                         → { card, ref, column, rev }
+ *                         → { card, ref, column, rev, board }
  *   POST  /archive      → { cards } → lifts finished cards off the board
  *   GET   /archive      → everything archived so far, newest first
  *
@@ -873,7 +873,9 @@ Deno.serve({ port: PORT }, async (req: Request) => {
         board: cur.board,
       };
       const res = await commitDoc(entry, doc);
-      if (res.ok) return json({ card, ref: ticketRef(card), column, rev: doc.rev });
+      if (res.ok) {
+        return json({ card, ref: ticketRef(card), column, rev: doc.rev, board: doc.board });
+      }
     }
     return json({ error: "write contention, retry" }, 503);
   }

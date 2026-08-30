@@ -18,7 +18,7 @@
  * this module never imports the render layer. */
 
 import { normalize, allCardIds, lifeMetaIds, mergeBoards, boardHasContent,
-         boardSize, removeProjectTicket, deleteRefreshOutcome,
+         boardSize, removeProjectTicket, reconcileDeletedTicket,
          BOARD_SIZE_LIMIT, BOARD_SIZE_WARN } from './store.js';
 import { STORE_KEY, state, setState, writeCache, onSave } from './state.js';
 
@@ -57,7 +57,6 @@ export async function connectSync(token) {
 export const SYNC = {
   rev: parseInt(localStorage.getItem(STORE_KEY + ':rev') || '0', 10),
   dirty: localStorage.getItem(STORE_KEY + ':dirty') === '1',
-  refresh: localStorage.getItem(STORE_KEY + ':refresh') === '1',
   pushing: false,
   pushTimer: /** @type {any} */ (null),
   pullTimer: /** @type {any} */ (null),
@@ -113,10 +112,8 @@ export function markDirty() {
 function adoptRev(rev) {
   SYNC.rev = rev;
   SYNC.dirty = false;
-  SYNC.refresh = false;
   localStorage.setItem(STORE_KEY + ':rev', String(rev));
   localStorage.removeItem(STORE_KEY + ':dirty');
-  localStorage.removeItem(STORE_KEY + ':refresh');
   localStorage.setItem(STORE_KEY + ':syncedIds',
     JSON.stringify([...allCardIds(state), ...lifeMetaIds(state)]));
 }
@@ -207,16 +204,10 @@ function recordRev(rev) {
   localStorage.setItem(STORE_KEY + ':rev', String(rev));
 }
 
-/** @param {boolean} pending */
-function recordRefreshPending(pending) {
-  SYNC.refresh = pending;
-  if (pending) localStorage.setItem(STORE_KEY + ':refresh', '1');
-  else localStorage.removeItem(STORE_KEY + ':refresh');
-}
-
 /** Hard-delete one projects-board ticket without sending a whole-board PUT.
- * The successful DELETE response is authoritative for removal and revision.
- * A canonical GET is adopted only if no local mutation happened meanwhile.
+ * The successful response carries the exact committed board and revision, so
+ * no follow-up GET can race local edits. A concurrent local mutation merges
+ * that canonical board before advancing the PUT base revision.
  * @param {string} id @returns {Promise<boolean>}
  */
 export async function deleteTicket(id) {
@@ -233,68 +224,37 @@ export async function deleteTicket(id) {
   }
 
   const result = await removed.json().catch(() => null);
-  if (!result || typeof result.rev !== 'number') {
+  if (
+    !result || typeof result.rev !== 'number' || !result.board ||
+    typeof result.board !== 'object'
+  ) {
     removeProjectTicket(state, id);
     writeCache();
-    recordRefreshPending(true);
-    hooks.onStatus('Ticket deleted, but its revision was missing — reload to refresh');
-    schedulePull();
+    // Keep the OLD base revision. A dirty retry must 409 and merge; a clean
+    // board pulls. Either path reconciles safely without trusting a malformed
+    // success response or putting stale state at the new server revision.
+    if (SYNC.dirty) schedulePush(0);
+    else schedulePull(0);
+    hooks.onStatus('Ticket deleted; response incomplete, reconciling');
     return true;
   }
-  removeProjectTicket(state, id);
-  writeCache();
-  const pending = deleteRefreshOutcome(
-    result.rev,
-    mutationAtDelete,
-    localMutationVersion,
-    null,
-  );
-  recordRev(pending.rev);
-  recordRefreshPending(pending.refreshPending);
 
-  if (localMutationVersion !== mutationAtDelete) {
-    recordRefreshPending(false);
+  const canonical = normalize(result.board);
+  if (localMutationVersion === mutationAtDelete) {
+    setState(canonical);
+    writeCache();
+    adoptRev(result.rev);
+    statusOk();
+  } else {
+    reconcileDeletedTicket(state, canonical, id, knownIds());
+    // Cache the merged board before advancing its base revision: a crash in
+    // between leaves the older base and therefore forces a safe 409 merge.
+    writeCache();
+    recordRev(result.rev);
     schedulePush(0);
     hooks.onStatus('Ticket deleted; syncing newer local edits');
-    return true;
   }
-
-  try {
-    const current = await apiRequest('GET', '/state');
-    if (!current.ok) {
-      hooks.onStatus(`Ticket deleted; canonical refresh pending (HTTP ${current.status})`);
-      schedulePull();
-      return true;
-    }
-    const doc = await current.json();
-    if (!doc || typeof doc.rev !== 'number') {
-      hooks.onStatus('Ticket deleted; canonical refresh pending');
-      schedulePull();
-      return true;
-    }
-    const outcome = deleteRefreshOutcome(
-      result.rev,
-      mutationAtDelete,
-      localMutationVersion,
-      doc,
-    );
-    recordRev(outcome.rev);
-    recordRefreshPending(outcome.refreshPending);
-    if (outcome.adopt) {
-      setState(normalize(doc.board || {}));
-      writeCache();
-      adoptRev(outcome.rev);
-      statusOk();
-    } else {
-      schedulePush(0);
-      hooks.onStatus('Ticket deleted; syncing newer local edits');
-    }
-    return true;
-  } catch (e) {
-    hooks.onStatus('Ticket deleted; canonical refresh pending');
-    schedulePull();
-    return true;
-  }
+  return true;
 }
 
 /** Merge a fresher server doc into dirty local state (see store.mergeBoards).
@@ -332,7 +292,7 @@ export async function pullState() {
       }
       return;
     }
-    if (doc.rev <= SYNC.rev && !SYNC.refresh) return; // nothing new
+    if (doc.rev <= SYNC.rev) return; // nothing new
     // A device that used the app before sync was configured has content but
     // has never synced (rev 0, not dirty). Adopting the server board here
     // would silently erase data that never reached the server — push instead;
@@ -383,7 +343,7 @@ export async function initSync(h) {
   }, 30000);
   window.addEventListener('online', () => {
     if (SYNC.dirty) schedulePush(0);
-    else if (SYNC.refresh) schedulePull(0);
+    else schedulePull(0);
   });
 
   // Last-chance flush if the tab closes inside the push debounce window.

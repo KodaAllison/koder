@@ -293,22 +293,18 @@ export function removeProjectTicket(s, id) {
   return false;
 }
 
-/** Decide whether a post-DELETE GET is safe to adopt. A failed refresh keeps
- * the authoritative DELETE revision but records that the canonical board is
- * still needed. A mutation counter change means local edits win and the GET
- * must be discarded rather than clearing their dirty flag.
- * @param {number} deleteRev
- * @param {number} mutationAtDelete
- * @param {number} mutationNow
- * @param {{rev: number}|null} refreshed
- * @returns {{rev: number, adopt: boolean, refreshPending: boolean}}
+/** Reconcile the exact post-DELETE server board into newer local edits.
+ * Removing the target first ensures it cannot be resurrected by local-wins
+ * merge behavior; normal merge semantics then retain remote additions and
+ * authoritative webhook metadata alongside the local edits.
+ * @param {BoardState} local
+ * @param {BoardState} canonical
+ * @param {string} deletedId
+ * @param {Set<string>} knownIds
  */
-export function deleteRefreshOutcome(deleteRev, mutationAtDelete, mutationNow, refreshed) {
-  if (!refreshed) return { rev: deleteRev, adopt: false, refreshPending: true };
-  if (mutationNow !== mutationAtDelete) {
-    return { rev: deleteRev, adopt: false, refreshPending: false };
-  }
-  return { rev: refreshed.rev, adopt: true, refreshPending: false };
+export function reconcileDeletedTicket(local, canonical, deletedId, knownIds) {
+  removeProjectTicket(local, deletedId);
+  mergeBoards(local, canonical, knownIds);
 }
 
 /* The lifeMeta arrays that sync merges item-by-item. `notes` is excluded: it's

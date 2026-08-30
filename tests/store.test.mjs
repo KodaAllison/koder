@@ -9,7 +9,7 @@ import {
   normalize, migrateLifeColumns, migrateLifeToDashboard, sortByPriority,
   allCardIds, lifeMetaIds, mergeBoards, boardHasContent, uid,
   openCards, doneCards, removeDoneCards, boardSize,
-  removeProjectTicket, deleteRefreshOutcome,
+  removeProjectTicket, reconcileDeletedTicket,
   DONE_COLUMN, BOARD_SIZE_LIMIT, BOARD_SIZE_WARN,
 } from '../js/store.js';
 import {
@@ -381,22 +381,21 @@ test('removeProjectTicket applies a successful server deletion to local state', 
   assert.equal(removeProjectTicket(s, 'missing'), false);
 });
 
-test('deleteRefreshOutcome keeps the DELETE revision when canonical refresh fails', () => {
-  assert.deepEqual(
-    deleteRefreshOutcome(12, 4, 4, null),
-    { rev: 12, adopt: false, refreshPending: true },
-  );
-});
+test('reconcileDeletedTicket keeps concurrent local edits and canonical remote additions', () => {
+  const local = normalize({ projects: { doing: [
+    card('deleted'),
+    card('edited', { title: 'new local title' }),
+  ] } });
+  const canonical = normalize({ projects: {
+    doing: [card('edited', { title: 'old server title' })],
+    todo: [card('remote')],
+  } });
 
-test('deleteRefreshOutcome refuses a canonical board after a concurrent local edit', () => {
-  assert.deepEqual(
-    deleteRefreshOutcome(12, 4, 5, { rev: 13 }),
-    { rev: 12, adopt: false, refreshPending: false },
-  );
-  assert.deepEqual(
-    deleteRefreshOutcome(12, 4, 4, { rev: 13 }),
-    { rev: 13, adopt: true, refreshPending: false },
-  );
+  reconcileDeletedTicket(local, canonical, 'deleted', new Set(['deleted', 'edited']));
+
+  assert.equal(allCardIds(local).has('deleted'), false);
+  assert.equal(local.projects.doing[0].title, 'new local title');
+  assert.deepEqual(local.projects.todo.map(c => c.id), ['remote']);
 });
 
 test('uid produces unique-ish ids', () => {
