@@ -20,7 +20,7 @@
  * every branch that touches a shell file would conflict on this one line. See
  * "Deploying" in README.md.
  */
-const CACHE_NAME = 'kanban-shell-4a8cf0604cca';
+const CACHE_NAME = 'kanban-shell-22bba51100eb';
 
 /* The "app shell": the minimal static files needed to render the UI.
  * We cache these at install time so the app boots with zero network.
