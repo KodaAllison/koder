@@ -23,3 +23,8 @@ test('every js/*.js module is listed in sw.js SHELL_ASSETS', () => {
     assert.match(sw, new RegExp(`\\./js/${mod}\\b`), `sw.js SHELL_ASSETS is missing ./js/${mod}`);
   }
 });
+
+test('PR status API bypasses all service worker caches', () => {
+  const sw = readFileSync(path.join(root, 'sw.js'), 'utf8');
+  assert.match(sw, /url\.pathname === '\/pr-status'/);
+});

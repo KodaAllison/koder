@@ -75,22 +75,21 @@ import { timingSafeEqual } from "node:crypto";
  * so the JSDoc types there are advisory here. */
 import { ticketRef } from "../js/ref.js";
 import { nextWebhookRevision } from "./workflow.ts";
+import { createGithubResolver, GITHUB_REPOS, parsePullRef } from "./github.ts";
 
 const KV_PATH = Deno.env.get("KODER_KV_PATH") || undefined;
 const kv = await Deno.openKv(KV_PATH);
 const TOKEN = Deno.env.get("KODER_TOKEN") ?? "";
 const WEBHOOK_SECRET = Deno.env.get("KODER_WEBHOOK_SECRET") ?? "";
+const GITHUB_TOKEN = Deno.env.get("GITHUB_TOKEN") ?? "";
 const PORT = Number(Deno.env.get("PORT") ?? "8000");
 const KEY = ["board"];
 const GITHUB_DELIVERY_KEY = ["github-delivery"];
 const GITHUB_BODY_MAX = 256 * 1024;
 
-const GITHUB_REPOS = new Set([
-  "KodaAllison/koder",
-  "KodaAllison/crook-community",
-  "KodaAllison/holitrackr",
-  "KodaAllison/portfolio-website",
-]);
+const githubResolver = createGithubResolver(GITHUB_TOKEN, {
+  apiBase: Deno.env.get("GITHUB_API_URL") ?? undefined,
+});
 
 // How many past revisions to keep as restore points. Snapshots live under
 // ["board", rev]; a prefix list on KEY returns exactly these (the current
@@ -468,7 +467,7 @@ async function recordGithubNoop(
  * request (the PWA's files) and skips the token gate. */
 function isApiPath(p: string): boolean {
   return p === "/state" || p === "/state/restore" || p === "/revisions" ||
-    p === "/archive" || p === "/tickets" || p.startsWith("/tickets/");
+    p === "/archive" || p === "/pr-status" || p === "/tickets" || p.startsWith("/tickets/");
 }
 
 Deno.serve({ port: PORT }, async (req: Request) => {
@@ -649,6 +648,19 @@ Deno.serve({ port: PORT }, async (req: Request) => {
 
   if (req.headers.get("Authorization") !== `Bearer ${TOKEN}`) {
     return json({ error: "unauthorized" }, 401);
+  }
+
+  /* Fetched, never stored: only PR refs already attached to canonical project
+   * cards are resolved. There is deliberately no caller-supplied repo/number. */
+  if (url.pathname === "/pr-status") {
+    if (req.method !== "GET") return json({ error: "method not allowed" }, 405);
+    const entry = await kv.get<Doc>(KEY);
+    const refs = Object.values((entry.value ?? emptyDoc()).board.projects ?? {})
+      .flatMap((cards) => cards ?? []).map((card) => card.pr);
+    const validCount = refs.filter((ref) => parsePullRef(ref) !== null).length;
+    if (validCount === 0) return json({});
+    if (!GITHUB_TOKEN) return json({ error: "PR status temporarily unavailable" }, 503);
+    return json(await githubResolver.resolve(refs));
   }
 
   /* ---- GET /state (optionally ?rev=N for a kept snapshot — a specific past

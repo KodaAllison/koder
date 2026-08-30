@@ -18,6 +18,7 @@ import { loadProjects } from './state.js';
 import { initSync } from './sync.js';
 import { render } from './board.js';
 import { editorBusy } from './modal.js';
+import { refreshPrStatuses } from './pr-status.js';
 
 /* Sync-error badge: HTTP failures (413 board-too-large, 401 bad token, …)
  * would otherwise leave the board silently diverging from the server. */
@@ -34,5 +35,10 @@ async function init() {
   await loadProjects();
   render();                       // instant first paint from the cache
   await initSync({ render, editorBusy, onStatus: showSyncStatus });
+  await refreshPrStatuses(render);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') refreshPrStatuses(render);
+  });
+  window.addEventListener('koder:synced', () => refreshPrStatuses(render));
 }
 init();

@@ -38,6 +38,8 @@ const SHELL_ASSETS = [
   './js/archive.js',
   './js/state.js',
   './js/sync.js',
+  './js/pr-status.js',
+  './js/pr-status-view.js',
   './js/render.js',
   './js/board.js',
   './js/sidebar.js',
@@ -99,6 +101,7 @@ self.addEventListener('fetch', (event) => {
    * browser does a normal network fetch. Offline, that fetch rejects and sync.js
    * already falls back to the localStorage cache. */
   if (url.pathname === '/state' || url.pathname === '/state/restore' ||
+      url.pathname === '/pr-status' ||
       url.pathname === '/revisions' || url.pathname === '/tickets' ||
       url.pathname.startsWith('/tickets/')) {
     return;
