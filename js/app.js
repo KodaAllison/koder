@@ -39,6 +39,9 @@ async function init() {
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') refreshPrStatuses(render);
   });
-  window.addEventListener('koder:synced', () => refreshPrStatuses(render));
+  window.addEventListener('koder:synced', () => refreshPrStatuses(render, true));
+  setInterval(() => {
+    if (document.visibilityState === 'visible') refreshPrStatuses(render);
+  }, 60_000);
 }
 init();

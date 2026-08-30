@@ -1,6 +1,6 @@
 // @ts-check
 import { apiEnabled, apiRequest } from './sync.js';
-import { parseStatusResponse } from './pr-status-view.js';
+import { statusesFromHttp } from './pr-status-view.js';
 export { chipDescriptors } from './pr-status-view.js';
 /** @typedef {{state:'open'|'closed'|'merged',ci:'passing'|'failing'|'pending'|'unknown',mergeable:'mergeable'|'conflicting'|'unknown'}} PullStatus */
 /** @type {Record<string, PullStatus>} */ let statuses = {};
@@ -15,8 +15,7 @@ export function refreshPrStatuses(onChange, force = false) {
   if (!force && Date.now() - lastFetch < 15_000) return Promise.resolve();
   lastFetch = Date.now();
   inFlight = apiRequest('GET', '/pr-status').then(async response => {
-    if (!response.ok) return;
-    statuses = parseStatusResponse(await response.json());
+    statuses = statusesFromHttp(response.ok, response.ok ? await response.json() : null);
     onChange();
   }).catch(() => {}).finally(() => { inFlight = null; });
   return inFlight;

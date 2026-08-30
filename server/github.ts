@@ -41,14 +41,16 @@ function ciState(checks: unknown, combined: unknown): PullStatus["ci"] {
   const statuses = Array.isArray((combined as { statuses?: unknown[] })?.statuses)
     ? (combined as { statuses: Array<{ state?: unknown }> }).statuses
     : [];
+  const combinedState = (combined as { state?: unknown } | null)?.state;
   const failing = runs.some((r) => r.status === "completed" &&
-    ["failure", "cancelled", "timed_out", "action_required", "startup_failure"].includes(String(r.conclusion))) ||
-    statuses.some((s) => ["failure", "error"].includes(String(s.state)));
+    ["failure", "cancelled", "timed_out", "action_required", "startup_failure", "stale"].includes(String(r.conclusion))) ||
+    statuses.some((s) => ["failure", "error"].includes(String(s.state))) ||
+    ["failure", "error"].includes(String(combinedState));
   if (failing) return "failing";
-  const pending = runs.some((r) => r.status !== "completed") || statuses.some((s) => s.state === "pending");
+  const pending = runs.some((r) => r.status !== "completed") || statuses.some((s) => s.state === "pending") || combinedState === "pending";
   if (pending) return "pending";
   const passing = runs.some((r) => r.status === "completed" && ["success", "neutral", "skipped"].includes(String(r.conclusion))) ||
-    statuses.some((s) => s.state === "success");
+    statuses.some((s) => s.state === "success") || combinedState === "success";
   return passing ? "passing" : "unknown";
 }
 
@@ -64,6 +66,7 @@ export function createGithubResolver(token: string, options: Options = {}) {
   const inflight = new Map<string, Promise<PullStatus | null>>();
   let active = 0;
   const waiting: Array<() => void> = [];
+  let blockedUntil = 0;
 
   async function slot() {
     if (active < (options.concurrency ?? 4)) { active++; return; }
@@ -77,12 +80,16 @@ export function createGithubResolver(token: string, options: Options = {}) {
     while (cache.size > max) cache.delete(cache.keys().next().value!);
   }
   async function github(path: string) {
+    if (now() < blockedUntil) throw new Error("GitHub rate limited");
     await slot();
+    if (now() < blockedUntil) {
+      release();
+      throw new Error("GitHub rate limited");
+    }
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      for (let attempt = 0; attempt < 2; attempt++) {
-        const response = await fetcher(`${apiBase}${path}`, {
+      const response = await fetcher(`${apiBase}${path}`, {
           signal: controller.signal,
           headers: {
             Accept: "application/vnd.github+json",
@@ -90,18 +97,15 @@ export function createGithubResolver(token: string, options: Options = {}) {
             "X-GitHub-Api-Version": "2022-11-28",
             "User-Agent": "koder-pr-status",
           },
-        });
-        if (response.ok) return await response.json();
+      });
+      if (response.ok) return await response.json();
+      if (response.status === 403 || response.status === 429) {
         const retry = response.headers.get("Retry-After");
         const reset = response.headers.get("X-RateLimit-Reset");
-        const wait = retry ? Number(retry) * 1000 : reset ? Number(reset) * 1000 - now() : 0;
-        if (attempt === 0 && (response.status === 403 || response.status === 429) && wait > 0 && wait <= 2_000) {
-          await new Promise((resolve) => setTimeout(resolve, wait));
-          continue;
-        }
-        throw new Error(`GitHub request failed (${response.status})`);
+        const until = retry ? now() + Number(retry) * 1000 : reset ? Number(reset) * 1000 : 0;
+        if (Number.isFinite(until) && until > blockedUntil) blockedUntil = until;
       }
-      throw new Error("GitHub request failed");
+      throw new Error(`GitHub request failed (${response.status})`);
     } finally { clearTimeout(timer); release(); }
   }
   async function load(ref: PullRef): Promise<PullStatus> {

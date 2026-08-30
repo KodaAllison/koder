@@ -13,6 +13,11 @@ export function parseStatusResponse(value) {
   }
   return parsed;
 }
+/** HTTP failures are authoritative absence; transport failures never call this. */
+/** @param {boolean} ok @param {unknown} value @returns {Record<string, PullStatus>} */
+export function statusesFromHttp(ok, value) {
+  return ok ? parseStatusResponse(value) : {};
+}
 /** @param {PullStatus|undefined} status @returns {Array<{label:string,kind:string}>} */
 export function chipDescriptors(status) {
   if (!status) return [];

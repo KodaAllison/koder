@@ -87,9 +87,7 @@ const KEY = ["board"];
 const GITHUB_DELIVERY_KEY = ["github-delivery"];
 const GITHUB_BODY_MAX = 256 * 1024;
 
-const githubResolver = createGithubResolver(GITHUB_TOKEN, {
-  apiBase: Deno.env.get("GITHUB_API_URL") ?? undefined,
-});
+const githubResolver = createGithubResolver(GITHUB_TOKEN);
 
 // How many past revisions to keep as restore points. Snapshots live under
 // ["board", rev]; a prefix list on KEY returns exactly these (the current

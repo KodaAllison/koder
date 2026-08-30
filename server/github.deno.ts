@@ -33,17 +33,53 @@ Deno.test("resolver dedupes inflight, honors fresh TTL, and serves stale on erro
   assertEquals((await resolver.resolve(["KodaAllison/koder#1"]))["KodaAllison/koder#1"].state, "open");
 });
 
-Deno.test("resolver evicts least-recently-used entries and retries short rate limits", async () => {
+Deno.test("resolver evicts least-recently-used entries", async () => {
+  let calls = 0;
+  const fake = async () => (calls++, Response.json({ state: "open", merged: false, mergeable: true, head: { sha: null } }));
+  const resolver = createGithubResolver("token", { fetch: fake as typeof fetch, maxEntries: 1 });
+  await resolver.resolve(["KodaAllison/koder#1"]);
+  assertEquals(calls, 1);
+  await resolver.resolve(["KodaAllison/koder#2"]);
+  await resolver.resolve(["KodaAllison/koder#1"]);
+  assertEquals(calls, 3);
+});
+
+Deno.test("resolver blocks subsequent requests until a long rate limit expires", async () => {
+  let clock = 1_000; let calls = 0;
+  const fake = async () => (calls++, new Response("limited", { status: 429, headers: { "Retry-After": "120" } }));
+  const resolver = createGithubResolver("token", { fetch: fake as typeof fetch, now: () => clock });
+  assertEquals(await resolver.resolve(["KodaAllison/koder#1"]), {});
+  assertEquals(await resolver.resolve(["KodaAllison/koder#2"]), {});
+  assertEquals(calls, 1);
+  clock += 120_001;
+  await resolver.resolve(["KodaAllison/koder#2"]);
+  assertEquals(calls, 2);
+});
+
+Deno.test("queued requests observe a rate limit before reaching GitHub", async () => {
   let calls = 0;
   const fake = async () => {
     calls++;
-    if (calls === 1) return new Response("limited", { status: 429, headers: { "Retry-After": "0.001" } });
-    return Response.json({ state: "open", merged: false, mergeable: true, head: { sha: null } });
+    return new Response("limited", { status: 403, headers: { "X-RateLimit-Reset": "200" } });
   };
-  const resolver = createGithubResolver("token", { fetch: fake as typeof fetch, maxEntries: 1 });
-  await resolver.resolve(["KodaAllison/koder#1"]);
-  assertEquals(calls, 2);
-  await resolver.resolve(["KodaAllison/koder#2"]);
-  await resolver.resolve(["KodaAllison/koder#1"]);
-  assertEquals(calls, 4);
+  const resolver = createGithubResolver("token", { fetch: fake as typeof fetch, now: () => 100_000, concurrency: 1 });
+  assertEquals(await resolver.resolve(["KodaAllison/koder#5", "KodaAllison/koder#6"]), {});
+  assertEquals(calls, 1);
+});
+
+Deno.test("stale checks fail and combined top-level status participates in precedence", async () => {
+  const responses = [
+    Response.json({ state: "open", merged: false, mergeable: true, head: { sha: "a".repeat(40) } }),
+    Response.json({ check_runs: [{ status: "completed", conclusion: "stale" }, { status: "in_progress" }] }),
+    Response.json({ state: "success", statuses: [] }),
+  ];
+  const resolver = createGithubResolver("token", { fetch: (async () => responses.shift()!) as typeof fetch });
+  assertEquals((await resolver.resolve(["KodaAllison/koder#3"]))["KodaAllison/koder#3"].ci, "failing");
+
+  const topLevel = [
+    Response.json({ state: "open", merged: false, mergeable: true, head: { sha: "b".repeat(40) } }),
+    Response.json({ check_runs: [] }), Response.json({ state: "pending", statuses: [] }),
+  ];
+  const pending = createGithubResolver("token", { fetch: (async () => topLevel.shift()!) as typeof fetch });
+  assertEquals((await pending.resolve(["KodaAllison/koder#4"]))["KodaAllison/koder#4"].ci, "pending");
 });
