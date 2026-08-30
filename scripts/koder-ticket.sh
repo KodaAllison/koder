@@ -7,10 +7,12 @@
 #   ./scripts/koder-ticket.sh list [options]                list tickets
 #   ./scripts/koder-ticket.sh move <ref|id> <column>        move a ticket
 #   ./scripts/koder-ticket.sh edit <ref|id> [options]       edit a ticket
+#   ./scripts/koder-ticket.sh delete <ref|id>               hard-delete a ticket
+#   ./scripts/koder-ticket.sh close <ref|id>                alias for delete
 #
 # Tickets have two names. The REF (KODER-8CDA) is what the board prints on
 # every card — quote that one to Koda. The ID (t_msa8scco_632be) is the
-# internal key. move and edit take either.
+# internal key. move, edit, delete, and close take either.
 #
 # Options (add / list / edit):
 #   --title "<text>"     ticket title (edit only — add takes it positionally)
@@ -27,6 +29,7 @@
 #   ./scripts/koder-ticket.sh list --project holitrackr --column todo
 #   ./scripts/koder-ticket.sh move HOLIT-X1Y2 doing
 #   ./scripts/koder-ticket.sh edit t_abc123_x1y2z --priority high --note "repro in #42"
+#   ./scripts/koder-ticket.sh delete KODER-X1Y2
 #
 # Config: KODER_API (server base URL) and KODER_TOKEN, from the environment
 # or from scripts/.koder.env (gitignored).
@@ -169,6 +172,14 @@ case "$cmd" in
     [ -n "$FIELDS" ] || { echo "edit: pass at least one of --title/--note/--priority/--project/--column" >&2; exit 1; }
     OUT="$(request PATCH "/tickets/$ID" "{${FIELDS#,}}")"
     echo "updated $(describe "$OUT" "$ID")"
+    ;;
+
+  delete|close)
+    ACTION="$cmd"
+    ID="${2:?usage: koder-ticket.sh $ACTION <ref|id>}"
+    [ $# -eq 2 ] || { echo "usage: koder-ticket.sh $ACTION <ref|id>" >&2; exit 1; }
+    OUT="$(request DELETE "/tickets/$ID")"
+    echo "deleted $(describe "$OUT" "$ID")"
     ;;
 
   -h|--help)

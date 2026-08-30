@@ -40,7 +40,7 @@ Every ticket has two names:
 **Always quote the ref when you tell Koda about a ticket.** An id means
 nothing to someone looking at the board; the ref is right there on the card.
 Use the id in notes that cross-reference other tickets, where precision beats
-readability. `move` and `edit` accept either.
+readability. `move`, `edit`, `delete`, and `close` accept either.
 
 **List tickets** (one per line: `ref | id | column | priority | [project] title`):
 
@@ -87,6 +87,18 @@ A ref is a truncation of the id, so it can in principle match two tickets. The
 server refuses that with a 409 listing both ids rather than patching one at
 random — pass the id when it happens.
 
+**Delete abandoned or superseded work** (by ref or id):
+
+```bash
+bash "$KT" delete KODER-8CDA
+```
+
+This is a hard delete, not a completion transition. Use it only when the work
+is no longer wanted; move shipped work to `done`. `close` is an exact alias for
+`delete` and has the same hard-delete semantics. A retained board snapshot can
+still restore the ticket for a limited time. Missing tickets return an error,
+so a retry cannot silently create another revision.
+
 ## The "pick up work" workflow
 
 When Koda says "look at the tickets on X and work on one":
@@ -127,6 +139,8 @@ curl -sS -X PATCH -H "Authorization: Bearer $KODER_TOKEN" -H 'Content-Type: appl
   -d '{"column":"doing"}' "${KODER_API%/}/tickets/KODER-8CDA"
 curl -sS -X PATCH -H "Authorization: Bearer $KODER_TOKEN" -H 'Content-Type: application/json' \
   -d '{"title":"Better title","priority":"high"}' "${KODER_API%/}/tickets/<id>"
+curl -sS -X DELETE -H "Authorization: Bearer $KODER_TOKEN" \
+  "${KODER_API%/}/tickets/KODER-8CDA"
 ```
 
 Full API docs live in the koder repo: `server/README.md`.

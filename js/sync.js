@@ -151,8 +151,8 @@ export function schedulePush(delay = 800) {
 }
 
 export async function pushState() {
-  if (!apiEnabled()) return;
-  if (SYNC.pushing) { schedulePush(); return; }
+  if (!apiEnabled()) return false;
+  if (SYNC.pushing) { schedulePush(); return false; }
   SYNC.pushing = true;
   try {
     let res = await apiRequest('PUT', '/state', { baseRev: SYNC.rev, board: state });
@@ -175,6 +175,7 @@ export async function pushState() {
       const j = await res.json();
       adoptRev(j.rev);
       statusOk();
+      return true;
     } else {
       // Non-409 failure (or a 409 that survived the merge+retry): the board
       // stays dirty and would otherwise diverge silently — surface it.
@@ -182,6 +183,33 @@ export async function pushState() {
     }
   } catch (e) { /* offline — stay dirty; retried on online/focus/next boot */ }
   finally { SYNC.pushing = false; }
+  return false;
+}
+
+/** Hard-delete one projects-board ticket without sending a whole-board PUT.
+ * Pending local edits are pushed first; after DELETE, a canonical GET folds
+ * in anything another writer landed during either request.
+ * @param {string} id @returns {Promise<boolean>}
+ */
+export async function deleteTicket(id) {
+  if (!apiEnabled()) return false;
+  if (SYNC.dirty && !await pushState()) return false;
+  try {
+    const removed = await apiRequest('DELETE', `/tickets/${encodeURIComponent(id)}`);
+    if (!removed.ok) { reportHttpError(removed); return false; }
+    const current = await apiRequest('GET', '/state');
+    if (!current.ok) { reportHttpError(current); return false; }
+    const doc = await current.json();
+    if (!doc || typeof doc.rev !== 'number') return false;
+    setState(normalize(doc.board || {}));
+    writeCache();
+    adoptRev(doc.rev);
+    statusOk();
+    return true;
+  } catch (e) {
+    hooks.onStatus('Delete failed — still offline?');
+    return false;
+  }
 }
 
 /** Merge a fresher server doc into dirty local state (see store.mergeBoards).

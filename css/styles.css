@@ -301,6 +301,8 @@ body.dragging-active { cursor: grabbing; }
 .btn-ghost { background: none; color: var(--muted); }
 .btn-danger { background: none; color: var(--high-t); margin-right: auto; }
 .btn-danger:hover { background: var(--high); }
+.btn-danger:disabled { opacity: .55; cursor: wait; }
+.delete-error { margin: -4px 0 0; font-size: 13px; color: var(--high-t); }
 .btn-install { background: var(--accent-soft); color: var(--accent); }
 
 .sync-error { margin: -4px 0 0; font-size: 13px; color: var(--high-t); }

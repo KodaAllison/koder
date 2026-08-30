@@ -304,7 +304,7 @@ key `mergeBoards` uses to decide what a sync conflict keeps, so it never
 changes.
 
 Because the ref truncates the id, two tickets in one project could in
-principle derive the same one. `PATCH` refuses that case rather than guessing
+principle derive the same one. `PATCH` and `DELETE` refuse that case rather than guessing
 (see below); `GET` just reports whatever each ticket derives.
 
 ### PATCH /tickets/:id — move and/or edit a ticket
@@ -336,6 +336,22 @@ curl -sS -X PATCH -H "Authorization: Bearer $KODER_TOKEN" -H 'Content-Type: appl
   -d '{"title":"Fix login bug on mobile","priority":"high"}' "$KODER_API/tickets/t_abc123_x1y2z"
 ```
 
+### DELETE /tickets/:id — remove abandoned or superseded work
+
+Hard-deletes one projects-board ticket by raw id or visible ref. This does not
+mean “done”: completed work should be moved to `done`; deletion is only for a
+ticket that should no longer exist. The server resolves refs with the same
+missing/ambiguous behavior as `PATCH`, removes only that card in an atomic
+read-modify-write, and returns `{ card, ref, column, rev }`. The new head and
+its snapshot omit the ticket, while the preceding retained snapshot can still
+be inspected or restored. Retrying after a successful delete returns 404 and
+does not create another revision.
+
+```bash
+curl -sS -X DELETE -H "Authorization: Bearer $KODER_TOKEN" \
+  "$KODER_API/tickets/KODER-1B2C"
+```
+
 Or use the wrapper for all of the above:
 
 ```bash
@@ -343,6 +359,9 @@ Or use the wrapper for all of the above:
 ./scripts/koder-ticket.sh list --project holitrackr --column todo
 ./scripts/koder-ticket.sh move t_abc123_x1y2z doing
 ./scripts/koder-ticket.sh edit t_abc123_x1y2z --title "Fix login bug on mobile" --priority high
+./scripts/koder-ticket.sh delete KODER-1B2C
+# `close` is an exact hard-delete alias; it does not move a ticket to done.
+./scripts/koder-ticket.sh close KODER-1B2C
 ```
 
 ## Security note
