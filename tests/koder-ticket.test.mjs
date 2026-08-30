@@ -1,3 +1,5 @@
+// @ts-check
+
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
@@ -5,9 +7,16 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
-const bash = 'C:\\Program Files\\Git\\bin\\bash.exe';
+const bash = process.platform === 'win32'
+  ? path.join(process.env.ProgramFiles || 'C:/Program Files', 'Git', 'bin', 'bash.exe')
+  : 'bash';
 const script = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'scripts', 'koder-ticket.sh');
 
+/**
+ * @param {string[]} args
+ * @param {Record<string, string|undefined>} env
+ * @returns {Promise<{code: number|null, stdout: string, stderr: string}>}
+ */
 function run(args, env) {
   return new Promise((resolve, reject) => {
     const child = spawn(bash, [script.replaceAll('\\', '/'), ...args], { env: { ...process.env, ...env } });
@@ -21,6 +30,7 @@ function run(args, env) {
 }
 
 test('delete and close parse as explicit DELETE commands', async t => {
+  /** @type {{method: string|undefined, url: string|undefined, auth: string|undefined}[]} */
   const requests = [];
   const server = http.createServer((req, res) => {
     requests.push({ method: req.method, url: req.url, auth: req.headers.authorization });
@@ -34,7 +44,9 @@ test('delete and close parse as explicit DELETE commands', async t => {
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   t.after(() => server.close());
-  const { port } = server.address();
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+  const { port } = address;
   const env = { KODER_API: `http://127.0.0.1:${port}`, KODER_TOKEN: 'test-token' };
 
   const deleted = await run(['delete', 'KODER-1A2B'], env);

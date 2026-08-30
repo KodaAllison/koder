@@ -207,18 +207,19 @@ btnDelete.onclick = async () => {
 
   btnDelete.disabled = true;
   deleteError.hidden = true;
-  if (boardId === 'projects' && apiEnabled() && !await deleteTicket(card.id)) {
+  const syncedDelete = boardId === 'projects' && apiEnabled();
+  if (syncedDelete && !await deleteTicket(card.id)) {
     btnDelete.disabled = false;
-    deleteError.textContent = 'Could not delete the ticket from sync. Nothing was removed locally.';
+    deleteError.textContent = 'The ticket was not deleted. Check sync and try again.';
     deleteError.hidden = false;
     return;
   }
 
-  const src = state[boardId][colId];
-  const i = src.findIndex(x => x.id === card.id);
-  if (i !== -1) src.splice(i, 1);
-  // A synced project delete has already adopted and cached the canonical
-  // board. Life cards and unsynced project boards still use local save().
-  if (boardId !== 'projects' || !apiEnabled()) save();
+  if (!syncedDelete) {
+    const src = state[boardId][colId];
+    const i = src.findIndex(x => x.id === card.id);
+    if (i !== -1) src.splice(i, 1);
+    save();
+  }
   closeModal(); render();
 };

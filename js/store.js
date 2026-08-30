@@ -280,6 +280,37 @@ export function allCardIds(s) {
   return ids;
 }
 
+/** Apply an already-committed server DELETE to the local projects board.
+ * @param {BoardState} s @param {string} id @returns {boolean}
+ */
+export function removeProjectTicket(s, id) {
+  for (const cards of Object.values(s.projects)) {
+    const index = cards.findIndex(card => card.id === id);
+    if (index === -1) continue;
+    cards.splice(index, 1);
+    return true;
+  }
+  return false;
+}
+
+/** Decide whether a post-DELETE GET is safe to adopt. A failed refresh keeps
+ * the authoritative DELETE revision but records that the canonical board is
+ * still needed. A mutation counter change means local edits win and the GET
+ * must be discarded rather than clearing their dirty flag.
+ * @param {number} deleteRev
+ * @param {number} mutationAtDelete
+ * @param {number} mutationNow
+ * @param {{rev: number}|null} refreshed
+ * @returns {{rev: number, adopt: boolean, refreshPending: boolean}}
+ */
+export function deleteRefreshOutcome(deleteRev, mutationAtDelete, mutationNow, refreshed) {
+  if (!refreshed) return { rev: deleteRev, adopt: false, refreshPending: true };
+  if (mutationNow !== mutationAtDelete) {
+    return { rev: deleteRev, adopt: false, refreshPending: false };
+  }
+  return { rev: refreshed.rev, adopt: true, refreshPending: false };
+}
+
 /* The lifeMeta arrays that sync merges item-by-item. `notes` is excluded: it's
  * the legacy scratchpad string (no id), migrated into stickies by normalize. */
 export const LIFE_META_LISTS = /** @type {const} */ (['focus', 'dates', 'stickies']);

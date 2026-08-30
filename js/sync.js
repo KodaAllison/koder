@@ -18,7 +18,8 @@
  * this module never imports the render layer. */
 
 import { normalize, allCardIds, lifeMetaIds, mergeBoards, boardHasContent,
-         boardSize, BOARD_SIZE_LIMIT, BOARD_SIZE_WARN } from './store.js';
+         boardSize, removeProjectTicket, deleteRefreshOutcome,
+         BOARD_SIZE_LIMIT, BOARD_SIZE_WARN } from './store.js';
 import { STORE_KEY, state, setState, writeCache, onSave } from './state.js';
 
 /* ---- API config resolution ----
@@ -56,10 +57,12 @@ export async function connectSync(token) {
 export const SYNC = {
   rev: parseInt(localStorage.getItem(STORE_KEY + ':rev') || '0', 10),
   dirty: localStorage.getItem(STORE_KEY + ':dirty') === '1',
+  refresh: localStorage.getItem(STORE_KEY + ':refresh') === '1',
   pushing: false,
   pushTimer: /** @type {any} */ (null),
   pullTimer: /** @type {any} */ (null),
 };
+let localMutationVersion = 0;
 
 /* Injected by initSync(). Defaults are no-ops so nothing here explodes if a
  * sync function is somehow reached before init. */
@@ -95,7 +98,11 @@ export function apiRequest(method, path, body) {
 /** @param {string|null} msg */
 export function syncStatus(msg) { hooks.onStatus(msg); }
 
-export function markDirty() { SYNC.dirty = true; localStorage.setItem(STORE_KEY + ':dirty', '1'); }
+export function markDirty() {
+  localMutationVersion++;
+  SYNC.dirty = true;
+  localStorage.setItem(STORE_KEY + ':dirty', '1');
+}
 
 /** Record a sync point: the rev plus the item ids the server knows about —
  * cards on both boards and lifeMeta items (focus/dates/stickies), which merge
@@ -106,8 +113,10 @@ export function markDirty() { SYNC.dirty = true; localStorage.setItem(STORE_KEY 
 function adoptRev(rev) {
   SYNC.rev = rev;
   SYNC.dirty = false;
+  SYNC.refresh = false;
   localStorage.setItem(STORE_KEY + ':rev', String(rev));
   localStorage.removeItem(STORE_KEY + ':dirty');
+  localStorage.removeItem(STORE_KEY + ':refresh');
   localStorage.setItem(STORE_KEY + ':syncedIds',
     JSON.stringify([...allCardIds(state), ...lifeMetaIds(state)]));
 }
@@ -154,6 +163,7 @@ export async function pushState() {
   if (!apiEnabled()) return false;
   if (SYNC.pushing) { schedulePush(); return false; }
   SYNC.pushing = true;
+  const mutationAtPush = localMutationVersion;
   try {
     let res = await apiRequest('PUT', '/state', { baseRev: SYNC.rev, board: state });
     // A 409 means someone wrote since our baseRev — usually agent tickets via
@@ -173,6 +183,11 @@ export async function pushState() {
     }
     if (res.ok) {
       const j = await res.json();
+      if (localMutationVersion !== mutationAtPush) {
+        recordRev(j.rev);
+        schedulePush(0);
+        return false;
+      }
       adoptRev(j.rev);
       statusOk();
       return true;
@@ -186,29 +201,99 @@ export async function pushState() {
   return false;
 }
 
+/** @param {number} rev */
+function recordRev(rev) {
+  SYNC.rev = rev;
+  localStorage.setItem(STORE_KEY + ':rev', String(rev));
+}
+
+/** @param {boolean} pending */
+function recordRefreshPending(pending) {
+  SYNC.refresh = pending;
+  if (pending) localStorage.setItem(STORE_KEY + ':refresh', '1');
+  else localStorage.removeItem(STORE_KEY + ':refresh');
+}
+
 /** Hard-delete one projects-board ticket without sending a whole-board PUT.
- * Pending local edits are pushed first; after DELETE, a canonical GET folds
- * in anything another writer landed during either request.
+ * The successful DELETE response is authoritative for removal and revision.
+ * A canonical GET is adopted only if no local mutation happened meanwhile.
  * @param {string} id @returns {Promise<boolean>}
  */
 export async function deleteTicket(id) {
   if (!apiEnabled()) return false;
   if (SYNC.dirty && !await pushState()) return false;
+  const mutationAtDelete = localMutationVersion;
+  let removed;
   try {
-    const removed = await apiRequest('DELETE', `/tickets/${encodeURIComponent(id)}`);
+    removed = await apiRequest('DELETE', `/tickets/${encodeURIComponent(id)}`);
     if (!removed.ok) { reportHttpError(removed); return false; }
-    const current = await apiRequest('GET', '/state');
-    if (!current.ok) { reportHttpError(current); return false; }
-    const doc = await current.json();
-    if (!doc || typeof doc.rev !== 'number') return false;
-    setState(normalize(doc.board || {}));
-    writeCache();
-    adoptRev(doc.rev);
-    statusOk();
-    return true;
   } catch (e) {
     hooks.onStatus('Delete failed — still offline?');
     return false;
+  }
+
+  const result = await removed.json().catch(() => null);
+  if (!result || typeof result.rev !== 'number') {
+    removeProjectTicket(state, id);
+    writeCache();
+    recordRefreshPending(true);
+    hooks.onStatus('Ticket deleted, but its revision was missing — reload to refresh');
+    schedulePull();
+    return true;
+  }
+  removeProjectTicket(state, id);
+  writeCache();
+  const pending = deleteRefreshOutcome(
+    result.rev,
+    mutationAtDelete,
+    localMutationVersion,
+    null,
+  );
+  recordRev(pending.rev);
+  recordRefreshPending(pending.refreshPending);
+
+  if (localMutationVersion !== mutationAtDelete) {
+    recordRefreshPending(false);
+    schedulePush(0);
+    hooks.onStatus('Ticket deleted; syncing newer local edits');
+    return true;
+  }
+
+  try {
+    const current = await apiRequest('GET', '/state');
+    if (!current.ok) {
+      hooks.onStatus(`Ticket deleted; canonical refresh pending (HTTP ${current.status})`);
+      schedulePull();
+      return true;
+    }
+    const doc = await current.json();
+    if (!doc || typeof doc.rev !== 'number') {
+      hooks.onStatus('Ticket deleted; canonical refresh pending');
+      schedulePull();
+      return true;
+    }
+    const outcome = deleteRefreshOutcome(
+      result.rev,
+      mutationAtDelete,
+      localMutationVersion,
+      doc,
+    );
+    recordRev(outcome.rev);
+    recordRefreshPending(outcome.refreshPending);
+    if (outcome.adopt) {
+      setState(normalize(doc.board || {}));
+      writeCache();
+      adoptRev(outcome.rev);
+      statusOk();
+    } else {
+      schedulePush(0);
+      hooks.onStatus('Ticket deleted; syncing newer local edits');
+    }
+    return true;
+  } catch (e) {
+    hooks.onStatus('Ticket deleted; canonical refresh pending');
+    schedulePull();
+    return true;
   }
 }
 
@@ -228,11 +313,16 @@ export async function pullState() {
   if (!apiEnabled()) return;
   if (SYNC.dirty || SYNC.pushing) { schedulePush(0); return; } // our edits go first (409-merge picks up remote adds)
   if (hooks.editorBusy()) return;
+  const mutationAtPull = localMutationVersion;
   try {
     const res = await apiRequest('GET', '/state');
     if (!res.ok) { reportHttpError(res); return; }
     const doc = await res.json();
     if (!doc || typeof doc.rev !== 'number') return;
+    if (SYNC.dirty || localMutationVersion !== mutationAtPull) {
+      schedulePush(0);
+      return;
+    }
     statusOk();
     if (doc.rev === 0) {
       // Empty server + non-empty local board → first run: seed the server.
@@ -242,7 +332,7 @@ export async function pullState() {
       }
       return;
     }
-    if (doc.rev <= SYNC.rev) return; // nothing new
+    if (doc.rev <= SYNC.rev && !SYNC.refresh) return; // nothing new
     // A device that used the app before sync was configured has content but
     // has never synced (rev 0, not dirty). Adopting the server board here
     // would silently erase data that never reached the server — push instead;
@@ -291,7 +381,10 @@ export async function initSync(h) {
   setInterval(() => {
     if (document.visibilityState === 'visible') pullState();
   }, 30000);
-  window.addEventListener('online', () => { if (SYNC.dirty) schedulePush(0); });
+  window.addEventListener('online', () => {
+    if (SYNC.dirty) schedulePush(0);
+    else if (SYNC.refresh) schedulePull(0);
+  });
 
   // Last-chance flush if the tab closes inside the push debounce window.
   // keepalive lets the request outlive the page; the persisted dirty flag
