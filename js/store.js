@@ -14,6 +14,8 @@
  * @property {Priority} priority
  * @property {number} created           epoch ms
  * @property {string|null} [project]    projects board only; absent on life cards
+ * @property {string} [pr]              GitHub owner/repo#number observed from webhook sync
+ * @property {number} [prRev]           server-owned monotonic webhook transition marker
  *
  * @typedef {Record<string, Card[]>} ColumnMap   column id → cards
  *
@@ -306,22 +308,47 @@ export function boardHasContent(s) {
  * remotely" (unknown id → keep) from "deleted locally" (known id → the local
  * deletion wins). Covers cards on both boards AND the lifeMeta arrays
  * (focus/dates/stickies), so a 409 push can't clobber sidebar items another
- * device added. Mutates `local`; returns how many items were adopted. */
+ * device added. A webhook PR that local has not observed yet is authoritative
+ * for both card data and column; after local carries the same `pr`, ordinary
+ * local-wins behavior resumes. Mutates `local`; returns how many items were
+ * adopted or refreshed from the server. */
 /**
  * @param {BoardState} local      already-normalized local state (mutated)
  * @param {BoardState} server     already-normalized server board
  * @param {Set<string>} knownIds  item ids recorded at the last sync point
- * @returns {number}              count of remotely-added items merged in
+ * @returns {number}              count of remotely-added/refreshed items merged in
  */
 export function mergeBoards(local, server, knownIds) {
-  const localIds = allCardIds(local);
+  /** @type {Map<string, {boardId: keyof typeof BOARDS, colId: string, card: Card}>} */
+  const localCards = new Map();
+  BOARD_IDS.forEach(boardId => {
+    Object.entries(local[boardId]).forEach(([colId, cards]) => {
+      cards.forEach(card => localCards.set(card.id, { boardId, colId, card }));
+    });
+  });
   let added = 0;
   BOARD_IDS.forEach(boardId => {
     Object.entries(server[boardId]).forEach(([colId, cards]) => {
       cards.forEach(card => {
-        if (localIds.has(card.id) || knownIds.has(card.id)) return;
+        const current = localCards.get(card.id);
+        if (current) {
+          const unseenWebhookState =
+            (card.pr && current.card.pr !== card.pr) ||
+            current.card.prRev !== card.prRev;
+          if (unseenWebhookState) {
+            local[current.boardId][current.colId] =
+              local[current.boardId][current.colId].filter(c => c.id !== card.id);
+            if (!local[boardId][colId]) local[boardId][colId] = [];
+            local[boardId][colId].push(card);
+            localCards.set(card.id, { boardId, colId, card });
+            added++;
+          }
+          return;
+        }
+        if (knownIds.has(card.id)) return;
         if (!local[boardId][colId]) local[boardId][colId] = [];
         local[boardId][colId].push(card);
+        localCards.set(card.id, { boardId, colId, card });
         added++;
       });
     });

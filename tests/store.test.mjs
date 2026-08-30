@@ -183,6 +183,108 @@ test('mergeBoards does not duplicate a card that moved columns locally', () => {
   assert.deepEqual(local.projects.backlog, []);
 });
 
+test('mergeBoards preserves a newly observed server webhook PR and column', () => {
+  const local = normalize({ projects: { doing: [card('a', { title: 'local edit' })] } });
+  const server = normalize({
+    projects: { review: [card('a', { title: 'server title', pr: 'KodaAllison/koder#21' })] },
+  });
+
+  mergeBoards(local, server, new Set(['a']));
+
+  assert.deepEqual(local.projects.doing, []);
+  assert.equal(local.projects.review[0].pr, 'KodaAllison/koder#21');
+  assert.equal(local.projects.review[0].title, 'server title');
+});
+
+test('mergeBoards preserves a changed server webhook PR and column', () => {
+  const local = normalize({
+    projects: { review: [card('a', { pr: 'KodaAllison/koder#20' })] },
+  });
+  const server = normalize({
+    projects: { done: [card('a', { pr: 'KodaAllison/koder#21' })] },
+  });
+
+  mergeBoards(local, server, new Set(['a']));
+
+  assert.deepEqual(local.projects.review, []);
+  assert.equal(local.projects.done[0].pr, 'KodaAllison/koder#21');
+});
+
+test('mergeBoards preserves a same-PR server transition with a newer webhook marker', () => {
+  const local = normalize({
+    projects: { review: [card('a', { pr: 'KodaAllison/koder#21', prRev: 1 })] },
+  });
+  const server = normalize({
+    projects: { done: [card('a', { pr: 'KodaAllison/koder#21', prRev: 2 })] },
+  });
+
+  mergeBoards(local, server, new Set(['a']));
+
+  assert.deepEqual(local.projects.review, []);
+  assert.equal(local.projects.done[0].prRev, 2);
+});
+
+test('mergeBoards treats any authoritative server marker mismatch as server-wins', () => {
+  const local = normalize({
+    projects: { doing: [card('a', { title: 'local', pr: 'KodaAllison/koder#21', prRev: 2 })] },
+  });
+  const server = normalize({
+    projects: { done: [card('a', { title: 'server', pr: 'KodaAllison/koder#21', prRev: 'legacy' })] },
+  });
+
+  mergeBoards(local, server, new Set(['a']));
+  assert.equal(local.projects.doing.length, 0);
+  assert.equal(local.projects.done[0].title, 'server');
+  assert.equal(local.projects.done[0].prRev, 'legacy');
+});
+
+test('mergeBoards treats authoritative marker absence as server-wins', () => {
+  const local = normalize({
+    projects: { doing: [card('a', { pr: 'KodaAllison/koder#999', prRev: 1 })] },
+  });
+  const server = normalize({
+    projects: { todo: [card('a', { title: 'server without workflow metadata' })] },
+  });
+
+  mergeBoards(local, server, new Set(['a']));
+  assert.deepEqual(local.projects.doing, []);
+  assert.equal(local.projects.todo[0].pr, undefined);
+  assert.equal(local.projects.todo[0].prRev, undefined);
+});
+
+test('mergeBoards resumes local wins after observing the same webhook marker', () => {
+  const local = normalize({
+    projects: {
+      doing: [card('a', { title: 'edited locally', pr: 'KodaAllison/koder#21', prRev: 2 })],
+    },
+  });
+  const server = normalize({
+    projects: {
+      done: [card('a', { title: 'stale server title', pr: 'KodaAllison/koder#21', prRev: 2 })],
+    },
+  });
+
+  mergeBoards(local, server, new Set(['a']));
+
+  assert.equal(local.projects.doing[0].title, 'edited locally');
+  assert.deepEqual(local.projects.done, []);
+});
+
+test('mergeBoards resumes local-wins edits after observing the same webhook PR', () => {
+  const local = normalize({
+    projects: { doing: [card('a', { title: 'edited locally', pr: 'KodaAllison/koder#21' })] },
+  });
+  const server = normalize({
+    projects: { review: [card('a', { title: 'stale server title', pr: 'KodaAllison/koder#21' })] },
+  });
+
+  mergeBoards(local, server, new Set(['a']));
+
+  assert.equal(local.projects.doing[0].title, 'edited locally');
+  assert.equal(local.projects.doing[0].pr, 'KodaAllison/koder#21');
+  assert.deepEqual(local.projects.review, []);
+});
+
 test('mergeBoards merges into both boards, creating unknown columns if needed', () => {
   const local = normalize({});
   const server = normalize({});
