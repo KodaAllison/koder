@@ -35,8 +35,9 @@ deno task test
    entrypoint `server/main.ts`. (Don't accept the auto-detected "static site"
    preset — the repo's root `index.html` triggers it, and you'd get a file
    server that 404s `/state`.)
-3. Settings → Environment Variables → add `KODER_TOKEN` (e.g. `openssl rand -hex 24`)
-   and `KODER_WEBHOOK_SECRET` (use a separate value, e.g. `openssl rand -hex 32`).
+3. Settings → Environment Variables → add `KODER_TOKEN` (e.g. `openssl rand -hex 24`),
+   `KODER_WEBHOOK_SECRET` (use a separate value, e.g. `openssl rand -hex 32`),
+   and the server-only `GITHUB_TOKEN` used for live PR status.
    Optionally `KODER_ORIGIN=https://<your-board-origin>` to lock down CORS.
 4. Create a KV database (org sidebar → Databases) and attach it to the app
    (app Settings → Databases), then redeploy — `Deno.openKv()` fails until
@@ -108,6 +109,22 @@ SQLite file; leave it unset for the normal local database and on Deno Deploy.
 The board endpoints below require `Authorization: Bearer $KODER_TOKEN`. The
 GitHub webhook is the sole exception: it does not accept the bearer token and
 authenticates only with GitHub's HMAC signature.
+
+### GET /pr-status — ephemeral PR and CI state
+
+Returns statuses only for strictly valid `card.pr` values already present on
+the canonical projects board. The request has no repo/PR parameters, duplicate
+refs are resolved once, invalid or non-allowlisted refs are ignored, and no
+result is written to KV, board state, localStorage, or the service-worker cache.
+An empty PR set returns `{}` without requiring GitHub credentials.
+
+Set `GITHUB_TOKEN` only in the server deployment environment. For public repos,
+a fine-grained token with read-only **Pull requests** and **Commit statuses**
+access to the four allowlisted repositories is sufficient; include read-only
+**Checks** access where the token settings offer it. The browser never receives
+this token. If statuses are needed and it is absent, the route returns a
+sanitized `503`. Upstream failures degrade individual PR/CI fields and may use
+a recent in-memory result; upstream bodies and credentials are never returned.
 
 ### POST /webhooks/github — move tickets from pull requests
 

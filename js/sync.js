@@ -307,6 +307,7 @@ export async function pullState() {
     adoptRev(doc.rev);
     statusOk();   // re-check: the board we just adopted is the one that matters
     hooks.render();
+    window.dispatchEvent(new Event('koder:synced'));
   } catch (e) { /* offline — keep the local cache */ }
 }
 

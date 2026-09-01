@@ -313,6 +313,45 @@ Deno.test({
     try {
       await waitForServer(baseUrl);
 
+      await t.step("PR status route enforces read auth and stays read-only", async () => {
+        const empty = await seedBoard(baseUrl, {});
+        const unauthorized = await fetch(`${baseUrl}/pr-status`);
+        assert.equal(unauthorized.status, 401);
+        const wrongMethod = await fetch(`${baseUrl}/pr-status`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${TOKEN}` },
+        });
+        assert.equal(wrongMethod.status, 405);
+        const noRefs = await fetch(`${baseUrl}/pr-status`, {
+          headers: { Authorization: `Bearer ${TOKEN}` },
+        });
+        assert.equal(noRefs.status, 200);
+        assert.deepEqual(await noRefs.json(), {});
+        assert.equal((await getState(baseUrl)).rev, empty.rev);
+
+        await seedBoard(baseUrl, { doing: [card()] });
+        const linked = await postWebhook(baseUrl, {
+          action: "opened",
+          repository: { full_name: "KodaAllison/koder" },
+          pull_request: {
+            number: 22,
+            title: "KODER-1A2B status route",
+            body: null,
+            merged: false,
+          },
+        });
+        assert.equal(linked.status, 200);
+        const beforeStatus = await getState(baseUrl);
+        const unavailable = await fetch(`${baseUrl}/pr-status`, {
+          headers: { Authorization: `Bearer ${TOKEN}` },
+        });
+        assert.equal(unavailable.status, 503);
+        assert.deepEqual(await unavailable.json(), { error: "PR status temporarily unavailable" });
+        const afterStatus = await getState(baseUrl);
+        assert.equal(afterStatus.rev, beforeStatus.rev);
+        assert.deepEqual(afterStatus.board, beforeStatus.board);
+      });
+
       await t.step(
         "missing and invalid HMACs are rejected with no bearer fallback",
         async () => {

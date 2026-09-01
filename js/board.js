@@ -11,6 +11,7 @@ import { renderSidebar } from './sidebar.js';
 import { openModal, refButton } from './modal.js';
 import { setRenderImpl } from './render.js';
 import { archiveDone, canArchive } from './archive.js';
+import { chipDescriptors, statusFor } from './pr-status.js';
 
 const PRI_LABEL = { low: 'Low', med: 'Med', high: 'High' };
 
@@ -217,8 +218,15 @@ function renderCard(card, colId, showProject, boardId) {
   /* Built with createElement, not folded into the innerHTML above: the ref
    * derives from card.id, and ids arrive from the sync server like any other
    * field — so it gets the same textContent treatment as title and note. */
-  /** @type {HTMLElement} */ (el.querySelector('.card-meta'))
-    .appendChild(refButton(ticketRef(card, boardId)));
+  const meta = /** @type {HTMLElement} */ (el.querySelector('.card-meta'));
+  meta.appendChild(refButton(ticketRef(card, boardId)));
+  for (const descriptor of chipDescriptors(statusFor(card.pr))) {
+    const chip = document.createElement('span');
+    chip.className = `pr-chip ${descriptor.kind}`;
+    chip.textContent = descriptor.label;
+    chip.setAttribute('aria-label', `Pull request ${descriptor.label}`);
+    meta.appendChild(chip);
+  }
 
   el.addEventListener('pointerdown', e => beginDrag(e, card, colId, el));
   el.addEventListener('click', () => {

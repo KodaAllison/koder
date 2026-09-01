@@ -265,6 +265,11 @@ body.dragging-active { cursor: grabbing; }
   padding: 1px 5px; color: var(--muted); cursor: pointer;
 }
 .card-ref:hover { border-color: var(--border); color: var(--accent); }
+.pr-chip { font-size: 9.5px; font-weight: 650; padding: 1px 6px; border-radius: 8px; white-space: nowrap; }
+.pr-chip.open, .pr-chip.closed { color: var(--muted); border: 1px solid var(--border); }
+.pr-chip.merged { color: #166534; background: #dcfce7; }
+.pr-chip.failing, .pr-chip.conflicting { color: #991b1b; background: #fee2e2; }
+.pr-chip.pending { color: #92400e; background: #fef3c7; }
 /* In the modal it sits under the title, so it needs to not stretch to the
  * flex column's full width the way the form fields do. */
 .modal-ref { align-self: flex-start; margin-top: -6px; }
