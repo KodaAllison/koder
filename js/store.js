@@ -280,6 +280,33 @@ export function allCardIds(s) {
   return ids;
 }
 
+/** Apply an already-committed server DELETE to the local projects board.
+ * @param {BoardState} s @param {string} id @returns {boolean}
+ */
+export function removeProjectTicket(s, id) {
+  for (const cards of Object.values(s.projects)) {
+    const index = cards.findIndex(card => card.id === id);
+    if (index === -1) continue;
+    cards.splice(index, 1);
+    return true;
+  }
+  return false;
+}
+
+/** Reconcile the exact post-DELETE server board into newer local edits.
+ * Removing the target first ensures it cannot be resurrected by local-wins
+ * merge behavior; normal merge semantics then retain remote additions and
+ * authoritative webhook metadata alongside the local edits.
+ * @param {BoardState} local
+ * @param {BoardState} canonical
+ * @param {string} deletedId
+ * @param {Set<string>} knownIds
+ */
+export function reconcileDeletedTicket(local, canonical, deletedId, knownIds) {
+  removeProjectTicket(local, deletedId);
+  mergeBoards(local, canonical, knownIds);
+}
+
 /* The lifeMeta arrays that sync merges item-by-item. `notes` is excluded: it's
  * the legacy scratchpad string (no id), migrated into stickies by normalize. */
 export const LIFE_META_LISTS = /** @type {const} */ (['focus', 'dates', 'stickies']);

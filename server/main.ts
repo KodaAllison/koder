@@ -42,7 +42,8 @@
  *   PATCH /tickets/:id  → :id is either the raw id or the board's ref (KODER-8CDA);
  *                         any subset of { title, note, priority, project, column }
  *                         → edits the ticket in place; `column` moves it
- *                         → { card, ref, column, rev }
+ *   DELETE /tickets/:id → hard-delete an abandoned/superseded ticket
+ *                         → { card, ref, column, rev, board }
  *   POST  /archive      → { cards } → lifts finished cards off the board
  *   GET   /archive      → everything archived so far, newest first
  *
@@ -434,7 +435,7 @@ function isNewerSameRepoPr(current: string, incoming: string): boolean {
 
 const CORS: Record<string, string> = {
   "Access-Control-Allow-Origin": Deno.env.get("KODER_ORIGIN") ?? "*",
-  "Access-Control-Allow-Methods": "GET, PUT, POST, PATCH, OPTIONS",
+  "Access-Control-Allow-Methods": "GET, PUT, POST, PATCH, DELETE, OPTIONS",
   "Access-Control-Allow-Headers": "Authorization, Content-Type",
   "Access-Control-Max-Age": "86400",
 };
@@ -839,6 +840,46 @@ Deno.serve({ port: PORT }, async (req: Request) => {
    * the response is the board's new head after this write, not a revision of
    * the ticket itself — tickets don't have their own version number. */
   const ticketMatch = url.pathname.match(/^\/tickets\/([^/]+)$/);
+  /* ---- DELETE /tickets/:id: permanently remove abandoned work ----
+   * This is deliberately distinct from moving to done: done is completed
+   * work, while deletion is for tickets that should no longer be on the
+   * board. The old board remains recoverable through revision snapshots. */
+  if (ticketMatch && req.method === "DELETE") {
+    const given = ticketMatch[1];
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const entry = await kv.get<Doc>(KEY);
+      const cur = structuredClone(entry.value ?? emptyDoc());
+      // Resolve on every attempt, just like PATCH, so a newly ambiguous ref
+      // can never select an arbitrary ticket after write contention.
+      const resolved = resolveTicketId(cur.board, given);
+      if ("error" in resolved) return json(resolved.error, resolved.status);
+
+      let card: Card | null = null;
+      let column: string | null = null;
+      for (const [col, cards] of Object.entries(cur.board.projects ?? {})) {
+        const index = (cards ?? []).findIndex((candidate) => candidate.id === resolved.id);
+        if (index !== -1) {
+          card = cards.splice(index, 1)[0];
+          column = col;
+          break;
+        }
+      }
+      if (!card || column === null) {
+        return json({ error: `no ticket with id or ref "${given}"` }, 404);
+      }
+      const doc: Doc = {
+        rev: cur.rev + 1,
+        updatedAt: new Date().toISOString(),
+        board: cur.board,
+      };
+      const res = await commitDoc(entry, doc);
+      if (res.ok) {
+        return json({ card, ref: ticketRef(card), column, rev: doc.rev, board: doc.board });
+      }
+    }
+    return json({ error: "write contention, retry" }, 503);
+  }
+
   if (ticketMatch && req.method === "PATCH") {
     // Not decoded: ids are alphanumeric + underscore and refs are A-Z0-9 with
     // one hyphen, so neither is ever percent-encoded — and decodeURIComponent

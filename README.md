@@ -84,7 +84,13 @@ is enough:
 
 ```bash
 ./scripts/koder-ticket.sh "Fix login bug" --project holitrackr --column todo --priority high
+./scripts/koder-ticket.sh delete KODER-8CDA   # abandoned/superseded, not completed
 ```
+
+`delete` hard-deletes by id or visible ref through the revisioned API; `close`
+is the same operation as an explicit alias. Neither means “done” — move shipped
+work to the `done` column instead. Deleted tickets remain recoverable while
+their older board snapshot is retained.
 
 Install the skill so Claude Code sessions in *any* repo can do this when you
 say "add a ticket to my board":

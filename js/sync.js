@@ -18,7 +18,8 @@
  * this module never imports the render layer. */
 
 import { normalize, allCardIds, lifeMetaIds, mergeBoards, boardHasContent,
-         boardSize, BOARD_SIZE_LIMIT, BOARD_SIZE_WARN } from './store.js';
+         boardSize, removeProjectTicket, reconcileDeletedTicket,
+         BOARD_SIZE_LIMIT, BOARD_SIZE_WARN } from './store.js';
 import { STORE_KEY, state, setState, writeCache, onSave } from './state.js';
 
 /* ---- API config resolution ----
@@ -60,6 +61,7 @@ export const SYNC = {
   pushTimer: /** @type {any} */ (null),
   pullTimer: /** @type {any} */ (null),
 };
+let localMutationVersion = 0;
 
 /* Injected by initSync(). Defaults are no-ops so nothing here explodes if a
  * sync function is somehow reached before init. */
@@ -95,7 +97,11 @@ export function apiRequest(method, path, body) {
 /** @param {string|null} msg */
 export function syncStatus(msg) { hooks.onStatus(msg); }
 
-export function markDirty() { SYNC.dirty = true; localStorage.setItem(STORE_KEY + ':dirty', '1'); }
+export function markDirty() {
+  localMutationVersion++;
+  SYNC.dirty = true;
+  localStorage.setItem(STORE_KEY + ':dirty', '1');
+}
 
 /** Record a sync point: the rev plus the item ids the server knows about —
  * cards on both boards and lifeMeta items (focus/dates/stickies), which merge
@@ -151,9 +157,10 @@ export function schedulePush(delay = 800) {
 }
 
 export async function pushState() {
-  if (!apiEnabled()) return;
-  if (SYNC.pushing) { schedulePush(); return; }
+  if (!apiEnabled()) return false;
+  if (SYNC.pushing) { schedulePush(); return false; }
   SYNC.pushing = true;
+  const mutationAtPush = localMutationVersion;
   try {
     let res = await apiRequest('PUT', '/state', { baseRev: SYNC.rev, board: state });
     // A 409 means someone wrote since our baseRev — usually agent tickets via
@@ -173,8 +180,14 @@ export async function pushState() {
     }
     if (res.ok) {
       const j = await res.json();
+      if (localMutationVersion !== mutationAtPush) {
+        recordRev(j.rev);
+        schedulePush(0);
+        return false;
+      }
       adoptRev(j.rev);
       statusOk();
+      return true;
     } else {
       // Non-409 failure (or a 409 that survived the merge+retry): the board
       // stays dirty and would otherwise diverge silently — surface it.
@@ -182,6 +195,66 @@ export async function pushState() {
     }
   } catch (e) { /* offline — stay dirty; retried on online/focus/next boot */ }
   finally { SYNC.pushing = false; }
+  return false;
+}
+
+/** @param {number} rev */
+function recordRev(rev) {
+  SYNC.rev = rev;
+  localStorage.setItem(STORE_KEY + ':rev', String(rev));
+}
+
+/** Hard-delete one projects-board ticket without sending a whole-board PUT.
+ * The successful response carries the exact committed board and revision, so
+ * no follow-up GET can race local edits. A concurrent local mutation merges
+ * that canonical board before advancing the PUT base revision.
+ * @param {string} id @returns {Promise<boolean>}
+ */
+export async function deleteTicket(id) {
+  if (!apiEnabled()) return false;
+  if (SYNC.dirty && !await pushState()) return false;
+  const mutationAtDelete = localMutationVersion;
+  let removed;
+  try {
+    removed = await apiRequest('DELETE', `/tickets/${encodeURIComponent(id)}`);
+    if (!removed.ok) { reportHttpError(removed); return false; }
+  } catch (e) {
+    hooks.onStatus('Delete failed — still offline?');
+    return false;
+  }
+
+  const result = await removed.json().catch(() => null);
+  if (
+    !result || typeof result.rev !== 'number' || !result.board ||
+    typeof result.board !== 'object'
+  ) {
+    removeProjectTicket(state, id);
+    writeCache();
+    // Keep the OLD base revision. A dirty retry must 409 and merge; a clean
+    // board pulls. Either path reconciles safely without trusting a malformed
+    // success response or putting stale state at the new server revision.
+    if (SYNC.dirty) schedulePush(0);
+    else schedulePull(0);
+    hooks.onStatus('Ticket deleted; response incomplete, reconciling');
+    return true;
+  }
+
+  const canonical = normalize(result.board);
+  if (localMutationVersion === mutationAtDelete) {
+    setState(canonical);
+    writeCache();
+    adoptRev(result.rev);
+    statusOk();
+  } else {
+    reconcileDeletedTicket(state, canonical, id, knownIds());
+    // Cache the merged board before advancing its base revision: a crash in
+    // between leaves the older base and therefore forces a safe 409 merge.
+    writeCache();
+    recordRev(result.rev);
+    schedulePush(0);
+    hooks.onStatus('Ticket deleted; syncing newer local edits');
+  }
+  return true;
 }
 
 /** Merge a fresher server doc into dirty local state (see store.mergeBoards).
@@ -200,11 +273,16 @@ export async function pullState() {
   if (!apiEnabled()) return;
   if (SYNC.dirty || SYNC.pushing) { schedulePush(0); return; } // our edits go first (409-merge picks up remote adds)
   if (hooks.editorBusy()) return;
+  const mutationAtPull = localMutationVersion;
   try {
     const res = await apiRequest('GET', '/state');
     if (!res.ok) { reportHttpError(res); return; }
     const doc = await res.json();
     if (!doc || typeof doc.rev !== 'number') return;
+    if (SYNC.dirty || localMutationVersion !== mutationAtPull) {
+      schedulePush(0);
+      return;
+    }
     statusOk();
     if (doc.rev === 0) {
       // Empty server + non-empty local board → first run: seed the server.
@@ -263,7 +341,10 @@ export async function initSync(h) {
   setInterval(() => {
     if (document.visibilityState === 'visible') pullState();
   }, 30000);
-  window.addEventListener('online', () => { if (SYNC.dirty) schedulePush(0); });
+  window.addEventListener('online', () => {
+    if (SYNC.dirty) schedulePush(0);
+    else schedulePull(0);
+  });
 
   // Last-chance flush if the tab closes inside the push debounce window.
   // keepalive lets the request outlive the page; the persisted dirty flag

@@ -7,6 +7,7 @@ import { colsFor, boardFor, uid, NOTE_MAX_CHARS } from './store.js';
 import { ticketRef } from './ref.js';
 import { state, activeTab, PROJECTS, projectIds, save } from './state.js';
 import { render } from './render.js';
+import { apiEnabled, deleteTicket } from './sync.js';
 
 /** @type {{ card: import('./store.js').Card|null, colId: string }|null} */
 let editing = null;
@@ -26,6 +27,7 @@ const fProject = /** @type {HTMLSelectElement} */ (document.getElementById('fPro
 const projectField = /** @type {HTMLElement} */ (document.getElementById('projectField'));
 const btnDelete = /** @type {HTMLButtonElement} */ (document.getElementById('btnDelete'));
 const modalRef = /** @type {HTMLButtonElement} */ (document.getElementById('modalRef'));
+const deleteError = /** @type {HTMLElement} */ (document.getElementById('deleteError'));
 
 /** The ref chip, click-to-copy. Quoting a ref somewhere else is the whole point
  * of having one, and on a phone there is no other way to get the text off a
@@ -134,6 +136,9 @@ export function openModal(card, colId) {
   fPriority.value = card ? card.priority : 'med';
   fCol.value = colId;
   btnDelete.hidden = !card;
+  btnDelete.disabled = false;
+  deleteError.hidden = true;
+  deleteError.textContent = '';
   pristine = formSnapshot();   // after every field is populated, before the user can touch it
   overlay.classList.add('open');
   fTitle.focus();
@@ -193,11 +198,28 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Enter' && overlay.classList.contains('open') && e.target === fTitle) saveModal();
 });
 
-btnDelete.onclick = () => {
+btnDelete.onclick = async () => {
   if (!editing || !editing.card) return;
   const { card, colId } = editing;
-  const src = state[boardFor(activeTab)][colId];
-  const i = src.findIndex(x => x.id === card.id);
-  if (i !== -1) src.splice(i, 1);
-  save(); closeModal(); render();
+  const boardId = boardFor(activeTab);
+  const ref = ticketRef(card, boardId);
+  if (!confirm(`Permanently delete ${ref} “${card.title}”?\n\nUse this only for abandoned or superseded work, not completed work.`)) return;
+
+  btnDelete.disabled = true;
+  deleteError.hidden = true;
+  const syncedDelete = boardId === 'projects' && apiEnabled();
+  if (syncedDelete && !await deleteTicket(card.id)) {
+    btnDelete.disabled = false;
+    deleteError.textContent = 'The ticket was not deleted. Check sync and try again.';
+    deleteError.hidden = false;
+    return;
+  }
+
+  if (!syncedDelete) {
+    const src = state[boardId][colId];
+    const i = src.findIndex(x => x.id === card.id);
+    if (i !== -1) src.splice(i, 1);
+    save();
+  }
+  closeModal(); render();
 };

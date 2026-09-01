@@ -978,6 +978,108 @@ Deno.test({
       );
 
       await t.step(
+        "DELETE removes one resolved ticket and records a recoverable revision",
+        async () => {
+          await seedBoard(baseUrl, {
+            doing: [card(), card("t_keep_beef")],
+          });
+          const workflow = await postWebhook(baseUrl, {
+            action: "opened",
+            repository: { full_name: "KodaAllison/koder" },
+            pull_request: {
+              number: 20,
+              title: "Preserve KODER-BEEF while deleting another ticket",
+              body: null,
+              merged: false,
+            },
+          });
+          assert.equal(workflow.status, 200);
+          const before = await getState(baseUrl);
+          const response = await fetch(`${baseUrl}/tickets/KODER-1A2B`, {
+            method: "DELETE",
+            headers: { Authorization: `Bearer ${TOKEN}` },
+          });
+
+          assert.equal(response.status, 200);
+          const result = await response.json() as {
+            card: Card;
+            ref: string;
+            column: string;
+            rev: number;
+            board: Doc["board"];
+          };
+          assert.equal(result.card.id, "t_ticket_1a2b");
+          assert.equal(result.ref, "KODER-1A2B");
+          assert.equal(result.column, "doing");
+          assert.equal(result.rev, before.rev + 1);
+
+          const after = await getState(baseUrl);
+          assert.equal(after.rev, result.rev);
+          assert.deepEqual(result.board, after.board);
+          assert.deepEqual(after.board.projects.doing, []);
+          assert.equal(after.board.projects.review[0].id, "t_keep_beef");
+          assert.equal(after.board.projects.review[0].pr, "KodaAllison/koder#20");
+          assert.equal(after.board.projects.review[0].prRev, 1);
+          assert.deepEqual(
+            (await getState(baseUrl, `/state?rev=${before.rev}`)).board,
+            before.board,
+          );
+          assert.deepEqual(
+            await getState(baseUrl, `/state?rev=${result.rev}`),
+            after,
+          );
+
+          const retry = await fetch(`${baseUrl}/tickets/t_ticket_1a2b`, {
+            method: "DELETE",
+            headers: { Authorization: `Bearer ${TOKEN}` },
+          });
+          assert.equal(retry.status, 404);
+          assert.equal((await getState(baseUrl)).rev, result.rev);
+
+          const restored = await fetch(`${baseUrl}/state/restore`, {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${TOKEN}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ rev: before.rev }),
+          });
+          assert.equal(restored.status, 200);
+          const restoredState = await getState(baseUrl);
+          assert.equal(restoredState.rev, result.rev + 1);
+          assert.equal(restoredState.board.projects.doing[0].id, "t_ticket_1a2b");
+          assert.equal(restoredState.board.projects.review[0].pr, "KodaAllison/koder#20");
+        },
+      );
+
+      await t.step(
+        "DELETE refuses missing and ambiguous refs without a revision change",
+        async () => {
+          const before = await seedBoard(baseUrl, {
+            todo: [card("t_first_abcd"), card("t_second_abcd")],
+          });
+          const missing = await fetch(`${baseUrl}/tickets/KODER-DEAD`, {
+            method: "DELETE",
+            headers: { Authorization: `Bearer ${TOKEN}` },
+          });
+          const ambiguous = await fetch(`${baseUrl}/tickets/KODER-ABCD`, {
+            method: "DELETE",
+            headers: { Authorization: `Bearer ${TOKEN}` },
+          });
+
+          assert.equal(missing.status, 404);
+          assert.equal(ambiguous.status, 409);
+          assert.deepEqual(
+            (await ambiguous.json() as { ids: string[] }).ids,
+            ["t_first_abcd", "t_second_abcd"],
+          );
+          const after = await getState(baseUrl);
+          assert.equal(after.rev, before.rev);
+          assert.deepEqual(after.board, before.board);
+        },
+      );
+
+      await t.step(
         "redelivery is idempotent and the changed revision is snapshotted",
         async () => {
           await seedBoard(baseUrl, { doing: [card()] });
