@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chipDescriptors, parseStatusResponse, statusesFromHttp } from '../js/pr-status-view.js';
+import { chipDescriptors, parseStatusResponse, prStatusMessage, statusesFromHttp } from '../js/pr-status-view.js';
 
 test('status response parser rejects malformed entries', () => {
   assert.deepEqual(parseStatusResponse(null), {});
@@ -14,6 +14,12 @@ test('HTTP errors clear prior statuses while successful responses are parsed', (
   const prior = { 'KodaAllison/koder#22': { state: 'open', ci: 'pending', mergeable: 'unknown' } };
   assert.deepEqual(statusesFromHttp(false, prior), {});
   assert.deepEqual(statusesFromHttp(true, prior), prior);
+});
+
+test('a missing server GitHub token produces an actionable status message', () => {
+  assert.equal(prStatusMessage(200), null);
+  assert.equal(prStatusMessage(503), 'PR status unavailable — add GITHUB_TOKEN');
+  assert.equal(prStatusMessage(500), 'PR status unavailable (HTTP 500)');
 });
 
 test('chips show state plus exceptional CI and conflicts without passing noise', () => {

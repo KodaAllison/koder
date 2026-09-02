@@ -23,11 +23,26 @@ import { refreshPrStatuses } from './pr-status.js';
 /* Sync-error badge: HTTP failures (413 board-too-large, 401 bad token, …)
  * would otherwise leave the board silently diverging from the server. */
 const syncBadge = /** @type {HTMLElement} */ (document.getElementById('syncBadge'));
-/** @param {string|null} msg */
-function showSyncStatus(msg) {
+let syncMessage = /** @type {string|null} */ (null);
+let prMessage = /** @type {string|null} */ (null);
+function paintStatus() {
+  const msg = syncMessage || prMessage;
   syncBadge.hidden = !msg;
   syncBadge.textContent = msg || '';
 }
+/** @param {string|null} msg */
+function showSyncStatus(msg) {
+  syncMessage = msg;
+  paintStatus();
+}
+/** @param {string|null} msg */
+function showPrStatus(msg) {
+  prMessage = msg;
+  paintStatus();
+}
+
+/** @param {boolean} [force] */
+const refreshPullRequests = (force = false) => refreshPrStatuses(render, force, showPrStatus);
 
 /* Boot: load the project list, paint from the local cache, then sync.
  * (state is loaded from localStorage synchronously on state.js import.) */
@@ -35,13 +50,13 @@ async function init() {
   await loadProjects();
   render();                       // instant first paint from the cache
   await initSync({ render, editorBusy, onStatus: showSyncStatus });
-  await refreshPrStatuses(render);
+  await refreshPullRequests();
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') refreshPrStatuses(render);
+    if (document.visibilityState === 'visible') refreshPullRequests();
   });
-  window.addEventListener('koder:synced', () => refreshPrStatuses(render, true));
+  window.addEventListener('koder:synced', () => refreshPullRequests(true));
   setInterval(() => {
-    if (document.visibilityState === 'visible') refreshPrStatuses(render);
+    if (document.visibilityState === 'visible') refreshPullRequests();
   }, 60_000);
 }
 init();
