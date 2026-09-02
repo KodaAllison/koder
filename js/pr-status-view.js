@@ -18,6 +18,12 @@ export function parseStatusResponse(value) {
 export function statusesFromHttp(ok, value) {
   return ok ? parseStatusResponse(value) : {};
 }
+/** @param {number} status @returns {string|null} */
+export function prStatusMessage(status) {
+  if (status >= 200 && status < 300) return null;
+  if (status === 503) return 'PR status unavailable — add GITHUB_TOKEN';
+  return `PR status unavailable (HTTP ${status})`;
+}
 /** @param {PullStatus|undefined} status @returns {Array<{label:string,kind:string}>} */
 export function chipDescriptors(status) {
   if (!status) return [];
