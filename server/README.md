@@ -71,8 +71,12 @@ KODER-6784). It does nothing unless you enable it.
 - Route: `GET /spike/db?target=deploy|neon[&n=100][&cold=1]`, bearer auth like
   every other API route. `404 {"error":"db spike disabled"}` unless
   `KODER_DB_SPIKE=1`.
-- Env: `KODER_DB_SPIKE=1`; `DATABASE_URL` for `target=deploy` (Deploy injects it
-  when its Postgres is attached); `NEON_DATABASE_URL` for `target=neon`. A
+- Env: `KODER_DB_SPIKE=1`; `DATABASE_URL` for `target=deploy` (Deploy injects
+  `DATABASE_URL`, `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER` and `PGPASSWORD` once
+  a database is provisioned or linked under Databases, with a separate logical
+  database per deployment environment; the docs don't say whether you can
+  override an injected value, but it is an ordinary env var, so you can also set
+  it by hand, which is unverified); `NEON_DATABASE_URL` for `target=neon`. A
   missing URL is a `400 {"error":"<VAR> not set"}`. Remove `KODER_DB_SPIKE` when
   the measurement is done.
 - Each request opens a fresh single connection (so connect time is measured) and

@@ -3,7 +3,7 @@
     "dev": "deno run --watch --unstable-kv --allow-net --allow-env --allow-read main.ts",
     "spike:db": "deno run --allow-net --allow-env --allow-read=../scripts/.koder.env spike/db-client.ts",
     "spike:pglite": "deno run --allow-read --allow-net=127.0.0.1 --allow-env --allow-sys --allow-ffi spike/pglite.probe.ts",
-    "check": "deno check main.ts store.ts kv-store.ts github.ts workflow.ts webhook.deno.ts kv-store.deno.ts github.deno.ts spike/db-route.ts spike/db-client.ts spike/db-route.deno.ts",
-    "test": "deno test --allow-run --allow-net --allow-read --allow-write --allow-env --unstable-kv webhook.deno.ts kv-store.deno.ts github.deno.ts spike/db-route.deno.ts"
+    "check": "deno check main.ts store.ts kv-store.ts github.ts workflow.ts webhook.deno.ts kv-store.deno.ts github.deno.ts spike/db-route.ts spike/db-client.ts spike/db-route.deno.ts spike/db-client.deno.ts",
+    "test": "deno test --allow-run --allow-net --allow-read --allow-write --allow-env --unstable-kv webhook.deno.ts kv-store.deno.ts github.deno.ts spike/db-route.deno.ts spike/db-client.deno.ts"
   }
 }

@@ -11,14 +11,14 @@ const call = (qs: string, env: Record<string, string>) =>
   handleDbSpike(new URL(`http://x/spike/db?${qs}`), envOf(env));
 
 /* port 0 + ssl-free URL, as in pglite.probe.ts */
-async function withPglite(fn: (url: string) => Promise<void>) {
+async function withPglite(fn: (url: string, db: PGlite) => Promise<void>) {
   const db = new PGlite();
   await db.waitReady;
   const server = new PGLiteSocketServer({ db, port: 0, host: "127.0.0.1" });
   await server.start();
   try {
     const port = Number(/(\d+)$/.exec(server.getServerConn())?.[1]);
-    await fn(`postgres://postgres:s3cretpw@127.0.0.1:${port}/postgres?sslmode=disable`);
+    await fn(`postgres://postgres:s3cretpw@127.0.0.1:${port}/postgres?sslmode=disable`, db);
   } finally {
     await server.stop().catch(() => {});
     await db.close().catch(() => {});
@@ -69,12 +69,51 @@ Deno.test("handler: 200 full run against PGlite, and cold=1, and n clamping", as
     assert.match(b.serverVersion, /PostgreSQL/);
     assert.ok(!JSON.stringify(b).includes("s3cretpw"));
 
-    const c = await (await call("target=deploy&cold=1&n=500", env)).json();
-    assert.deepEqual(Object.keys(c).sort(), ["connectMs", "firstQueryMs", "region", "serverVersion", "target"]);
-
-    // n is clamped to 1..500 (0 -> 1; the table must not have grown in cold mode)
+    // n is clamped to 1..500
     const lo = await (await call("target=deploy&n=0", env)).json();
     assert.equal(lo.selectOne.n, 1);
+    const hi = await (await call("target=deploy&n=999", env)).json();
+    assert.equal(hi.selectOne.n, 500);
+    assert.equal(hi.txn3.n, 500);
+  });
+});
+
+Deno.test("handler: cold=1 is write-free (no table created, nothing inserted)", async () => {
+  await withPglite(async (url, db) => {
+    const env = { KODER_DB_SPIKE: "1", DATABASE_URL: url };
+    const c = await (await call("target=deploy&cold=1&n=500", env)).json();
+    assert.deepEqual(Object.keys(c).sort(), ["connectMs", "firstQueryMs", "region", "serverVersion", "target"]);
+    const t = await db.query<{ t: string | null }>("SELECT to_regclass('spike_probe')::text AS t");
+    assert.equal(t.rows[0].t, null);
+
+    // once the table exists, a cold run leaves its rows alone
+    await call("target=deploy&n=2", env);
+    const before = (await db.query<{ n: number }>("SELECT count(*)::int AS n FROM spike_probe")).rows[0].n;
+    assert.equal(before, 2);
+    await call("target=deploy&cold=1", env);
+    const after = (await db.query<{ n: number }>("SELECT count(*)::int AS n FROM spike_probe")).rows[0].n;
+    assert.equal(after, before);
+  });
+});
+
+Deno.test("handler: a failure mid-loop is a 502 and the connection is still closed", async () => {
+  await withPglite(async (url, db) => {
+    const env = { KODER_DB_SPIKE: "1", DATABASE_URL: url };
+    // A spike_probe without `note`: CREATE IF NOT EXISTS passes, the txn INSERT fails with BEGIN open.
+    await db.exec("CREATE TABLE spike_probe (id bigserial PRIMARY KEY, at timestamptz DEFAULT now())");
+    const bad = await call("target=deploy&n=3", env);
+    assert.equal(bad.status, 502);
+    assert.ok(!(await bad.text()).includes("s3cretpw"));
+    // pglite-socket accepts one connection at a time: if the first leaked, this would hang
+    // PGlite is one backend shared by every socket, so closing the connection doesn't roll
+    // back the open txn the way a real Postgres does; do it by hand.
+    await db.exec("ROLLBACK");
+    await db.exec("DROP TABLE spike_probe");
+    const ok = await Promise.race([
+      call("target=deploy&n=3", env),
+      new Promise<never>((_, rej) => setTimeout(() => rej(new Error("connection leaked: next request hung")), 15000)),
+    ]);
+    assert.equal(ok.status, 200);
   });
 });
 

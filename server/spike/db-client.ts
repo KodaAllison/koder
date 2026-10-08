@@ -21,7 +21,9 @@ export function parseEnvFile(text: string): Record<string, string> {
 async function loadConfig(): Promise<{ api: string; token: string }> {
   let file: Record<string, string> = {};
   try {
-    const path = new URL("../../scripts/.koder.env", import.meta.url);
+    // KODER_ENV_FILE exists so the tests can point at a temp file.
+    const override = Deno.env.get("KODER_ENV_FILE");
+    const path = override ?? new URL("../../scripts/.koder.env", import.meta.url);
     file = parseEnvFile(await Deno.readTextFile(path));
   } catch { /* no env file: environment only */ }
   const api = Deno.env.get("KODER_API") || file.KODER_API;
@@ -35,6 +37,7 @@ function fail(msg: string): never {
   Deno.exit(1);
 }
 
+async function main() {
 const { values: flags } = parseArgs({
   args: Deno.args.filter((a) => a !== "--"),
   options: { target: { type: "string" }, n: { type: "string" }, cold: { type: "boolean" }, json: { type: "boolean" } },
@@ -88,3 +91,6 @@ if (flags.json) {
   const w = Math.max(...rows.map((r) => r[0].length));
   for (const [k, v] of rows) console.log(`${k.padEnd(w)}  ${v}`);
 }
+}
+
+if (import.meta.main) await main();
