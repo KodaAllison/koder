@@ -13,7 +13,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseShellAssets, readCacheName, computeCacheName } from '../scripts/stamp-sw.mjs';
+import { parseShellAssets, readCacheName, computeCacheName, hashableBytes } from '../scripts/stamp-sw.mjs';
 
 /* Real asset paths, so computeCacheName can actually read them off disk, but a
  * hand-written source so these tests don't move every time sw.js does. */
@@ -69,4 +69,50 @@ test('computeCacheName distinguishes different asset content', () => {
   const a = "const SHELL_ASSETS = [\n  './index.html',\n];";
   const b = "const SHELL_ASSETS = [\n  './css/styles.css',\n];";
   assert.notEqual(computeCacheName(a), computeCacheName(b));
+});
+
+/* Line endings. With core.autocrlf=true a Windows checkout has CRLF text files
+ * while main's blobs (and a Linux/CI checkout, and the deploy) are LF, so the
+ * name must not depend on which one is on disk. These use in-memory fixtures
+ * via computeCacheName's readAsset seam, so they don't depend on the checkout. */
+const EOL_FIXTURE = "const SHELL_ASSETS = [\n  './',\n  './js/app.js',\n  './icons/icon.png',\n];";
+const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x0d, 0x0a, 0xff]);
+const LF_TEXT = {
+  './': Buffer.from('<!doctype html>\n<title>k</title>\n'),
+  './js/app.js': Buffer.from("// @ts-check\nimport './store.js';\n"),
+};
+
+/** @param {Record<string, Buffer>} files */
+const reader = (files) => (/** @type {string} */ entry) => files[entry] ?? PNG;
+/** @param {Buffer} buf */
+const toCrlf = (buf) => Buffer.from(buf.toString('latin1').replace(/\n/g, '\r\n'), 'latin1');
+
+test('computeCacheName is the same for LF and CRLF checkouts of text assets', () => {
+  const crlf = Object.fromEntries(Object.entries(LF_TEXT).map(([k, v]) => [k, toCrlf(v)]));
+  assert.ok(crlf['./js/app.js'].includes('\r\n')); // fixture really is CRLF
+  assert.equal(computeCacheName(EOL_FIXTURE, reader(crlf)), computeCacheName(EOL_FIXTURE, reader(LF_TEXT)));
+});
+
+test('computeCacheName is the same for a file with mixed line endings', () => {
+  // gen-projects.sh output on a Windows checkout can end up part CRLF, part LF.
+  const mixed = { ...LF_TEXT, './js/app.js': Buffer.from("// @ts-check\r\nimport './store.js';\n") };
+  assert.equal(computeCacheName(EOL_FIXTURE, reader(mixed)), computeCacheName(EOL_FIXTURE, reader(LF_TEXT)));
+});
+
+test('computeCacheName still notices real text edits', () => {
+  const edited = { ...LF_TEXT, './js/app.js': Buffer.from("// @ts-check\nimport './sync.js';\n") };
+  assert.notEqual(computeCacheName(EOL_FIXTURE, reader(edited)), computeCacheName(EOL_FIXTURE, reader(LF_TEXT)));
+});
+
+test('hashableBytes leaves binary assets byte-for-byte alone', () => {
+  // A PNG header contains \r\n; normalizing it would corrupt the content hash.
+  assert.ok(hashableBytes('./icons/icon.png', PNG).equals(PNG));
+  assert.ok(hashableBytes('./icons/ICON.PNG', PNG).equals(PNG));
+  assert.ok(!hashableBytes('./js/app.js', PNG).equals(PNG)); // ...which text would strip
+});
+
+test('computeCacheName hashes binary assets raw, so \r\n vs \n there is a change', () => {
+  const lfPng = Buffer.from(PNG.toString('latin1').replace(/\r\n/g, '\n'), 'latin1');
+  const withPng = (/** @type {Buffer} */ png) => (/** @type {string} */ e) => LF_TEXT[e] ?? png;
+  assert.notEqual(computeCacheName(EOL_FIXTURE, withPng(PNG)), computeCacheName(EOL_FIXTURE, withPng(lfPng)));
 });
