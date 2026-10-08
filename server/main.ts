@@ -362,7 +362,7 @@ async function recordGithubNoop(
  * request (the PWA's files) and skips the token gate. */
 function isApiPath(p: string): boolean {
   return p === "/state" || p === "/state/restore" || p === "/revisions" ||
-    p === "/archive" || p === "/pr-status" || p === "/tickets" || p.startsWith("/tickets/");
+    p === "/archive" || p === "/pr-status" || p === "/spike/db" || p === "/tickets" || p.startsWith("/tickets/");
 }
 
 /* A write that can't fit the store is a 507 on every route (a valid request
@@ -504,6 +504,11 @@ async function handle(req: Request): Promise<Response> {
 
   if (req.headers.get("Authorization") !== `Bearer ${TOKEN}`) {
     return json({ error: "unauthorized" }, 401);
+  }
+
+  /* Storage-spike DB latency probe; off unless KODER_DB_SPIKE=1 (KODER-6784). */
+  if (url.pathname === "/spike/db" && req.method === "GET") {
+    return (await import("./spike/db-route.ts")).handleDbSpike(url, Deno.env);
   }
 
   /* Fetched, never stored: only PR refs already attached to canonical project
