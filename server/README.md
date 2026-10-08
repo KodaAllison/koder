@@ -209,6 +209,19 @@ empty board.
 curl -H "Authorization: Bearer $KODER_TOKEN" "$KODER_API/state"
 ```
 
+The response carries `ETag: "<rev>"` (a quoted strong validator),
+`Cache-Control: no-cache` and `Vary: Authorization`. Send `If-None-Match` with
+a previous ETag (a list, `W/` tags and `*` are accepted) and an unchanged board
+answers `304 Not Modified` with no body, decided from the head read alone, so
+the 30s poll skips serializing and sending the board. (On the KV backend the
+head read is still a board read, so this saves serialization and egress, not a
+KV get; a cheaper head arrives with KODER-F6F7.) The ETag assumes a rev is never
+reused, so wiping the KV or restoring a drifted copy can cause a false 304. `no-cache` lets a browser
+store the response but forces it to revalidate every time, so a stale board is
+never served from the HTTP cache; the service worker passes `/state` straight
+to the network. Without `If-None-Match` the response is unchanged. CORS allows
+the `If-None-Match` request header and exposes `ETag`.
+
 Pass `?rev=N` to fetch a past snapshot instead of the current board (see
 history below). `404` if that rev has been pruned.
 

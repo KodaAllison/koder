@@ -405,6 +405,78 @@ Deno.test({
     try {
       await waitForServer(baseUrl);
 
+      await t.step("GET /state sends an ETag and answers 304 to a matching If-None-Match", async () => {
+        const auth = { Authorization: `Bearer ${TOKEN}` };
+        const seeded = await seedBoard(baseUrl, { doing: [card()] });
+        const etag = `"${seeded.rev}"`;
+
+        const first = await fetch(`${baseUrl}/state`, { headers: auth });
+        assert.equal(first.status, 200);
+        assert.equal(first.headers.get("etag"), etag);
+        assert.equal(first.headers.get("cache-control"), "no-cache");
+        assert.equal(first.headers.get("access-control-expose-headers"), "ETag");
+        assert.equal((await first.json() as Doc).rev, seeded.rev);
+
+        const cond = (inm: string, path = "/state") =>
+          fetch(`${baseUrl}${path}`, { headers: { ...auth, "If-None-Match": inm } });
+        for (const inm of [etag, `W/${etag}`, `"0", ${etag}`, "*"]) {
+          const hit = await cond(inm);
+          assert.equal(hit.status, 304, `If-None-Match: ${inm}`);
+          assert.equal(hit.headers.get("etag"), etag);
+          assert.equal(hit.headers.get("cache-control"), "no-cache");
+          assert.equal(hit.headers.get("vary"), "Authorization");
+          assert.ok(hit.headers.get("access-control-allow-origin"));
+          assert.equal(await hit.text(), "");
+        }
+        const miss = await cond(`"${seeded.rev + 100}"`);
+        assert.equal(miss.status, 200);
+        assert.equal((await miss.json() as Doc).rev, seeded.rev);
+
+        // A conditional request still needs the bearer token.
+        const noAuth = await fetch(`${baseUrl}/state`, { headers: { "If-None-Match": etag } });
+        assert.equal(noAuth.status, 401);
+
+        // Snapshots carry the same validator.
+        const snap = await fetch(`${baseUrl}/state?rev=${seeded.rev}`, { headers: auth });
+        assert.equal(snap.status, 200);
+        assert.equal(snap.headers.get("etag"), etag);
+        await snap.body?.cancel();
+        assert.equal((await cond(etag, `/state?rev=${seeded.rev}`)).status, 304);
+
+        // After a write the old ETag no longer matches: 200 with the new board.
+        const put = await fetch(`${baseUrl}/state`, {
+          method: "PUT",
+          headers: { ...auth, "Content-Type": "application/json" },
+          body: JSON.stringify({
+            baseRev: seeded.rev,
+            board: { ...seeded.board, projects: { doing: [card(undefined, undefined, { title: "changed" })] } },
+          }),
+        });
+        assert.equal(put.status, 200);
+        const { rev } = await put.json() as { rev: number };
+        const after = await cond(etag);
+        assert.equal(after.status, 200);
+        assert.equal(after.headers.get("etag"), `"${rev}"`);
+        const afterDoc = await after.json() as Doc;
+        assert.equal(afterDoc.rev, rev);
+        assert.equal(afterDoc.board.projects.doing[0].title, "changed");
+        assert.equal((await cond(`"${rev}"`)).status, 304);
+
+        // Ticket writes bump rev too: POST /tickets invalidates the new ETag.
+        const created = await fetch(`${baseUrl}/tickets`, {
+          method: "POST",
+          headers: { ...auth, "Content-Type": "application/json" },
+          body: JSON.stringify({ title: "etag ticket", project: "koder" }),
+        });
+        assert.equal(created.status, 201);
+        const viaTicket = await cond(`"${rev}"`);
+        assert.equal(viaTicket.status, 200);
+        const ticketDoc = await viaTicket.json() as Doc;
+        assert.equal(ticketDoc.rev, rev + 1);
+        assert.equal(viaTicket.headers.get("etag"), `"${rev + 1}"`);
+        assert.ok(Object.values(ticketDoc.board.projects).flat().some((c) => c.title === "etag ticket"));
+      });
+
       await t.step("PR status route enforces read auth and stays read-only", async () => {
         const empty = await seedBoard(baseUrl, {});
         const unauthorized = await fetch(`${baseUrl}/pr-status`);

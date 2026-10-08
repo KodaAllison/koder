@@ -90,6 +90,7 @@ import {
   type ArchivedCard,
   type Board,
   type Card,
+  type Doc,
   type PutResult,
   type Store,
   StoreContentionError,
@@ -286,7 +287,8 @@ async function readGithubBody(
 const CORS: Record<string, string> = {
   "Access-Control-Allow-Origin": Deno.env.get("KODER_ORIGIN") ?? "*",
   "Access-Control-Allow-Methods": "GET, PUT, POST, PATCH, DELETE, OPTIONS",
-  "Access-Control-Allow-Headers": "Authorization, Content-Type",
+  "Access-Control-Allow-Headers": "Authorization, Content-Type, If-None-Match",
+  "Access-Control-Expose-Headers": "ETag",
   "Access-Control-Max-Age": "86400",
 };
 
@@ -294,6 +296,53 @@ function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
     headers: { ...CORS, "Content-Type": "application/json" },
+  });
+}
+
+/* GET /state validators. The ETag is the doc's rev as a quoted strong
+ * validator. Every board write (PUT, ticket writes, restore, webhook move)
+ * bumps rev by exactly 1 in the same atomic commit, so one rev is one body. That assumes a rev is never reused (a wiped dev KV,
+ * or restoring a drifted KV copy, could reuse one and give a false 304); the
+ * client's baseRev handling in sync.js relies on the same invariant.
+ * `no-cache` lets the browser store the response but forces revalidation on
+ * every use; `Vary: Authorization` keeps one token's cached copy from
+ * answering a request made with another. */
+const STATE_HEADERS = { "Cache-Control": "no-cache", "Vary": "Authorization" };
+
+function etagFor(rev: number): string {
+  return `"${rev}"`;
+}
+
+/* RFC 9110 If-None-Match: `*` or a comma list of (optionally weak) tags, with
+ * weak comparison. Our tags never contain a comma, so a plain split is enough. */
+function matchesEtag(header: string | null, etag: string): boolean {
+  if (header === null) return false;
+  return header.split(",").some((t) => {
+    t = t.trim();
+    return t === "*" || t.replace(/^W\//, "") === etag;
+  });
+}
+
+function notModified(rev: number): Response {
+  return new Response(null, {
+    status: 304,
+    headers: { ...CORS, ...STATE_HEADERS, ETag: etagFor(rev) },
+  });
+}
+
+/* The ETag always comes from the doc being returned, never from a separate
+ * head read, so a write landing in between can't pair an old ETag with a
+ * newer body. */
+function stateResponse(doc: Doc, ifNoneMatch: string | null): Response {
+  if (matchesEtag(ifNoneMatch, etagFor(doc.rev))) return notModified(doc.rev);
+  return new Response(JSON.stringify(doc), {
+    status: 200,
+    headers: {
+      ...CORS,
+      ...STATE_HEADERS,
+      "Content-Type": "application/json",
+      ETag: etagFor(doc.rev),
+    },
   });
 }
 
@@ -482,9 +531,19 @@ async function handle(req: Request): Promise<Response> {
       if (!snap) {
         return json({ error: `no snapshot for rev ${requestedRev} (only the last ${store.limits.keptRevisions} are kept)` }, 404);
       }
-      return json(snap);
+      // Immutable per rev, so the same ETag fits (still no-cache: a pruned
+      // snapshot becomes a 404 that a cached copy must not hide).
+      return stateResponse(snap, req.headers.get("If-None-Match"));
     }
-    return json(await store.readBoard());
+    /* Head first: a match skips serialising and sending the board. On KvStore
+     * getHead() is itself a readBoard(), so a miss costs two KV gets; the head
+     * read gets cheaper once a real head exists (KODER-F6F7). On a miss, fall through to a full read and answer from it. */
+    const inm = req.headers.get("If-None-Match");
+    if (inm !== null) {
+      const head = await store.getHead();
+      if (matchesEtag(inm, etagFor(head.rev))) return notModified(head.rev);
+    }
+    return stateResponse(await store.readBoard(), inm);
   }
 
   /* ---- GET /revisions: the kept restore points, newest first ---- */
