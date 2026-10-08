@@ -98,12 +98,29 @@ The card goes to `review` now: the PR is real work Koda can watch.
 
 - Spawn the reviewer with the reviewer brief. It posts its review on the PR
   (see "PR comments") and also returns the verdict to you.
-- On CHANGES_REQUESTED, send the findings to the **same builder** with
-  `SendMessage`. It fixes, commits, **pushes to the PR branch**, and replies on
-  each thread it addressed.
-- Round 2 goes to the **same reviewer**, so it checks its own findings.
-- **Max 2 fix rounds.** Anything left goes in the PR description under
-  "Known nits"; anything worth tracking also becomes a backlog ticket.
+- **The verdict follows from the findings; the reviewer doesn't choose it.**
+
+  | Severity | Means | Examples |
+  |---|---|---|
+  | `blocker` | Wrong or unsafe as shipped | Wrong behaviour, data loss, security hole, broken build or tests, doesn't do what the ticket asks |
+  | `should-fix` | Works, but isn't done | A risky path with no test, a doc or comment that states something false, a claim nothing verified, a missed edge case likely to bite |
+  | `nit` | Optional polish | Naming, style, a nicer structure; the PR is fine without it |
+
+  **APPROVE only when there are zero blockers and zero should-fixes.** Any
+  blocker or should-fix means CHANGES_REQUESTED. A finding the reviewer isn't
+  willing to send back is a nit. If a reported verdict doesn't match its
+  findings, treat it as CHANGES_REQUESTED and tell the reviewer in round 2.
+- On CHANGES_REQUESTED, send the blockers and should-fixes, plus any cheap
+  nits, to the **same builder** with `SendMessage`. It fixes, commits,
+  **pushes to the PR branch**, and replies on each thread it addressed.
+- Round 2 goes to the **same reviewer**, so it checks its own findings and
+  posts a fresh verdict by the same rule.
+- On APPROVE, nits are optional: send the cheap ones as a fix round you check
+  yourself (no second review), or list them in the PR under "Known nits".
+- **Max 2 fix rounds.** A blocker still open after round 2 stops the ticket:
+  leave the PR as a draft and tell Koda. Leftover should-fixes and nits go in
+  the PR under "Known nits"; anything worth tracking also becomes a backlog
+  ticket.
 - Send extra concerns to an agent *before* it reports. A message to an agent
   that has already finished arrives after its report; fold it into the next
   round instead.
@@ -122,6 +139,11 @@ For any ticket that changes what users see or do, after the review approves:
 - If the app can't be driven (sign-in the browser session can't complete, no
   browser tool, a backend that won't start), say exactly what wasn't verified
   in the PR description. Never claim a check that didn't run.
+- No browser tools in the session? For server or API changes, run the
+  branch's server locally (throwaway data, a gitignored local config) and
+  check it with curl: status codes, headers, before/after a write. Post that
+  as the verifier comment and give Koda a short browser checklist in the PR for
+  what curl can't show. Delete the local config and data afterwards.
 - A repo's CLAUDE.md wins over this step: if it limits how UI may be checked,
   follow it, and list any scenarios left for Koda in the PR.
 
@@ -153,7 +175,7 @@ which comments aren't theirs. Koda never starts a comment with `🤖`.
 
 | Who | Where | Starts with |
 |---|---|---|
-| Reviewer | Review summary | `🤖 **Claude reviewer** · <model> · round <n>` then `**Verdict: APPROVE**` or `**Verdict: CHANGES_REQUESTED**` |
+| Reviewer | Review summary | `🤖 **Claude reviewer** · <model> · round <n>` then `**Verdict: APPROVE**` or `**Verdict: CHANGES_REQUESTED**`, then the counts, e.g. `0 blockers · 1 should-fix · 2 nits` |
 | Reviewer | Inline finding | `🤖 Claude reviewer · <blocker\|should-fix\|nit>:` |
 | Builder | Thread reply | `🤖 Claude builder · fixed in <sha>:` (or `· not changed:` with the reason) |
 | Verifier | PR comment | `🤖 Claude verifier · <tool>:` |
@@ -165,7 +187,7 @@ Post a review with inline threads in one call:
 gh api repos/{owner}/{repo}/pulls/<n>/reviews --input review.json
 # review.json:
 # { "event": "COMMENT",
-#   "body": "🤖 **Claude reviewer** · sonnet · round 1\n\n**Verdict: CHANGES_REQUESTED**\n\n<summary>",
+#   "body": "🤖 **Claude reviewer** · sonnet · round 1\n\n**Verdict: CHANGES_REQUESTED**\n0 blockers · 1 should-fix · 0 nits\n\n<summary>",
 #   "comments": [ { "path": "src/App.tsx", "line": 259, "side": "RIGHT",
 #                   "body": "🤖 Claude reviewer · should-fix: <finding and concrete fix>" } ] }
 ```
@@ -226,10 +248,22 @@ Check carefully
   6. If another open sprint branch touches the same files, test-merge it.
   7. Run lint, tests and build.
 
+Severity
+  blocker     wrong or unsafe as shipped: wrong behaviour, data loss, security,
+              broken build/tests, doesn't do what the ticket asks
+  should-fix  works but isn't done: risky path untested, a doc/comment that
+              states something false, an unverified claim, a likely edge case
+  nit         optional polish; the PR is fine without it
+  If you wouldn't send it back to the builder, it's a nit.
+
+Verdict: derived, not chosen
+  APPROVE only with zero blockers and zero should-fixes.
+  Any blocker or should-fix → CHANGES_REQUESTED.
+
 Post your review on the PR (format in koder-sprint "PR comments"), one inline
-thread per finding. Then report back: APPROVE or CHANGES_REQUESTED, findings
-with severity (blocker / should-fix / nit), file:line and a concrete fix.
-Verify each finding by tracing the code. Don't pad the list.
+thread per finding. Then report back: the verdict, the count per severity,
+and each finding with severity, file:line and a concrete fix. Verify each
+finding by tracing the code. Don't pad the list.
 ```
 
 ## Gotchas
@@ -241,5 +275,12 @@ Verify each finding by tracing the code. Don't pad the list.
   so agent worktrees under `.claude/worktrees/` never show up in `git status`.
 - Builds cost the most usage (a focus-handling build used ~150k tokens). Pick
   the builder model per ticket; don't default everything to `opus`.
+- Windows: running a command inside an agent's worktree moves this session's
+  working directory there, and that locks the folder (`git worktree remove`
+  fails with "Permission denied", leaving an empty folder). `cd` back to the
+  repo root in a separate command first. A worktree holding only the agent's
+  ignored `.claude/settings.local.json` needs `--force`; check `status
+  --porcelain` and unpushed commits before forcing.
+- Stop any local server you started (TaskStop) before removing its worktree.
 - Builders and reviewers only see unit tests. "Lint, tests and build pass" is
   not "works in the app" — that's what step 6 is for.
