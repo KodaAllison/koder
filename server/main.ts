@@ -787,7 +787,11 @@ async function handle(req: Request): Promise<Response> {
     // possibly fit, with the same message shape.
     const raw = await req.text();
     if (raw.length > 4 * STORE_VALUE_MAX) {
-      return json(storeFullBody(new StoreFullError(raw.length)), 413);
+      return json({
+        error: `board too large: request body is ${raw.length} characters,` +
+          ` store holds ${STORE_VALUE_MAX} bytes — archive done tickets to free space`,
+        limit: STORE_VALUE_MAX,
+      }, 413);
     }
     let body: { baseRev?: unknown; board?: unknown };
     try {
@@ -856,6 +860,16 @@ async function handle(req: Request): Promise<Response> {
 
       const entry = await kv.get<ArchivedCard[]>([...ARCHIVE_KEY, index]);
       const next = [...(entry.value ?? []), ...fresh];
+      // A board under the cap can't produce this, but the body is the
+      // caller's, so refuse rather than let KV throw a bare 500.
+      const nextSize = serialize(next).byteLength;
+      if (nextSize > STORE_VALUE_MAX) {
+        return json({
+          error: `archive batch too large: ${nextSize} of ${STORE_VALUE_MAX} bytes — send fewer cards`,
+          size: nextSize,
+          limit: STORE_VALUE_MAX,
+        }, 413);
+      }
       const res = await kv.atomic().check(entry)
         .set([...ARCHIVE_KEY, index], next).commit();
       if (res.ok) {

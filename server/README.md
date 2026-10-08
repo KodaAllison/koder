@@ -236,7 +236,8 @@ anything is written, and the board and rev are left unchanged:
 
 That covers `POST /tickets`, `PATCH /tickets/:id` (a note/title that grows the
 card), `POST /state/restore` and webhook moves (the delivery is not recorded,
-so GitHub can redeliver it once there's room). `PUT /state` returns the same
+so it can be redelivered from the repo's GitHub webhook settings once
+there's room — GitHub doesn't retry failed deliveries on its own). `PUT /state` returns the same
 body with `413`, as it always has for an oversized board. Writes that don't
 grow the board — a move between existing columns, a same-length edit, a
 delete — still land. The fix is to archive done tickets (below).
