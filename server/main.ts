@@ -47,11 +47,15 @@
  *   POST  /archive      → { cards } → lifts finished cards off the board
  *   GET   /archive      → everything archived so far, newest first
  *
+ * Any board write the store can't hold answers 507 { error: "board store full:
+ * N of M bytes …", size, limit } (413 for PUT /state) — see STORE_VALUE_MAX.
+ *
  * GitHub webhook (no bearer fallback; requires a valid HMAC made with
  * `KODER_WEBHOOK_SECRET`):
  *   POST  /webhooks/github → trusted PR events move a visible-ref ticket
  *
- * Archive: the board is ONE KV value, so it can only ever hold ~60KB, and Done
+ * Archive: the board is ONE KV value, so it can only ever hold 64KB as stored
+ * (see STORE_VALUE_MAX — a write past that is a 507 "board store full"), and Done
  * is the only column that only ever grows. The archive is where done cards go
  * to stop counting against that budget — a separate, append-only, chunked set
  * of keys under ["archive", n], each sealed well short of the 64KB value cap.
@@ -69,6 +73,7 @@
 import { serveDir } from "jsr:@std/http/file-server";
 import { fromFileUrl } from "jsr:@std/path";
 import { timingSafeEqual } from "node:crypto";
+import { serialize } from "node:v8";
 /* The SAME derivation the board renders with — js/ref.js is dependency-free
  * plain ESM precisely so this import works and the two can't drift on what a
  * ref means. Deno does not type-check imported .js (no checkJs in deno.json),
@@ -96,12 +101,13 @@ const githubResolver = createGithubResolver(GITHUB_TOKEN);
 const KEEP_REVISIONS = 20;
 
 // Archived cards live under ["archive", n], separate from the board so they
-// stop counting against its 60_000 budget.
+// stop counting against its budget.
 const ARCHIVE_KEY = ["archive"];
-// Seal a chunk once appending would take it past this. The gap to KV's 64KB
-// value cap is deliberate: one append carries at most a whole board's worth of
-// cards (<60_000, since that's all a PUT can hold), so a chunk that starts
-// empty still lands under the cap.
+// Seal a chunk once appending would take it past this many stored bytes
+// (measured like the board — see STORE_VALUE_MAX). The gap to KV's 64KB value
+// cap is deliberate: one append carries at most a whole board's worth of cards,
+// which is under the cap by construction, so a chunk that starts empty still
+// lands under it.
 const ARCHIVE_CHUNK_MAX = 50_000;
 
 // Repo root (this file is in server/) — where the PWA's static files live, so
@@ -162,21 +168,62 @@ function emptyDoc(): Doc {
   return { rev: 0, updatedAt: null, board: { projects: {}, life: {}, lifeMeta: {} } };
 }
 
+/* The board store's real capacity. The whole Doc is ONE Deno KV value, and KV
+ * caps a value at 65,536 bytes of its V8 structured-clone serialization — not
+ * of JSON. V8 writes a string as one byte per char only if every char is
+ * Latin-1; a single em dash or arrow makes the whole string two bytes per
+ * char. Ticket notes are full of those, so a board that is ~48KB as JSON can
+ * already be 64KB as stored. node:v8 serialize() is the same encoding KV uses
+ * (byte-for-byte, header included), so measuring with it checks against the
+ * cap KV will actually enforce. */
+const STORE_VALUE_MAX = 65_536;
+
+class StoreFullError extends Error {
+  constructor(readonly size: number) {
+    super(
+      `board store full: ${size} of ${STORE_VALUE_MAX} bytes` +
+        " — archive done tickets to free space",
+    );
+  }
+}
+
+/* Every write that commits a board goes through commitDoc, so this is the one
+ * place the size is checked: an oversized doc throws StoreFullError, which the
+ * request handler turns into a 507 (PUT /state answers 413 instead). Its body
+ * is { error, size, limit }. */
+function storeFullBody(err: StoreFullError) {
+  return { error: err.message, size: err.size, limit: STORE_VALUE_MAX };
+}
+
 /* Commit a new doc as one atomic step: advance the current pointer, snapshot
  * the doc under ["board", rev], and prune the snapshot KEEP_REVISIONS behind.
  * `check(entry)` guards against a concurrent writer landing on the same rev.
- * All writers (PUT, POST, PATCH, restore) go through here so a snapshot can
- * never diverge from the rev that produced it. */
-function commitDoc(entry: Deno.KvEntryMaybe<Doc>, doc: Doc, delivery?: DeliveryGuard) {
-  const atomic = kv.atomic().check(entry);
-  if (delivery) atomic.check(delivery.entry);
-  atomic.set(KEY, doc)
-    .set([...KEY, doc.rev], doc)
-    .delete([...KEY, doc.rev - KEEP_REVISIONS]);
-  if (delivery) {
-    atomic.set(delivery.key, true);
+ * All writers (PUT, POST, PATCH, DELETE, restore, webhook) go through here so a
+ * snapshot can never diverge from the rev that produced it — and so every one
+ * of them gets the store-size check. Throws StoreFullError if the doc can't
+ * fit in one KV value. */
+async function commitDoc(entry: Deno.KvEntryMaybe<Doc>, doc: Doc, delivery?: DeliveryGuard) {
+  const size = serialize(doc).byteLength;
+  if (size > STORE_VALUE_MAX) throw new StoreFullError(size);
+  try {
+    const atomic = kv.atomic().check(entry);
+    if (delivery) atomic.check(delivery.entry);
+    atomic.set(KEY, doc)
+      .set([...KEY, doc.rev], doc)
+      .delete([...KEY, doc.rev - KEEP_REVISIONS]);
+    if (delivery) {
+      atomic.set(delivery.key, true);
+    }
+    return await atomic.commit();
+  } catch (err) {
+    // Belt and braces: if the backend ever measures differently from the check
+    // above, its own "Value too large" still becomes a clear store-full error
+    // rather than a bare 500.
+    if (err instanceof Error && /value too large/i.test(err.message)) {
+      throw new StoreFullError(size);
+    }
+    throw err;
   }
-  return atomic.commit();
 }
 
 function recordDelivery(entry: Deno.KvEntryMaybe<Doc>, delivery: DeliveryGuard) {
@@ -468,7 +515,19 @@ function isApiPath(p: string): boolean {
     p === "/archive" || p === "/pr-status" || p === "/tickets" || p.startsWith("/tickets/");
 }
 
+/* A write that can't fit the store is a 507 on every route (a valid request
+ * the server has no room for), never a bare 500. PUT /state handles its own
+ * case first to keep its long-standing 413. */
 Deno.serve({ port: PORT }, async (req: Request) => {
+  try {
+    return await handle(req);
+  } catch (err) {
+    if (err instanceof StoreFullError) return json(storeFullBody(err), 507);
+    throw err;
+  }
+});
+
+async function handle(req: Request): Promise<Response> {
   const url = new URL(req.url);
 
   if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
@@ -723,11 +782,12 @@ Deno.serve({ port: PORT }, async (req: Request) => {
 
   /* ---- PUT /state: full-board write, conditional on baseRev ---- */
   if (url.pathname === "/state" && req.method === "PUT") {
-    // Deno KV values cap at 64KB — reject early with a clear error instead of
-    // letting kv.set() fail mysteriously once the board grows too big.
+    // The real size check is commitDoc's, against the stored encoding (see
+    // STORE_VALUE_MAX). This only refuses to parse a body that couldn't
+    // possibly fit, with the same message shape.
     const raw = await req.text();
-    if (raw.length > 60_000) {
-      return json({ error: "board too large (60KB limit — Deno KV caps values at 64KB)" }, 413);
+    if (raw.length > 4 * STORE_VALUE_MAX) {
+      return json(storeFullBody(new StoreFullError(raw.length)), 413);
     }
     let body: { baseRev?: unknown; board?: unknown };
     try {
@@ -748,7 +808,15 @@ Deno.serve({ port: PORT }, async (req: Request) => {
       updatedAt: new Date().toISOString(),
       board: preserveWorkflowMetadata(body.board, cur.board),
     };
-    const res = await commitDoc(entry, doc);
+    let res: Deno.KvCommitResult | Deno.KvCommitError;
+    try {
+      res = await commitDoc(entry, doc);
+    } catch (err) {
+      // The whole board was sent, so "too big" is the request's fault: 413,
+      // which the PWA already reads as "archive done cards".
+      if (err instanceof StoreFullError) return json(storeFullBody(err), 413);
+      throw err;
+    }
     if (!res.ok) return json({ error: "conflict: concurrent write, retry" }, 409);
     return json({ rev: doc.rev, updatedAt: doc.updatedAt });
   }
@@ -783,7 +851,7 @@ Deno.serve({ port: PORT }, async (req: Request) => {
       const last = chunks[chunks.length - 1];
       // Start a fresh chunk when appending would overflow the current one.
       const sealed = !last ||
-        JSON.stringify([...last.cards, ...fresh]).length > ARCHIVE_CHUNK_MAX;
+        serialize([...last.cards, ...fresh]).byteLength > ARCHIVE_CHUNK_MAX;
       const index = last ? (sealed ? last.index + 1 : last.index) : 0;
 
       const entry = await kv.get<ArchivedCard[]>([...ARCHIVE_KEY, index]);
@@ -1001,4 +1069,4 @@ Deno.serve({ port: PORT }, async (req: Request) => {
   }
 
   return json({ error: "not found" }, 404);
-});
+}

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { serialize } from "node:v8";
 import { nextWebhookRevision } from "./workflow.ts";
 
 const TOKEN = "webhook-test-token";
@@ -273,6 +274,53 @@ function card(
     project,
     ...extra,
   };
+}
+
+// Deno KV's per-value cap, in bytes of the V8 serialization it stores (which
+// node:v8 serialize() reproduces exactly). The board is one value.
+const STORE_VALUE_MAX = 65_536;
+
+/* Seed a board whose stored doc sits `headroom` bytes (±4) under the cap: a
+ * filler card padded to size plus a small KODER-5A11 card to act on. The
+ * filler note starts with an em dash, so V8 stores it as two-byte chars. */
+async function seedNearFullBoard(baseUrl: string, headroom: number): Promise<Doc> {
+  const projects = (padding: number) => ({
+    todo: [
+      card("t_filler_f111", "koder", { note: "—" + "a".repeat(padding) }),
+      card("t_small_5a11"),
+    ],
+    doing: [],
+  });
+  const first = await seedBoard(baseUrl, projects(1000));
+  const grow = Math.floor((STORE_VALUE_MAX - headroom - serialize(first).byteLength) / 2);
+  const doc = await seedBoard(baseUrl, projects(1000 + grow));
+  const left = STORE_VALUE_MAX - serialize(doc).byteLength;
+  assert.ok(Math.abs(left - headroom) <= 4, `expected ~${headroom} bytes free, got ${left}`);
+  return doc;
+}
+
+function assertStoreFullBody(body: { error: string; size: number; limit: number }) {
+  assert.match(
+    body.error,
+    /^board store full: \d+ of 65536 bytes — archive done tickets to free space$/,
+  );
+  assert.equal(body.limit, STORE_VALUE_MAX);
+  assert.ok(body.size > STORE_VALUE_MAX);
+}
+
+async function patchTicket(
+  baseUrl: string,
+  id: string,
+  fields: Record<string, unknown>,
+): Promise<Response> {
+  return await fetch(`${baseUrl}/tickets/${id}`, {
+    method: "PATCH",
+    headers: {
+      Authorization: `Bearer ${TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(fields),
+  });
 }
 
 Deno.test({
@@ -1182,6 +1230,105 @@ Deno.test({
             await getState(baseUrl, `/state?rev=${mergedBody.rev}`),
             current,
           );
+        },
+      );
+
+      await t.step(
+        "a ticket write that would overflow the board store is a 507 with a clear message",
+        async () => {
+          const before = await seedNearFullBoard(baseUrl, 24);
+
+          const post = await fetch(`${baseUrl}/tickets`, {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${TOKEN}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ title: "One ticket too many", project: "koder" }),
+          });
+          assert.equal(post.status, 507);
+          assertStoreFullBody(await post.json());
+
+          const patch = await patchTicket(baseUrl, "KODER-5A11", {
+            note: "a note long enough to push the board past the cap",
+          });
+          assert.equal(patch.status, 507);
+          assertStoreFullBody(await patch.json());
+
+          const after = await getState(baseUrl);
+          assert.equal(after.rev, before.rev);
+          assert.deepEqual(after.board, before.board);
+        },
+      );
+
+      await t.step(
+        "a PATCH that doesn't grow the board still lands on a near-full store",
+        async () => {
+          const before = await seedNearFullBoard(baseUrl, 24);
+          const response = await patchTicket(baseUrl, "KODER-5A11", {
+            priority: "low",
+            column: "doing",
+          });
+          assert.equal(response.status, 200);
+          const after = await getState(baseUrl);
+          assert.equal(after.rev, before.rev + 1);
+          assert.equal(after.board.projects.doing[0].id, "t_small_5a11");
+          assert.equal(after.board.projects.doing[0].priority, "low");
+        },
+      );
+
+      await t.step(
+        "a webhook move that would overflow is a 507 and can be redelivered once there is room",
+        async () => {
+          const before = await seedNearFullBoard(baseUrl, 24);
+          const delivery = freshDelivery();
+          const opened = {
+            action: "opened",
+            repository: { full_name: "KodaAllison/koder" },
+            pull_request: {
+              number: 31,
+              title: "Ship KODER-5A11",
+              body: null,
+              merged: false,
+            },
+          };
+          const full = await postWebhook(baseUrl, opened, { delivery });
+          assert.equal(full.status, 507);
+          assertStoreFullBody(await full.json());
+          assert.equal((await getState(baseUrl)).rev, before.rev);
+
+          // The refused delivery was not recorded, so it lands once space frees.
+          await seedBoard(baseUrl, { todo: [card("t_small_5a11")] });
+          const retried = await postWebhook(baseUrl, opened, { delivery });
+          assert.equal(retried.status, 200);
+          assert.equal((await retried.json() as { updated: boolean }).updated, true);
+        },
+      );
+
+      await t.step(
+        "PUT /state measures the stored size, not the JSON length",
+        async () => {
+          const before = await seedBoard(baseUrl, { todo: [card()] });
+          // ~33K chars of JSON (well under the old 60_000 guard), but every
+          // char is stored as two bytes because the string isn't Latin-1.
+          const board = {
+            projects: { todo: [card("t_ticket_1a2b", "koder", { note: "—".repeat(33_000) })] },
+            life: {},
+            lifeMeta: {},
+          };
+          const body = JSON.stringify({ baseRev: before.rev, board });
+          assert.ok(body.length < 60_000);
+          const response = await fetch(`${baseUrl}/state`, {
+            method: "PUT",
+            headers: {
+              Authorization: `Bearer ${TOKEN}`,
+              "Content-Type": "application/json",
+            },
+            body,
+          });
+          assert.equal(response.status, 413);
+          assertStoreFullBody(await response.json());
+          assert.equal((await getState(baseUrl)).rev, before.rev);
         },
       );
     } finally {
