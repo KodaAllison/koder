@@ -6,7 +6,7 @@
 #   * ~/.claude/skills/koder-ticket/          (personal — loads in any local session)
 #   * <sibling repo>/.claude/skills/koder-ticket/  for every git repo under the
 #     parent Code folder that has an "origin" remote (cloud/mobile sessions
-#     only see what's pushed to GitHub)
+#     only see what's pushed to GitHub), except the archived repos in SKIP_REPOS
 #
 # What gets synced: SKILL.md (master: .claude/skills/koder-ticket/SKILL.md here)
 # and the CLI (master: scripts/koder-ticket.sh here). Credentials (.koder.env)
@@ -21,6 +21,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SRC_MD="$ROOT/.claude/skills/koder-ticket/SKILL.md"
 SRC_SH="$ROOT/scripts/koder-ticket.sh"
+
+# Archived projects that no longer get the skill. Folder names under Code/.
+SKIP_REPOS=" SART SwiftPlan weatherapp "
 
 [ -f "$SRC_MD" ] || { echo "master SKILL.md not found: $SRC_MD" >&2; exit 1; }
 [ -f "$SRC_SH" ] || { echo "master CLI not found: $SRC_SH" >&2; exit 1; }
@@ -46,6 +49,7 @@ CODE_DIR="$(dirname "$ROOT")"
 for d in "$CODE_DIR"/*/; do
   repo="${d%/}"
   [ -d "$repo/.git" ] || continue
+  case "$SKIP_REPOS" in *" $(basename "$repo") "*) echo "skipped (archived): $repo"; continue ;; esac
   git -C "$repo" remote get-url origin >/dev/null 2>&1 || continue
   sync_to "$repo/.claude/skills/koder-ticket"
   guard_gitignore "$repo"
