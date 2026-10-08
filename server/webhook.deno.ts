@@ -1370,6 +1370,33 @@ Deno.test({
       );
 
       await t.step(
+        "a restored deleted card may carry a link older than a later relink",
+        async () => {
+          await seedBoard(baseUrl, { review: [card("t_ticket_1a2b")] });
+          assert.equal((await openPr(20, "KODER-1A2B")).status, 200);
+          const first = await getState(baseUrl);
+          assert.equal((await openPr(21, "KODER-1A2B")).status, 200);
+          const deleted = await fetch(`${baseUrl}/tickets/t_ticket_1a2b`, {
+            method: "DELETE",
+            headers: { Authorization: `Bearer ${TOKEN}` },
+          });
+          assert.equal(deleted.status, 200);
+
+          // Documented behaviour: the orphan returns with the snapshot's #20/1,
+          // not the since-deleted #21/2.
+          await restoreRev(first.rev);
+          const restored = (await getState(baseUrl)).board.projects.review[0];
+          assert.equal(restored.pr, "KodaAllison/koder#20");
+          assert.equal(restored.prRev, 1);
+          // The next event for the newer PR repairs it.
+          assert.equal((await openPr(21, "KODER-1A2B")).status, 200);
+          const healed = (await getState(baseUrl)).board.projects.review[0];
+          assert.equal(healed.pr, "KodaAllison/koder#21");
+          assert.equal(healed.prRev, 2);
+        },
+      );
+
+      await t.step(
         "DELETE refuses missing and ambiguous refs without a revision change",
         async () => {
           const before = await seedBoard(baseUrl, {

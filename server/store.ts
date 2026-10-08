@@ -16,7 +16,9 @@
  * StoreContentionError if it can't land the write.
  *
  * Domain rules every backend must apply identically — ref resolution, the
- * webhook's transition policy, pr/prRev preservation on a full-board PUT —
+ * webhook's transition policy, pr/prRev preservation on a full-board PUT, and
+ * on restore (surviving cards keep their CURRENT pr/prRev; cards deleted since
+ * the snapshot keep the snapshot's) —
  * live here as pure functions over a Board, so two backends can't drift on
  * what a write means. */
 
@@ -173,7 +175,9 @@ export interface Store {
   deleteTicket(
     given: string,
   ): Promise<{ kind: "ok"; card: Card; column: string; rev: number; board: Board } | Unresolved>;
-  // Re-land a kept snapshot as a new head rev; null if it was pruned.
+  // Re-land a kept snapshot as a new head rev; null if it was pruned. Must apply
+  // restoreWorkflowMetadata: surviving cards keep their CURRENT pr/prRev, and
+  // cards deleted since the snapshot come back with the snapshot's own.
   restore(rev: number): Promise<{ rev: number; updatedAt: string } | null>;
 
   /* ---- Archive: append-only, idempotent by card id ---- */
