@@ -1,6 +1,7 @@
 # Koder sync server
 
-A single-file Deno server (`main.ts`) backed by Deno KV. It holds the canonical
+A small Deno server (`main.ts` for HTTP) backed by a `Store` (`store.ts`; Deno KV
+by default via `kv-store.ts`). It holds the canonical
 copy of the board; the PWA syncs against it and keeps localStorage as an
 offline cache. It also gives agents/scripts a way to add tickets from a
 terminal via `POST /tickets`.
