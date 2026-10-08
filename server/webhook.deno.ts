@@ -1255,6 +1255,120 @@ Deno.test({
         },
       );
 
+      const openPr = (number: number, ref: string) =>
+        postWebhook(baseUrl, {
+          action: "opened",
+          repository: { full_name: "KodaAllison/koder" },
+          pull_request: { number, title: `${ref} PR ${number}`, body: null, merged: false },
+        });
+      const restoreRev = async (rev: number) => {
+        const response = await fetch(`${baseUrl}/state/restore`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ rev }),
+        });
+        assert.equal(response.status, 200);
+        return await response.json() as { rev: number; restoredFrom: number };
+      };
+
+      await t.step(
+        "restore keeps the current PR link when the snapshot predates it",
+        async () => {
+          // Snapshot with the old text and no link at all.
+          const snapshot = await seedBoard(baseUrl, {
+            todo: [card("t_ticket_1a2b", "koder", { title: "Old text" })],
+          });
+          assert.equal((await openPr(20, "KODER-1A2B")).status, 200);
+          const linked = await getState(baseUrl);
+          const card1 = linked.board.projects.review[0];
+          assert.equal(card1.pr, "KodaAllison/koder#20");
+          assert.equal(card1.prRev, 1);
+          // Edit the text through the sync seam (the PUT keeps the link).
+          const edited = structuredClone(linked.board);
+          edited.projects.review[0].title = "New text";
+          const afterEdit = await putBoard(baseUrl, edited);
+
+          const result = await restoreRev(snapshot.rev);
+          assert.equal(result.restoredFrom, snapshot.rev);
+          assert.equal(result.rev, afterEdit.rev + 1);
+          const restored = await getState(baseUrl);
+          assert.equal(restored.rev, result.rev);
+          // Text and column come from the snapshot...
+          assert.equal(restored.board.projects.todo[0].title, "Old text");
+          assert.equal(restored.board.projects.review?.length ?? 0, 0);
+          // ...but the link and its revision counter are the current ones.
+          assert.equal(restored.board.projects.todo[0].pr, "KodaAllison/koder#20");
+          assert.equal(restored.board.projects.todo[0].prRev, 1);
+          // It is a snapshotted head rev like any other write.
+          assert.deepEqual(await getState(baseUrl, `/state?rev=${result.rev}`), restored);
+        },
+      );
+
+      await t.step(
+        "restore after the PR link changed keeps the newest pr and prRev",
+        async () => {
+          await seedBoard(baseUrl, { review: [card("t_ticket_1a2b")] });
+          assert.equal((await openPr(20, "KODER-1A2B")).status, 200);
+          const first = await getState(baseUrl);
+          assert.equal(first.board.projects.review[0].prRev, 1);
+          assert.equal((await openPr(21, "KODER-1A2B")).status, 200);
+          const second = await getState(baseUrl);
+          assert.equal(second.board.projects.review[0].pr, "KodaAllison/koder#21");
+          assert.equal(second.board.projects.review[0].prRev, 2);
+
+          await restoreRev(first.rev);
+          const restored = await getState(baseUrl);
+          assert.equal(restored.board.projects.review[0].pr, "KodaAllison/koder#21");
+          assert.equal(restored.board.projects.review[0].prRev, 2);
+        },
+      );
+
+      await t.step(
+        "restore matches cards by id across columns and leaves other fields alone",
+        async () => {
+          const snapshot = await seedBoard(baseUrl, {
+            todo: [card("t_ticket_1a2b", "koder", { note: "snapshot note" })],
+            doing: [card("t_other_0001", "koder", { title: "Unlinked" })],
+          });
+          assert.equal((await openPr(20, "KODER-1A2B")).status, 200);
+          await restoreRev(snapshot.rev);
+          const restored = await getState(baseUrl);
+          const linked = restored.board.projects.todo[0];
+          assert.equal(linked.note, "snapshot note");
+          assert.equal(linked.pr, "KodaAllison/koder#20");
+          assert.equal(linked.prRev, 1);
+          const other = restored.board.projects.doing[0];
+          assert.equal(other.title, "Unlinked");
+          assert.equal("pr" in other, false);
+          assert.equal("prRev" in other, false);
+        },
+      );
+
+      await t.step(
+        "restore keeps a deleted card's own link, not stripping or forging one",
+        async () => {
+          await seedBoard(baseUrl, { review: [card("t_ticket_1a2b")] });
+          assert.equal((await openPr(20, "KODER-1A2B")).status, 200);
+          const withLink = await getState(baseUrl);
+          // Delete the card; the current board has no pr/prRev for it at all.
+          const deleted = await fetch(`${baseUrl}/tickets/t_ticket_1a2b`, {
+            method: "DELETE",
+            headers: { Authorization: `Bearer ${TOKEN}` },
+          });
+          assert.equal(deleted.status, 200);
+
+          await restoreRev(withLink.rev);
+          const restored = await getState(baseUrl);
+          // The webhook-written link comes back with the card, unchanged.
+          assert.equal(restored.board.projects.review[0].id, "t_ticket_1a2b");
+          assert.equal(restored.board.projects.review[0].pr, "KodaAllison/koder#20");
+          assert.equal(restored.board.projects.review[0].prRev, 1);
+          // The webhook still owns the counter: it continues from there.
+          assert.equal((await openPr(22, "KODER-1A2B")).status, 200);
+          assert.equal((await getState(baseUrl)).board.projects.review[0].prRev, 2);
+        },
+      );
+
       await t.step(
         "DELETE refuses missing and ambiguous refs without a revision change",
         async () => {

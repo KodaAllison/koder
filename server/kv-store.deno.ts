@@ -5,6 +5,7 @@
 
 import assert from "node:assert/strict";
 import { KvStore } from "./kv-store.ts";
+import { restoreWorkflowMetadata } from "./store.ts";
 import type { ArchivedCard, Card } from "./store.ts";
 
 function card(id: string, extra: Partial<ArchivedCard> = {}): ArchivedCard {
@@ -49,6 +50,29 @@ Deno.test("KvStore", async (t) => {
       assert.equal(kept?.board.projects.todo.length, 4);
       assert.equal(revisions.find((r) => r.rev === 4)?.updatedAt, kept?.updatedAt);
     }));
+
+  await t.step("restoreWorkflowMetadata covers every board, any column, and orphans", () => {
+    const linked = (id: string, pr: string, prRev: number): Card => ({ ...card(id), pr, prRev });
+    const snapshot = {
+      projects: { todo: [card("t_a_000a")], done: [linked("t_gone_000d", "o/r#1", 1)] },
+      life: { week: [card("t_life_000b", { title: "old" }), card("t_lifeplain_000c")] },
+      lifeMeta: {},
+    };
+    const current = {
+      projects: { review: [linked("t_a_000a", "o/r#5", 3)] },
+      life: { today: [linked("t_life_000b", "o/r#9", 2)] },
+      lifeMeta: {},
+    };
+    const out = restoreWorkflowMetadata(snapshot, current);
+    assert.deepEqual([out.projects.todo[0].pr, out.projects.todo[0].prRev], ["o/r#5", 3]);
+    assert.equal(out.life.week[0].title, "old");
+    assert.deepEqual([out.life.week[0].pr, out.life.week[0].prRev], ["o/r#9", 2]);
+    assert.equal("pr" in out.life.week[1], false);
+    // Deleted since the snapshot: keeps the snapshot's own values.
+    assert.deepEqual([out.projects.done[0].pr, out.projects.done[0].prRev], ["o/r#1", 1]);
+    // Inputs are not mutated.
+    assert.equal("pr" in snapshot.projects.todo[0], false);
+  });
 
   await t.step("archive is idempotent by id and reads back in append order", () =>
     withStore(async (store) => {
