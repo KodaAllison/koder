@@ -40,6 +40,7 @@ import {
   emptyDoc,
   type Head,
   preserveWorkflowMetadata,
+  restoreWorkflowMetadata,
   type PutResult,
   resolveTicketId,
   type Store,
@@ -309,7 +310,9 @@ export class KvStore implements Store {
       const doc: Doc = {
         rev: cur.rev + 1,
         updatedAt: new Date().toISOString(),
-        board: snap.value.board,
+        // Recomputed against `cur` on every retry: the card text is the
+        // snapshot's, but surviving cards keep their CURRENT pr/prRev.
+        board: restoreWorkflowMetadata(snap.value.board, cur.board),
       };
       const res = await this.commitDoc(entry, doc);
       if (res.ok) return { rev: doc.rev, updatedAt: doc.updatedAt! };

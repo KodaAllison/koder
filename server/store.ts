@@ -16,7 +16,9 @@
  * StoreContentionError if it can't land the write.
  *
  * Domain rules every backend must apply identically — ref resolution, the
- * webhook's transition policy, pr/prRev preservation on a full-board PUT —
+ * webhook's transition policy, pr/prRev preservation on a full-board PUT, and
+ * on restore (surviving cards keep their CURRENT pr/prRev; cards deleted since
+ * the snapshot keep the snapshot's) —
  * live here as pure functions over a Board, so two backends can't drift on
  * what a write means. */
 
@@ -173,7 +175,9 @@ export interface Store {
   deleteTicket(
     given: string,
   ): Promise<{ kind: "ok"; card: Card; column: string; rev: number; board: Board } | Unresolved>;
-  // Re-land a kept snapshot as a new head rev; null if it was pruned.
+  // Re-land a kept snapshot as a new head rev; null if it was pruned. Must apply
+  // restoreWorkflowMetadata: surviving cards keep their CURRENT pr/prRev, and
+  // cards deleted since the snapshot come back with the snapshot's own.
   restore(rev: number): Promise<{ rev: number; updatedAt: string } | null>;
 
   /* ---- Archive: append-only, idempotent by card id ---- */
@@ -231,6 +235,23 @@ const hasOwn = (value: object, key: PropertyKey) =>
  * exactly. New cards (and legacy cards without workflow state) cannot acquire
  * either field from an untrusted PUT. */
 export function preserveWorkflowMetadata(incoming: Board, current: Board): Board {
+  return carryWorkflowMetadata(incoming, current, false);
+}
+
+/* Restore's variant: the snapshot's card text comes back, but each card that
+ * still exists keeps its CURRENT pr/prRev (matched by id across both boards
+ * and every column), so restoring never unlinks a PR or rewinds prRev. The
+ * one difference from the PUT rule is a card deleted since the snapshot: it has
+ * no current value, so it keeps the snapshot's own pr/prRev. Those were
+ * written by the webhook (every stored board has passed
+ * preserveWorkflowMetadata), so keeping them forges nothing, whereas
+ * stripping them would drop a real link and let a later webhook restart prRev
+ * below a value a client may still hold. */
+export function restoreWorkflowMetadata(snapshot: Board, current: Board): Board {
+  return carryWorkflowMetadata(snapshot, current, true);
+}
+
+function carryWorkflowMetadata(incoming: Board, current: Board, keepOrphans: boolean): Board {
   const board = structuredClone(incoming);
   const currentCards = new Map<string, Card>();
   for (const boardId of ["projects", "life"] as const) {
@@ -242,6 +263,7 @@ export function preserveWorkflowMetadata(incoming: Board, current: Board): Board
     for (const cards of Object.values(board[boardId] ?? {})) {
       for (const card of cards ?? []) {
         const authoritative = currentCards.get(card.id);
+        if (!authoritative && keepOrphans) continue;
         delete card.pr;
         delete card.prRev;
         if (authoritative && hasOwn(authoritative, "pr")) card.pr = authoritative.pr;

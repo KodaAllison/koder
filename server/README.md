@@ -314,7 +314,12 @@ curl -H "Authorization: Bearer $KODER_TOKEN" "$KODER_API/revisions"
 Inspect a snapshot with `GET /state?rev=N`, then **`POST /state/restore`** with
 `{ rev }` to bring it back. Restore doesn't rewind `rev`: it re-lands that
 snapshot's board as a *new* head rev, so open tabs pull it in like any other
-change. `404` if the rev has been pruned.
+change. Card text and placement come from the snapshot, but each card keeps its
+*current* `pr`/`prRev` (matched by id): the webhook is the only writer of PR links, so
+a restore never unlinks a surviving card's PR or rewinds its `prRev`. A card deleted
+since the snapshot has no current link, so it comes back with the snapshot's link, which
+may predate a later relink (until the next webhook event for it). `404` if the rev has been
+pruned.
 
 ```bash
 curl -X POST -H "Authorization: Bearer $KODER_TOKEN" -H 'Content-Type: application/json' \
