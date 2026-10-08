@@ -31,25 +31,68 @@ deno task test
 
 ## Deploy (free) on Deno Deploy
 
-1. https://dash.deno.com → New App → link this GitHub repo.
-2. Build config: framework preset **None**, run as a **dynamic app** with
-   entrypoint `server/main.ts`. (Don't accept the auto-detected "static site"
-   preset — the repo's root `index.html` triggers it, and you'd get a file
-   server that 404s `/state`.)
-3. Settings → Environment Variables → add `KODER_TOKEN` (e.g. `openssl rand -hex 24`),
-   `KODER_WEBHOOK_SECRET` (use a separate value, e.g. `openssl rand -hex 32`),
-   and the server-only `GITHUB_TOKEN` used for live PR status.
-   Optionally `KODER_ORIGIN=https://<your-board-origin>` to lock down CORS.
-4. Create a KV database (org sidebar → Databases) and attach it to the app
-   (app Settings → Databases), then redeploy — `Deno.openKv()` fails until
-   one is attached.
-5. Put the app URL + token into `js/config.local.js` (copy
-   `js/config.example.js`) and `scripts/.koder.env`:
+This targets the new Deno Deploy (https://console.deno.com). Deploy Classic
+(dash.deno.com) shut down on 20 July 2026.
+
+1. Go to https://console.deno.com and create an organization (its name and slug
+   can't be changed afterwards). Click **+ New App** and link this GitHub repo
+   (use "Configure GitHub App permissions" if it doesn't appear).
+2. Build config: framework preset **No Preset**, a **dynamic** app (it executes
+   code on every request), entrypoint `server/main.ts`. Don't accept an
+   auto-detected static preset: the repo's root `index.html` triggers it, and
+   you'd get a file server that 404s `/state`. (Unverified: whether the console
+   still auto-detects a static app for this repo; the guard is cheap, so keep it.)
+3. Environment variables (app Settings, or the New App page): add them to the
+   **Production** context, which serves production traffic: `KODER_TOKEN`
+   (e.g. `openssl rand -hex 24`), `KODER_WEBHOOK_SECRET` (a separate value, e.g.
+   `openssl rand -hex 32`), and the server-only `GITHUB_TOKEN` for live PR status.
+   Optionally `KODER_ORIGIN=https://<your-board-origin>` to lock down CORS. The
+   **Development** context covers preview/branch URLs; add the same vars there
+   if previews should work. (Build-context vars exist only during builds.)
+4. Attach a KV database: org dashboard → **Databases** → your Deno KV instance →
+   **Assign** → pick the app. Each timeline gets its own database, and
+   `Deno.openKv()` needs no URL on Deploy. Redeploy after assigning.
+   (Unverified: the exact flow for *creating* the KV instance, and whether
+   `--unstable-kv` matters on Deploy; the docs say nothing about it.)
+5. The app is served at `https://<app>.<org>.deno.net`. Put that URL + the token
+   into `js/config.local.js` (copy `js/config.example.js`) and
+   `scripts/.koder.env`:
 
    ```
    KODER_API=https://<app>.<org>.deno.net
    KODER_TOKEN=<token>
    ```
+
+### DB spike probe
+
+A guarded latency probe for the storage spike (`docs/specs/storage-spike.md`,
+KODER-6784). It does nothing unless you enable it.
+
+- Route: `GET /spike/db?target=deploy|neon[&n=100][&cold=1]`, bearer auth like
+  every other API route. `404 {"error":"db spike disabled"}` unless
+  `KODER_DB_SPIKE=1`.
+- Env: `KODER_DB_SPIKE=1`; `DATABASE_URL` for `target=deploy` (Deploy injects it
+  when its Postgres is attached); `NEON_DATABASE_URL` for `target=neon`. A
+  missing URL is a `400 {"error":"<VAR> not set"}`. Remove `KODER_DB_SPIKE` when
+  the measurement is done.
+- Each request opens a fresh single connection (so connect time is measured) and
+  closes it. A `-pooler` host gets `prepare: false` for PgBouncer. `n` is
+  clamped to 1..500. Connection failures are `502` with the password scrubbed.
+- Response: `{ target, region, connectMs, firstQueryMs, selectOne: {n,p50,p95,max},
+  txn3: {n,p50,p95}, serverVersion }`, in ms. `cold=1` returns only the connect,
+  first-query and version fields: no loops, no writes. A full run creates a
+  tiny `spike_probe` table and deletes its rows older than a day.
+- Client, from `server/`:
+
+  ```bash
+  deno task spike:db -- --target neon|deploy [--n 100] [--cold] [--json]
+  ```
+
+  It reads `KODER_API`/`KODER_TOKEN` from the environment, else
+  `scripts/.koder.env` (the environment wins), prints a small table (or the raw
+  JSON with `--json`) and exits non-zero with the server's message on an HTTP
+  error. `region` comes from `DENO_REGION`, which the Deploy docs do not list,
+  so it may be `null`.
 
 ## Host the frontend (so it works on your phone)
 
