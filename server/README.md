@@ -104,6 +104,13 @@ empty — `/tickets` returns `{"tickets":[]}` until you file something into it.
 Tests set the optional `KODER_KV_PATH` environment variable to a fresh temporary
 SQLite file; leave it unset for the normal local database and on Deno Deploy.
 
+Storage sits behind a `Store` interface (`store.ts`), picked at startup by the
+optional `KODER_STORE` variable. `kv` (the default, `kv-store.ts`) is the only
+backend so far; `pg` and `dual` are reserved for the planned Postgres store and
+make the server exit at startup with a "not implemented yet" error.
+`webhook.deno.ts` drives the server purely over HTTP and passes `KODER_STORE`
+through, so it is the contract suite every backend must pass.
+
 ## API
 
 The board endpoints below require `Authorization: Bearer $KODER_TOKEN`. The

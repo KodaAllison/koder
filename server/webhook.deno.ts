@@ -1,7 +1,14 @@
+/* The server's contract suite. It spawns the real main.ts and drives it only
+ * over HTTP, so it doesn't know or care which Store backs it: KODER_STORE
+ * (default "kv") is passed straight through to the server, and the same steps
+ * are meant to pass against every backend. The few steps that pin a
+ * backend-specific limit (KV's 64KB value cap) say so and only run there. */
+
 import assert from "node:assert/strict";
 import { serialize } from "node:v8";
 import { nextWebhookRevision } from "./workflow.ts";
 
+const STORE = Deno.env.get("KODER_STORE") || "kv";
 const TOKEN = "webhook-test-token";
 const SECRET = "webhook-test-secret";
 let deliverySequence = 1;
@@ -277,7 +284,8 @@ function card(
 }
 
 // Deno KV's per-value cap, in bytes of the V8 serialization it stores (which
-// node:v8 serialize() reproduces exactly). The board is one value.
+// node:v8 serialize() reproduces exactly). The board is one value. Steps
+// that depend on this run only when KODER_STORE is "kv" (see kvOnly below).
 const STORE_VALUE_MAX = 65_536;
 
 /* Seed a board whose stored doc sits `headroom` bytes (±4) under the cap: a
@@ -323,8 +331,51 @@ async function patchTicket(
   });
 }
 
+const mainUrl = new URL("./main.ts", import.meta.url);
+const SERVER_ARGS = [
+  "run",
+  "--unstable-kv",
+  "--allow-env",
+  "--allow-net",
+  "--allow-read",
+  "--allow-write",
+  Deno.build.os === "windows"
+    ? decodeURIComponent(mainUrl.pathname.slice(1))
+    : decodeURIComponent(mainUrl.pathname),
+];
+
+Deno.test("KODER_STORE fails fast at startup unless the backend exists", async () => {
+  for (
+    const [backend, message] of [
+      ["pg", 'KODER_STORE=pg is not implemented yet; only "kv" is available'],
+      ["dual", 'KODER_STORE=dual is not implemented yet; only "kv" is available'],
+      ["mongo", 'unknown KODER_STORE "mongo"; expected "kv", "pg" or "dual"'],
+    ]
+  ) {
+    const dir = await Deno.makeTempDir({ prefix: "koder-store-select-test-" });
+    try {
+      const { code, stderr } = await new Deno.Command(Deno.execPath(), {
+        args: SERVER_ARGS,
+        cwd: dir,
+        env: {
+          KODER_TOKEN: TOKEN,
+          KODER_STORE: backend,
+          KODER_KV_PATH: `${dir}/board.sqlite3`,
+          PORT: "0",
+        },
+        stdout: "null",
+        stderr: "piped",
+      }).output();
+      assert.notEqual(code, 0, backend);
+      assert.ok(new TextDecoder().decode(stderr).includes(message), backend);
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  }
+});
+
 Deno.test({
-  name: "GitHub PR webhook",
+  name: `GitHub PR webhook (KODER_STORE=${STORE})`,
   sanitizeOps: false,
   sanitizeResources: false,
   async fn(t) {
@@ -332,24 +383,13 @@ Deno.test({
     const port = (probe.addr as Deno.NetAddr).port;
     probe.close();
     const kvDir = await Deno.makeTempDir({ prefix: "koder-webhook-test-" });
-    const mainUrl = new URL("./main.ts", import.meta.url);
-    const mainPath = Deno.build.os === "windows"
-      ? decodeURIComponent(mainUrl.pathname.slice(1))
-      : decodeURIComponent(mainUrl.pathname);
     const server = new Deno.Command(Deno.execPath(), {
-      args: [
-        "run",
-        "--unstable-kv",
-        "--allow-env",
-        "--allow-net",
-        "--allow-read",
-        "--allow-write",
-        mainPath,
-      ],
+      args: SERVER_ARGS,
       cwd: kvDir,
       env: {
         KODER_TOKEN: TOKEN,
         KODER_WEBHOOK_SECRET: SECRET,
+        KODER_STORE: STORE,
         KODER_KV_PATH: `${kvDir}/board.sqlite3`,
         PORT: String(port),
       },
@@ -357,6 +397,10 @@ Deno.test({
       stderr: "null",
     }).spawn();
     const baseUrl = `http://127.0.0.1:${port}`;
+    // A step that pins KV's 64KB value cap: skipped (reported as ignored)
+    // against any other backend, whose capacity is its own.
+    const kvOnly = (name: string, fn: () => Promise<void>) =>
+      t.step({ name, fn, ignore: STORE !== "kv" });
 
     try {
       await waitForServer(baseUrl);
@@ -1233,7 +1277,7 @@ Deno.test({
         },
       );
 
-      await t.step(
+      await kvOnly(
         "a ticket write that would overflow the board store is a 507 with a clear message",
         async () => {
           const before = await seedNearFullBoard(baseUrl, 24);
@@ -1261,7 +1305,7 @@ Deno.test({
         },
       );
 
-      await t.step(
+      await kvOnly(
         "a PATCH that doesn't grow the board still lands on a near-full store",
         async () => {
           const before = await seedNearFullBoard(baseUrl, 24);
@@ -1277,7 +1321,7 @@ Deno.test({
         },
       );
 
-      await t.step(
+      await kvOnly(
         "a webhook move that would overflow is a 507 and can be redelivered once there is room",
         async () => {
           const before = await seedNearFullBoard(baseUrl, 24);
@@ -1305,7 +1349,7 @@ Deno.test({
         },
       );
 
-      await t.step(
+      await kvOnly(
         "PUT /state measures the stored size, not the JSON length",
         async () => {
           const before = await seedBoard(baseUrl, { todo: [card()] });
