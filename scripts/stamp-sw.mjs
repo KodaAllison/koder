@@ -6,7 +6,8 @@
  * it was easy to forget — a stale CACHE_NAME means a phone keeps serving the
  * old shell from cache after a deploy. This stamps CACHE_NAME with a hash of
  * the actual SHELL_ASSETS bytes, so it changes exactly when the cached files
- * change and never when they don't.
+ * change and never when they don't. Text assets are hashed with LF line
+ * endings, so the name doesn't depend on the checkout's core.autocrlf.
  *
  * The file list is read from sw.js's own SHELL_ASSETS — one source of truth,
  * so it can't drift from what the SW actually pre-caches.
@@ -55,15 +56,36 @@ function assetToFile(entry) {
   return path.join(root, rel);
 }
 
+/* Assets hashed as raw bytes. Everything else in SHELL_ASSETS is text, whose
+ * line endings depend on the checkout (core.autocrlf=true gives CRLF on
+ * Windows) rather than on what's committed and deployed. */
+const BINARY_EXT = new Set(['.png', '.ico', '.jpg', '.jpeg', '.gif', '.webp', '.avif', '.woff', '.woff2']);
+
+/** The bytes to hash for an asset: CRLF -> LF for text, untouched for binary,
+ * so a Windows checkout and a Linux/CI checkout stamp the same name. Only
+ * transforms the in-memory copy; the asset on disk is never written.
+ * @param {string} entry @param {Buffer} bytes @returns {Buffer} */
+export function hashableBytes(entry, bytes) {
+  if (BINARY_EXT.has(path.extname(entry).toLowerCase())) return bytes;
+  // latin1 maps bytes 1:1 to chars, so this round-trip only drops the \r of \r\n.
+  return Buffer.from(bytes.toString('latin1').replace(/\r\n/g, '\n'), 'latin1');
+}
+
 /** Compute the content-derived CACHE_NAME for the shell currently on disk.
- * @param {string} [swSource] @returns {string} */
-export function computeCacheName(swSource = readFileSync(swPath, 'utf8')) {
+ * @param {string} [swSource]
+ * @param {(entry: string) => Buffer} [readAsset] reads one SHELL_ASSETS entry;
+ *   injectable so tests can hash in-memory fixtures
+ * @returns {string} */
+export function computeCacheName(
+  swSource = readFileSync(swPath, 'utf8'),
+  readAsset = (entry) => readFileSync(assetToFile(entry))
+) {
   const hash = createHash('sha256');
   for (const entry of parseShellAssets(swSource)) {
-    // Hash the entry name (so add/remove/reorder shifts the hash) then the raw
+    // Hash the entry name (so add/remove/reorder shifts the hash) then the
     // file bytes (so any content edit does). Buffers, so PNGs hash too.
     hash.update(entry + '\0');
-    hash.update(readFileSync(assetToFile(entry)));
+    hash.update(hashableBytes(entry, readAsset(entry)));
     hash.update('\0');
   }
   return PREFIX + hash.digest('hex').slice(0, HASH_LEN);
