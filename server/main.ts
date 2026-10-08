@@ -301,7 +301,9 @@ function json(body: unknown, status = 200): Response {
 
 /* GET /state validators. The ETag is the doc's rev as a quoted strong
  * validator. Every board write (PUT, ticket writes, restore, webhook move)
- * bumps rev by exactly 1 in the same atomic commit, so one rev is one body.
+ * bumps rev by exactly 1 in the same atomic commit, so one rev is one body. That assumes a rev is never reused (a wiped dev KV,
+ * or restoring a drifted KV copy, could reuse one and give a false 304); the
+ * client's baseRev handling in sync.js relies on the same invariant.
  * `no-cache` lets the browser store the response but forces revalidation on
  * every use; `Vary: Authorization` keeps one token's cached copy from
  * answering a request made with another. */
@@ -533,8 +535,9 @@ async function handle(req: Request): Promise<Response> {
       // snapshot becomes a 404 that a cached copy must not hide).
       return stateResponse(snap, req.headers.get("If-None-Match"));
     }
-    /* Head first: on a match that is the whole cost of the 30s poll, with no
-     * readBoard. On a miss, fall through to a full read and answer from it. */
+    /* Head first: a match skips serialising and sending the board. On KvStore
+     * getHead() is itself a readBoard(), so a miss costs two KV gets; the head
+     * read gets cheaper once a real head exists (KODER-F6F7). On a miss, fall through to a full read and answer from it. */
     const inm = req.headers.get("If-None-Match");
     if (inm !== null) {
       const head = await store.getHead();

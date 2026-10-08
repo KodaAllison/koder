@@ -414,6 +414,7 @@ Deno.test({
         assert.equal(first.status, 200);
         assert.equal(first.headers.get("etag"), etag);
         assert.equal(first.headers.get("cache-control"), "no-cache");
+        assert.equal(first.headers.get("access-control-expose-headers"), "ETag");
         assert.equal((await first.json() as Doc).rev, seeded.rev);
 
         const cond = (inm: string, path = "/state") =>
@@ -423,6 +424,8 @@ Deno.test({
           assert.equal(hit.status, 304, `If-None-Match: ${inm}`);
           assert.equal(hit.headers.get("etag"), etag);
           assert.equal(hit.headers.get("cache-control"), "no-cache");
+          assert.equal(hit.headers.get("vary"), "Authorization");
+          assert.ok(hit.headers.get("access-control-allow-origin"));
           assert.equal(await hit.text(), "");
         }
         const miss = await cond(`"${seeded.rev + 100}"`);
@@ -458,6 +461,20 @@ Deno.test({
         assert.equal(afterDoc.rev, rev);
         assert.equal(afterDoc.board.projects.doing[0].title, "changed");
         assert.equal((await cond(`"${rev}"`)).status, 304);
+
+        // Ticket writes bump rev too: POST /tickets invalidates the new ETag.
+        const created = await fetch(`${baseUrl}/tickets`, {
+          method: "POST",
+          headers: { ...auth, "Content-Type": "application/json" },
+          body: JSON.stringify({ title: "etag ticket", project: "koder" }),
+        });
+        assert.equal(created.status, 201);
+        const viaTicket = await cond(`"${rev}"`);
+        assert.equal(viaTicket.status, 200);
+        const ticketDoc = await viaTicket.json() as Doc;
+        assert.equal(ticketDoc.rev, rev + 1);
+        assert.equal(viaTicket.headers.get("etag"), `"${rev + 1}"`);
+        assert.ok(Object.values(ticketDoc.board.projects).flat().some((c) => c.title === "etag ticket"));
       });
 
       await t.step("PR status route enforces read auth and stays read-only", async () => {
