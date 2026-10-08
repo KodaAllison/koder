@@ -1,6 +1,7 @@
 # Koder sync server
 
-A single-file Deno server (`main.ts`) backed by Deno KV. It holds the canonical
+A small Deno server (`main.ts` for HTTP) backed by a `Store` (`store.ts`; Deno KV
+by default via `kv-store.ts`). It holds the canonical
 copy of the board; the PWA syncs against it and keeps localStorage as an
 offline cache. It also gives agents/scripts a way to add tickets from a
 terminal via `POST /tickets`.
@@ -103,6 +104,13 @@ The local KV is its own store, separate from the deployed board, so it starts
 empty — `/tickets` returns `{"tickets":[]}` until you file something into it.
 Tests set the optional `KODER_KV_PATH` environment variable to a fresh temporary
 SQLite file; leave it unset for the normal local database and on Deno Deploy.
+
+Storage sits behind a `Store` interface (`store.ts`), picked at startup by the
+optional `KODER_STORE` variable. `kv` (the default, `kv-store.ts`) is the only
+backend so far; `pg` and `dual` are reserved for the planned Postgres store and
+make the server exit at startup with a "not implemented yet" error.
+`webhook.deno.ts` drives the server purely over HTTP and passes `KODER_STORE`
+through, so it is the contract suite every backend must pass.
 
 ## API
 
