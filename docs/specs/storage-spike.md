@@ -14,7 +14,7 @@ suite). Versions: `@electric-sql/pglite` 0.5.8 (reports PostgreSQL 18.3), `@elec
 `npm:postgres` 3.4.9, Deno 2.9.6, Windows 11.
 
 The probe executes the ```sql block of section 5 of the spec verbatim (it reads the markdown), so a schema edit
-that PGlite can't run fails the probe. Result: 33 checks, 33 pass (two of them assert a documented gap).
+that PGlite can't run fails the probe. Result: 34 checks, 34 pass (two of them assert a documented gap).
 
 | Feature the spec relies on | Works? | Notes |
 |---|---|---|
@@ -32,7 +32,7 @@ that PGlite can't run fails the probe. Result: 33 checks, 33 pass (two of them a
 | `= ANY($1::text[])` (archive) | Yes | Array parameters bind from JS arrays and via `npm:postgres`. |
 | jsonb (`extra`, `->>`, `@>`, `||`, `jsonb_set`) | Yes | |
 | Data-modifying CTEs | Yes | |
-| Immutability trigger (`fin.reject_mutation`, BEFORE UPDATE OR DELETE) | Yes | plpgsql works, `RAISE ... ERRCODE`. Both UPDATE and DELETE rejected (`23001`). |
+| Immutability trigger (spec's `CREATE TRIGGER` line; the `reject_mutation` function body is the probe's own, the spec only comments the trigger) | Yes | plpgsql works, `RAISE ... ERRCODE`. Both UPDATE and DELETE rejected (`23001`). |
 | Role `GRANT`-based immutability (5.5, 10) | Not testable | One superuser; test the trigger only. Test the grants against the real DB. |
 | UNIQUE-based idempotent import | Yes | |
 | Aggregates (`sum ... GROUP BY`), `array_agg(... ORDER BY rank)` | Yes | |
@@ -82,12 +82,13 @@ PASS  CONCURRENCY: StoreContentionError path NOT reachable via lock contention
 PASS  CONCURRENCY: 40001 can be produced only by hand
 PASS  DRIVER: npm:postgres connects to PGlite through pglite-socket
         bigint comes back as string ("11"); sql.begin(), FOR UPDATE, array params, SQLSTATEs work
+PASS  DRIVER: port 0 gives a free port (read back) and postgres.js connects with ssl: false
 PASS  DRIVER: postgres.js pool (max 4), default vs maxConnections: 4
         default server -> failed: read ECONNRESET; maxConnections: 4 -> 4 parallel queries OK
 PASS  DRIVER: multiplexer and real row-lock contention between two connections?
         B acquired the lock after 356ms. A real server answers 55P03 at ~100ms
 
-33/33 passed
+34/34 passed
 ```
 
 (Notes are condensed from the probe's own output; run the task for the full text.)
@@ -125,12 +126,12 @@ acceptable because `PgStore` should rely on the CAS predicate and `FOR UPDATE` f
   Either set `max: 1` for tests (the production pool size can be a config knob) or start the socket server with
   `maxConnections: N` (works, with the multiplexer caveat above).
 - Run the socket server in-process in the test (`new PGLiteSocketServer({ db, port: 0 })`); no Docker, no external
-  binary. `port: 0` picks a free port, so parallel test files don't collide. Needs `--allow-net=127.0.0.1`.
+  binary. `port: 0` picks a free port (probe-verified: read back via `getServerConn()`), so parallel test files don't collide. Needs `--allow-net=127.0.0.1`.
 - **Type differences to code for in `PgStore`, not in tests:** `postgres.js` returns `bigint` (`int8`, `rev`,
   `created`, `pr_rev`) as **strings** by default, whereas PGlite's own API returns numbers. Because production runs
   `postgres.js`, always go through it in the contract suite, and convert once (e.g. `types: { bigint: postgres.BigInt }`
   or `Number()` at the mapping layer). `rev` is well inside 2^53.
-- SSL is not supported by the socket server; tests connect with `ssl: false`, production with the provider's TLS.
+- SSL is not supported by the socket server; tests connect with `ssl: false` (probe-verified), production with the provider's TLS.
 - **No thin adapter is needed** for `npm:postgres`; the cost is the extra devDependency
   (`@electric-sql/pglite-socket`) and the single-connection rule. Going the other way (in-process `PGlite`
   directly, no socket) would need an adapter and would test a different driver, so don't.
@@ -158,9 +159,9 @@ fetched page did not say.
 
 Changes vs the spec: free-tier size is probably 200K ops / ~1 GB rather than 100K / 500 MB (unreconciled);
 connection is plain env vars and TCP (spec said "could not verify"); billing counts queries, not compute time.
-The 7.1 poll budget (~58K ops/month for two tabs, one query per poll) fits comfortably under either cap, but
-`PUT`/`PATCH`/webhook transactions issue several statements and, if each statement counts, the margin shrinks
-to about 3x at the old 100K cap. Measure the real count (see section 6).
+The 7.1 poll budget (~58K ops/month for two tabs, one query per poll) fits under either cap, but the margin is
+thin. Estimate: 100K / 58K is only about 1.7x headroom at the old cap (about 3.4x at 200K), before any
+`PUT`/`PATCH`/webhook statements, which issue several statements each and may count per statement. Measure the real count (see section 6).
 
 ### 4.2 Neon free plan
 

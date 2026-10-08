@@ -104,6 +104,12 @@ await check("Partial index predicate rejects non-matching queries (cards_pr)", a
   const plan = await db.query<{ "QUERY PLAN": string }>(`EXPLAIN SELECT id FROM cards WHERE pr = 'a/b#1'`);
   await db.exec(`RESET enable_seqscan`);
   assert(/cards_pr/.test(plan.rows.map((r) => r["QUERY PLAN"]).join("\n")), "cards_pr unused");
+  // Negative: the index only holds rows WHERE pr IS NOT NULL, so it cannot answer pr IS NULL.
+  await db.exec(`SET enable_seqscan = off`);
+  const neg = await db.query<{ "QUERY PLAN": string }>(`EXPLAIN SELECT id FROM cards WHERE pr IS NULL`);
+  await db.exec(`RESET enable_seqscan`);
+  assert(!/cards_pr/.test(neg.rows.map((r) => r["QUERY PLAN"]).join("\n")), "cards_pr used for pr IS NULL");
+  return "pr = $1 uses cards_pr; pr IS NULL does not";
 });
 
 await check("jsonb: extra round-trip, ->>, @>, ||, jsonb_set, jsonb_build_object", async () => {
@@ -238,7 +244,9 @@ await check("Foreign keys (cards.owner_id, agent_runs.card_id)", async () => {
   assert(code === "23503", code);
 });
 
-await check("Ledger immutability trigger (the spec's commented reject_mutation, section 5.5)", async () => {
+// The spec only gives the CREATE TRIGGER line (commented out); the function body below is the
+// probe's own, not verbatim from the spec.
+await check("Ledger immutability trigger (spec's CREATE TRIGGER line, probe's own reject_mutation body)", async () => {
   await db.exec(`
     CREATE FUNCTION fin.reject_mutation() RETURNS trigger LANGUAGE plpgsql AS $$
     BEGIN RAISE EXCEPTION 'fin.transactions is append-only' USING ERRCODE = 'restrict_violation'; END $$;
@@ -470,6 +478,26 @@ async function poolOf4(port: number, maxConnections: number | undefined): Promis
 }
 let poolDefault = "";
 let poolMux = "";
+await check("DRIVER: port 0 gives a free port (read back) and postgres.js connects with ssl: false", async () => {
+  const server = new PGLiteSocketServer({ db, port: 0, host: "127.0.0.1" });
+  await server.start();
+  try {
+    const conn = server.getServerConn();
+    const port = Number(/(\d+)$/.exec(conn)?.[1]);
+    assert(port > 0 && ![54329, 54330, 54331, 54332].includes(port), `bad bound port from "${conn}"`);
+    const sql = postgres({ host: "127.0.0.1", port, user: "postgres", database: "postgres", ssl: false, max: 1, onnotice: () => {} });
+    try {
+      const [r] = await sql`SELECT 1 AS one`;
+      assert(r.one === 1, "query failed");
+    } finally {
+      await sql.end({ timeout: 1 });
+    }
+    return `getServerConn() = "${conn}"; connected on port ${port} with ssl: false`;
+  } finally {
+    await server.stop();
+  }
+});
+
 await check("DRIVER: postgres.js pool (max 4) against pglite-socket, default vs maxConnections: 4", async () => {
   poolDefault = await poolOf4(54330, undefined);
   poolMux = await poolOf4(54331, 4);
