@@ -214,15 +214,39 @@ Full-board write, used by the PWA. Body: `{ baseRev, board }`. `baseRev` must
 equal the current server rev, otherwise you get `409 { rev }` — re-GET, merge,
 retry. Success: `{ rev, updatedAt }`.
 
-A body over **60,000 characters** is rejected with `413`, because the whole
-board is one Deno KV value and KV caps a value at 64KB. See *Archive* below for
-what keeps it under that.
+A board too big for the store is rejected with `413` and the same
+`board store full` body as below. See *Board store full* and *Archive*.
+
+### Board store full — 507
+
+The whole board (every project, plus life and its revision metadata) is **one
+Deno KV value**, and KV caps a value at **65,536 bytes as stored**. "As
+stored" is V8's serialization, not JSON: a string is one byte per char only
+if every char in it is Latin-1, and a single `—`, `→` or emoji makes the whole
+string two bytes per char. Agent-written notes are full of those, so a board
+that measures ~48KB as JSON can already be at the cap.
+
+Any write that would push the stored board past the cap is refused before
+anything is written, and the board and rev are left unchanged:
+
+```
+507 { "error": "board store full: 65581 of 65536 bytes — archive done tickets to free space",
+      "size": 65581, "limit": 65536 }
+```
+
+That covers `POST /tickets`, `PATCH /tickets/:id` (a note/title that grows the
+card), `POST /state/restore` and webhook moves (the delivery is not recorded,
+so it can be redelivered from the repo's GitHub webhook settings once
+there's room — GitHub doesn't retry failed deliveries on its own). `PUT /state` returns the same
+body with `413`, as it always has for an oversized board. Writes that don't
+grow the board — a move between existing columns, a same-length edit, a
+delete — still land. The fix is to archive done tickets (below).
 
 ### Archive
 
-The board only grows in one place: Done. Left alone it eventually crosses the
-60KB line, and then every push 413s and the board sits dirty forever behind a
-badge. The archive is where finished cards go so they stop counting against
+The board only grows in one place: Done. Left alone it eventually hits the
+store cap, and then every push 413s (and every ticket write 507s) and the board
+sits dirty forever behind a badge. The archive is where finished cards go so they stop counting against
 that budget — separate, append-only KV keys under `["archive", n]`, each chunk
 sealed well short of the value cap.
 
@@ -283,7 +307,8 @@ Body: `{ title, note?, project?, column?, priority? }`. Column is one of
 `backlog | todo | doing | review | done` (default `backlog`); priority `low | med | high`
 (default `med`); `project` should be a folder name under `Code/` (defaults to
 unassigned). The server assigns the id and appends the card atomically —
-callers never need to read or send the whole board.
+callers never need to read or send the whole board. `507` means the board store
+is full (see *Board store full*); `koder-ticket.sh` prints the message.
 
 ```bash
 curl -sS -X POST \
@@ -334,7 +359,8 @@ Body: any subset of `{ title, note, priority, project, column }`. Finds the
 ticket anywhere on the projects board and applies the change atomically;
 fields you omit are left alone. 404 if neither an id nor a ref matches, 409 if
 a ref matches more than one ticket (the response lists the ids — pass one of
-them), 400 on an empty body (nothing to patch). Response:
+them), 400 on an empty body (nothing to patch), 507 if the edit would grow the
+board past the store cap (see *Board store full*). Response:
 `{ card, ref, column, rev }`, where `column` is where the ticket ended up.
 
 `column` moves the card — one of `backlog | todo | doing | review | done`. The
