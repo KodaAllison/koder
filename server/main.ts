@@ -1,22 +1,28 @@
-/* Koder sync server — Deno Deploy + Deno KV.
+/* Koder sync server — Deno Deploy + a pluggable Store (Deno KV today).
  *
  * The server is the canonical copy of the board; the PWA keeps localStorage
- * as an offline cache and syncs against this. One KV entry, ["board"], holds:
+ * as an offline cache and syncs against this. The board doc is
  *
  *   { rev: number, updatedAt: string|null, board: { projects, life, lifeMeta } }
  *
  * `board` is exactly the shape the client stores under kanban-hub-v1.
  *
+ * This file is the HTTP layer: routing, auth, body parsing, status codes,
+ * CORS and GitHub resolution. Persistence sits behind the Store interface
+ * (store.ts), chosen by KODER_STORE; the only backend so far is KvStore
+ * (kv-store.ts), which documents how the doc, snapshots, archive and webhook
+ * deliveries are laid out in KV.
+ *
  * Concurrency model: monotonic rev + conditional writes.
  *  - PUT /state must send the baseRev it last synced; a stale baseRev gets a
  *    409 and the client merges + retries. This is what stops an open browser
  *    tab from silently overwriting a ticket an agent just POSTed.
- *  - Writes go through kv.atomic().check() so two racing writers can't both
- *    land on the same rev.
+ *  - Every write is one atomic step in the store, so two racing writers can't
+ *    both land on the same rev.
  *
- * History / undo: every write also snapshots the new doc under ["board", rev]
- * and prunes the one KEEP_REVISIONS behind, so the last N boards survive a bad
- * push. Restore rolls the chosen snapshot forward as a fresh rev (rev never
+ * History / undo: every write also snapshots the new doc, and the store keeps
+ * the last N (Store.limits.keptRevisions), so a bad push is recoverable.
+ * Restore rolls the chosen snapshot forward as a fresh rev (rev never
  * rewinds), so open tabs pull it back like any other change.
  *
  * Terminology — "rev" means different things depending on where you see it:
@@ -48,23 +54,24 @@
  *   GET   /archive      → everything archived so far, newest first
  *
  * Any board write the store can't hold answers 507 { error: "board store full:
- * N of M bytes …", size, limit } (413 for PUT /state) — see STORE_VALUE_MAX.
+ * N of M bytes …", size, limit } (413 for PUT /state) — see StoreFullError.
  *
  * GitHub webhook (no bearer fallback; requires a valid HMAC made with
  * `KODER_WEBHOOK_SECRET`):
  *   POST  /webhooks/github → trusted PR events move a visible-ref ticket
  *
- * Archive: the board is ONE KV value, so it can only ever hold 64KB as stored
- * (see STORE_VALUE_MAX — a write past that is a 507 "board store full"), and Done
+ * Archive: the board can only ever hold Store.limits.boardBytes (64KB as
+ * stored, under KV — a write past that is a 507 "board store full"), and Done
  * is the only column that only ever grows. The archive is where done cards go
- * to stop counting against that budget — a separate, append-only, chunked set
- * of keys under ["archive", n], each sealed well short of the 64KB value cap.
- * Nothing else reads it; it exists so finishing work can't eventually wedge
- * sync (see js/archive.js).
+ * to stop counting against that budget — append-only and separate from the
+ * board. Nothing else reads it; it exists so finishing work can't eventually
+ * wedge sync (see js/archive.js and kv-store.ts).
  *
  * Env: KODER_TOKEN (required), KODER_WEBHOOK_SECRET (required for the GitHub
  * webhook), KODER_ORIGIN (optional — lock CORS to the deployed board origin
- * instead of "*" once you know it), PORT (optional; defaults to 8000), and
+ * instead of "*" once you know it), PORT (optional; defaults to 8000),
+ * KODER_STORE (optional storage backend: "kv", the default, is the only one
+ * implemented; "pg" and "dual" fail at startup until they are), and
  * KODER_KV_PATH (optional local/test database path; unset on Deno Deploy).
  *
  * Local dev:  KODER_TOKEN=dev deno task dev   (see deno.json)
@@ -73,42 +80,50 @@
 import { serveDir } from "jsr:@std/http/file-server";
 import { fromFileUrl } from "jsr:@std/path";
 import { timingSafeEqual } from "node:crypto";
-import { serialize } from "node:v8";
 /* The SAME derivation the board renders with — js/ref.js is dependency-free
  * plain ESM precisely so this import works and the two can't drift on what a
  * ref means. Deno does not type-check imported .js (no checkJs in deno.json),
  * so the JSDoc types there are advisory here. */
 import { ticketRef } from "../js/ref.js";
-import { nextWebhookRevision } from "./workflow.ts";
 import { createGithubResolver, GITHUB_REPOS, parsePullRef } from "./github.ts";
+import {
+  type ArchivedCard,
+  type Board,
+  type Card,
+  type PutResult,
+  type Store,
+  StoreContentionError,
+  StoreFullError,
+  type TicketEdits,
+} from "./store.ts";
+import { KvStore } from "./kv-store.ts";
 
-const KV_PATH = Deno.env.get("KODER_KV_PATH") || undefined;
-const kv = await Deno.openKv(KV_PATH);
 const TOKEN = Deno.env.get("KODER_TOKEN") ?? "";
 const WEBHOOK_SECRET = Deno.env.get("KODER_WEBHOOK_SECRET") ?? "";
 const GITHUB_TOKEN = Deno.env.get("GITHUB_TOKEN") ?? "";
 const PORT = Number(Deno.env.get("PORT") ?? "8000");
-const KEY = ["board"];
-const GITHUB_DELIVERY_KEY = ["github-delivery"];
 const GITHUB_BODY_MAX = 256 * 1024;
 
+/* Pick the storage backend once, at startup. Anything but a working backend
+ * fails here — before the listener opens — rather than on the first request,
+ * so a mistyped or not-yet-built KODER_STORE is a deploy failure, not a board
+ * that answers 500s. "pg" and "dual" are reserved for the Postgres phases of
+ * docs/specs/storage-expansion.md. */
+async function openStore(): Promise<Store> {
+  const backend = Deno.env.get("KODER_STORE") || "kv";
+  switch (backend) {
+    case "kv":
+      return await KvStore.open(Deno.env.get("KODER_KV_PATH") || undefined);
+    case "pg":
+    case "dual":
+      throw new Error(`KODER_STORE=${backend} is not implemented yet; only "kv" is available`);
+    default:
+      throw new Error(`unknown KODER_STORE "${backend}"; expected "kv", "pg" or "dual"`);
+  }
+}
+const store = await openStore();
+
 const githubResolver = createGithubResolver(GITHUB_TOKEN);
-
-// How many past revisions to keep as restore points. Snapshots live under
-// ["board", rev]; a prefix list on KEY returns exactly these (the current
-// pointer ["board"] equals the prefix and is excluded). Each is a full board
-// copy — cheap, and every write prunes the one this far behind.
-const KEEP_REVISIONS = 20;
-
-// Archived cards live under ["archive", n], separate from the board so they
-// stop counting against its budget.
-const ARCHIVE_KEY = ["archive"];
-// Seal a chunk once appending would take it past this many stored bytes
-// (measured like the board — see STORE_VALUE_MAX). The gap to KV's 64KB value
-// cap is deliberate: one append carries at most a whole board's worth of cards,
-// which is under the cap by construction, so a chunk that starts empty still
-// lands under it.
-const ARCHIVE_CHUNK_MAX = 50_000;
 
 // Repo root (this file is in server/) — where the PWA's static files live, so
 // one app can serve the frontend and the API. Derive from the module URL;
@@ -128,110 +143,13 @@ const NOTE_MAX = 5000;
 // The parts of a ticket a caller may set. Four of them live on the card;
 // `column` is the board key the card sits under, not a field on the card.
 const SETTABLE_FIELDS = ["title", "note", "priority", "project", "column"] as const;
-type TicketFields = {
-  title?: string;
-  note?: string;
-  priority?: string;
-  project?: string | null;
-  column?: string;
-};
+type TicketFields = TicketEdits & { column?: string };
 
-type Card = {
-  id: string;
-  title: string;
-  note: string;
-  priority: string;
-  created: number;
-  project: string | null;
-  pr?: string;
-  prRev?: number;
-};
-type Board = {
-  projects: Record<string, Card[]>;
-  life: Record<string, Card[]>;
-  lifeMeta: Record<string, unknown>;
-};
-type Doc = {
-  rev: number; // the HEAD revision — see the "Terminology" note above
-  updatedAt: string | null;
-  board: Board;
-};
-type DeliveryGuard = {
-  key: Deno.KvKey;
-  entry: Deno.KvEntryMaybe<boolean>;
-};
-// A card as it looks once off the board: the client tags it with the board it
-// came from and when it left, so an archive read is legible on its own.
-type ArchivedCard = Card & { board?: string; archivedAt?: number };
-
-function emptyDoc(): Doc {
-  return { rev: 0, updatedAt: null, board: { projects: {}, life: {}, lifeMeta: {} } };
-}
-
-/* The board store's real capacity. The whole Doc is ONE Deno KV value, and KV
- * caps a value at 65,536 bytes of its V8 structured-clone serialization — not
- * of JSON. V8 writes a string as one byte per char only if every char is
- * Latin-1; a single em dash or arrow makes the whole string two bytes per
- * char. Ticket notes are full of those, so a board that is ~48KB as JSON can
- * already be 64KB as stored. node:v8 serialize() is the same encoding KV uses
- * (byte-for-byte, header included), so measuring with it checks against the
- * cap KV will actually enforce. */
-const STORE_VALUE_MAX = 65_536;
-
-class StoreFullError extends Error {
-  constructor(readonly size: number) {
-    super(
-      `board store full: ${size} of ${STORE_VALUE_MAX} bytes` +
-        " — archive done tickets to free space",
-    );
-  }
-}
-
-/* Every write that commits a board goes through commitDoc, so this is the one
- * place the size is checked: an oversized doc throws StoreFullError, which the
- * request handler turns into a 507 (PUT /state answers 413 instead). Its body
- * is { error, size, limit }. */
+/* Every board write in the store checks the size in one place: an oversized
+ * doc throws StoreFullError, which the request handler turns into a 507
+ * (PUT /state answers 413 instead). Its body is { error, size, limit }. */
 function storeFullBody(err: StoreFullError) {
-  return { error: err.message, size: err.size, limit: STORE_VALUE_MAX };
-}
-
-/* Commit a new doc as one atomic step: advance the current pointer, snapshot
- * the doc under ["board", rev], and prune the snapshot KEEP_REVISIONS behind.
- * `check(entry)` guards against a concurrent writer landing on the same rev.
- * All writers (PUT, POST, PATCH, DELETE, restore, webhook) go through here so a
- * snapshot can never diverge from the rev that produced it — and so every one
- * of them gets the store-size check. Throws StoreFullError if the doc can't
- * fit in one KV value. */
-async function commitDoc(entry: Deno.KvEntryMaybe<Doc>, doc: Doc, delivery?: DeliveryGuard) {
-  const size = serialize(doc).byteLength;
-  if (size > STORE_VALUE_MAX) throw new StoreFullError(size);
-  try {
-    const atomic = kv.atomic().check(entry);
-    if (delivery) atomic.check(delivery.entry);
-    atomic.set(KEY, doc)
-      .set([...KEY, doc.rev], doc)
-      .delete([...KEY, doc.rev - KEEP_REVISIONS]);
-    if (delivery) {
-      atomic.set(delivery.key, true);
-    }
-    return await atomic.commit();
-  } catch (err) {
-    // Belt and braces: if the backend ever measures differently from the check
-    // above, its own "Value too large" still becomes a clear store-full error
-    // rather than a bare 500.
-    if (err instanceof Error && /value too large/i.test(err.message)) {
-      throw new StoreFullError(size);
-    }
-    throw err;
-  }
-}
-
-function recordDelivery(entry: Deno.KvEntryMaybe<Doc>, delivery: DeliveryGuard) {
-  return kv.atomic()
-    .check(entry)
-    .check(delivery.entry)
-    .set(delivery.key, true)
-    .commit();
+  return { error: err.message, size: err.size, limit: err.limit };
 }
 
 /* Light shape check for a client-PUT board. The client's normalize() repairs
@@ -313,81 +231,6 @@ function cleanTicketFields(
   return { fields };
 }
 
-/* Every archive chunk, oldest first. Callers read the whole set: it's how a
- * POST dedupes by id across chunks, and the volume is a personal board's
- * finished tickets, not a data warehouse. */
-async function readArchiveChunks(): Promise<{ index: number; cards: ArchivedCard[] }[]> {
-  const chunks: { index: number; cards: ArchivedCard[] }[] = [];
-  for await (const e of kv.list<ArchivedCard[]>({ prefix: ARCHIVE_KEY })) {
-    const index = Number(e.key[e.key.length - 1]);
-    if (Number.isInteger(index) && Array.isArray(e.value)) chunks.push({ index, cards: e.value });
-  }
-  chunks.sort((a, b) => a.index - b.index);
-  return chunks;
-}
-
-/* Resolve a caller-supplied identifier to a card id, accepting either form:
- * the raw id (t_msa8scco_632be) or the ref the board shows (KODER-632B).
- *
- * Exact id match wins outright. Ids are unique and authoritative — they're the
- * merge key — so checking them first keeps every existing caller working
- * unchanged and means a ref can never shadow a real id.
- *
- * A ref is a truncation, so it CAN match more than one ticket. That's refused
- * rather than resolved arbitrarily: silently patching one of two tickets that
- * share a ref is the one failure mode worse than not patching at all. */
-function resolveTicketId(
-  board: Board,
-  given: string,
-): { id: string } | { error: Record<string, unknown>; status: number } {
-  const allCards = Object.values(board.projects ?? {}).flatMap((cards) => cards ?? []);
-  const byId = allCards.find((c) => c.id === given);
-  if (byId) return { id: byId.id };
-
-  const wanted = given.trim().toUpperCase();
-  const matches = allCards.filter((c) => ticketRef(c).toUpperCase() === wanted);
-  if (matches.length === 1) return { id: matches[0].id };
-  if (matches.length > 1) {
-    return {
-      status: 409,
-      error: {
-        error: `ref "${given}" matches ${matches.length} tickets — use the id instead`,
-        ids: matches.map((c) => c.id),
-      },
-    };
-  }
-  return { status: 404, error: { error: `no ticket with id or ref "${given}"` } };
-}
-
-const hasOwn = (value: object, key: PropertyKey) =>
-  Object.prototype.hasOwnProperty.call(value, key);
-
-/* pr/prRev are workflow state, not browser-editable card fields. A full-board
- * sync may move or edit a card, but it must carry the current server values
- * exactly. New cards (and legacy cards without workflow state) cannot acquire
- * either field from an untrusted PUT. */
-function preserveWorkflowMetadata(incoming: Board, current: Board): Board {
-  const board = structuredClone(incoming);
-  const currentCards = new Map<string, Card>();
-  for (const boardId of ["projects", "life"] as const) {
-    for (const cards of Object.values(current[boardId] ?? {})) {
-      for (const card of cards ?? []) currentCards.set(card.id, card);
-    }
-  }
-  for (const boardId of ["projects", "life"] as const) {
-    for (const cards of Object.values(board[boardId] ?? {})) {
-      for (const card of cards ?? []) {
-        const authoritative = currentCards.get(card.id);
-        delete card.pr;
-        delete card.prRev;
-        if (authoritative && hasOwn(authoritative, "pr")) card.pr = authoritative.pr;
-        if (authoritative && hasOwn(authoritative, "prRev")) card.prRev = authoritative.prRev;
-      }
-    }
-  }
-  return board;
-}
-
 async function validGithubSignature(raw: Uint8Array<ArrayBuffer>, signature: string): Promise<boolean> {
   const key = await crypto.subtle.importKey(
     "raw",
@@ -440,43 +283,6 @@ async function readGithubBody(
   return { raw };
 }
 
-function resolveVisibleTicket(
-  board: Board,
-  text: string,
-): { id: string; ref: string } | { error: Record<string, unknown>; status: number } | null {
-  const candidates = new Set(
-    Array.from(text.matchAll(/\b[A-Z0-9]+-[A-Z0-9]{4}\b/gi), (match) => match[0].toUpperCase()),
-  );
-  const matches = new Map<string, string>();
-  for (const candidate of candidates) {
-    const resolved = resolveTicketId(board, candidate);
-    if ("error" in resolved) {
-      if (resolved.status === 409) return resolved;
-      continue;
-    }
-    matches.set(resolved.id, candidate);
-  }
-  if (matches.size === 0) return null;
-  if (matches.size > 1) {
-    return {
-      status: 409,
-      error: {
-        error: "PR title/body references more than one ticket",
-        refs: [...matches.values()],
-      },
-    };
-  }
-  const [[id, ref]] = matches;
-  return { id, ref };
-}
-
-function isNewerSameRepoPr(current: string, incoming: string): boolean {
-  const currentMatch = current.match(/^(.+)#([1-9][0-9]*)$/);
-  const incomingMatch = incoming.match(/^(.+)#([1-9][0-9]*)$/);
-  if (!currentMatch || !incomingMatch || currentMatch[1] !== incomingMatch[1]) return false;
-  return Number(incomingMatch[2]) > Number(currentMatch[2]);
-}
-
 const CORS: Record<string, string> = {
   "Access-Control-Allow-Origin": Deno.env.get("KODER_ORIGIN") ?? "*",
   "Access-Control-Allow-Methods": "GET, PUT, POST, PATCH, DELETE, OPTIONS",
@@ -496,16 +302,11 @@ async function recordGithubNoop(
   body: Record<string, unknown>,
   status: number,
 ): Promise<Response> {
-  const key = [...GITHUB_DELIVERY_KEY, deliveryId];
-  for (let attempt = 0; attempt < 5; attempt++) {
-    const entry = await kv.get<Doc>(KEY);
-    const delivery: DeliveryGuard = { key, entry: await kv.get<boolean>(key) };
-    if (delivery.entry.value) {
-      return json({ updated: false, redelivered: true, rev: (entry.value ?? emptyDoc()).rev });
-    }
-    if ((await recordDelivery(entry, delivery)).ok) return json(body, status);
+  const recorded = await store.recordDelivery(deliveryId);
+  if (recorded.kind === "redelivered") {
+    return json({ updated: false, redelivered: true, rev: recorded.rev });
   }
-  return json({ error: "write contention, retry" }, 503);
+  return json(body, status);
 }
 
 /* The authenticated API surface. A GET to anything else is a static frontend
@@ -517,12 +318,14 @@ function isApiPath(p: string): boolean {
 
 /* A write that can't fit the store is a 507 on every route (a valid request
  * the server has no room for), never a bare 500. PUT /state handles its own
- * case first to keep its long-standing 413. */
+ * case first to keep its long-standing 413. A server-side read-modify-write
+ * that keeps losing races is a 503 the caller can retry. */
 Deno.serve({ port: PORT }, async (req: Request) => {
   try {
     return await handle(req);
   } catch (err) {
     if (err instanceof StoreFullError) return json(storeFullBody(err), 507);
+    if (err instanceof StoreContentionError) return json({ error: err.message }, 503);
     throw err;
   }
 });
@@ -555,10 +358,8 @@ async function handle(req: Request): Promise<Response> {
     if (!await validGithubSignature(raw, signature)) {
       return json({ error: "invalid webhook signature" }, 401);
     }
-    const deliveryKey = [...GITHUB_DELIVERY_KEY, deliveryId];
-    if ((await kv.get<boolean>(deliveryKey)).value) {
-      const entry = await kv.get<Doc>(KEY);
-      return json({ updated: false, redelivered: true, rev: (entry.value ?? emptyDoc()).rev });
+    if (await store.hasDelivery(deliveryId)) {
+      return json({ updated: false, redelivered: true, rev: (await store.getHead()).rev });
     }
     if (req.headers.get("X-GitHub-Event") !== "pull_request") {
       return await recordGithubNoop(deliveryId, { ignored: "unsupported event" }, 202);
@@ -619,73 +420,22 @@ async function handle(req: Request): Promise<Response> {
 
     const pr = `${repo}#${pullRequest.number}`;
     const text = `${pullRequest.title}\n${pullRequest.body ?? ""}`;
-    for (let attempt = 0; attempt < 5; attempt++) {
-      const entry = await kv.get<Doc>(KEY);
-      const delivery: DeliveryGuard = {
-        key: deliveryKey,
-        entry: await kv.get<boolean>(deliveryKey),
-      };
-      if (delivery.entry.value) {
-        return json({ updated: false, redelivered: true, rev: (entry.value ?? emptyDoc()).rev });
-      }
-      const cur = structuredClone(entry.value ?? emptyDoc());
-      const resolved = resolveVisibleTicket(cur.board, text);
-      if (!resolved) {
-        if (!(await recordDelivery(entry, delivery)).ok) continue;
-        return json({ ignored: "no ticket ref" }, 202);
-      }
-      if ("error" in resolved) {
-        if (!(await recordDelivery(entry, delivery)).ok) continue;
-        return json(resolved.error, resolved.status);
-      }
-
-      let card: Card | null = null;
-      let from: string | null = null;
-      let fromCards: Card[] | null = null;
-      let cardIndex = -1;
-      for (const [column, cards] of Object.entries(cur.board.projects ?? {})) {
-        const index = (cards ?? []).findIndex((candidate) => candidate.id === resolved.id);
-        if (index !== -1) {
-          from = column;
-          fromCards = cards;
-          cardIndex = index;
-          card = cards[index];
-          break;
-        }
-      }
-      if (!card || from === null || !fromCards || cardIndex < 0) {
-        if (!(await recordDelivery(entry, delivery)).ok) continue;
-        return json({ ignored: "ticket no longer exists" }, 202);
-      }
-      if (from === "done" && target === "review") {
-        if (!(await recordDelivery(entry, delivery)).ok) continue;
-        return json({ ignored: "done is terminal for webhook events", ref: resolved.ref }, 202);
-      }
-      if (card.pr && card.pr !== pr && !isNewerSameRepoPr(card.pr, pr)) {
-        if (!(await recordDelivery(entry, delivery)).ok) continue;
-        return json({ ignored: "stale or cross-repository PR association", ref: resolved.ref }, 202);
-      }
-      if (from === target && card.pr === pr) {
-        if (!(await recordDelivery(entry, delivery)).ok) continue;
-        return json({ updated: false, ref: resolved.ref, column: from, pr, rev: cur.rev });
-      }
-      card.pr = pr;
-      card.prRev = nextWebhookRevision(card.prRev);
-      if (from !== target) {
-        fromCards.splice(cardIndex, 1);
-        (cur.board.projects[target] ??= []).push(card);
-      }
-      const doc: Doc = {
-        rev: cur.rev + 1,
-        updatedAt: new Date().toISOString(),
-        board: cur.board,
-      };
-      const result = await commitDoc(entry, doc, delivery);
-      if (result.ok) {
-        return json({ updated: true, ref: resolved.ref, column: target, pr, rev: doc.rev });
-      }
+    /* The store decides the outcome against the board it reads and records the
+     * delivery atomically with it — and with the card move, when there is one
+     * (see applyWebhookEvent in store.ts for the transition rules). */
+    const result = await store.commitWebhookMove({ deliveryId, pr, target, text });
+    switch (result.kind) {
+      case "redelivered":
+        return json({ updated: false, redelivered: true, rev: result.rev });
+      case "ignored":
+        return json({ ignored: result.ignored, ref: result.ref }, 202);
+      case "refused":
+        return json(result.error, result.status);
+      case "unchanged":
+        return json({ updated: false, ref: result.ref, column: result.column, pr, rev: result.rev });
+      case "moved":
+        return json({ updated: true, ref: result.ref, column: result.column, pr, rev: result.rev });
     }
-    return json({ error: "write contention, retry" }, 503);
   }
 
   if (!TOKEN) return json({ error: "server misconfigured: KODER_TOKEN not set" }, 500);
@@ -711,8 +461,7 @@ async function handle(req: Request): Promise<Response> {
    * cards are resolved. There is deliberately no caller-supplied repo/number. */
   if (url.pathname === "/pr-status") {
     if (req.method !== "GET") return json({ error: "method not allowed" }, 405);
-    const entry = await kv.get<Doc>(KEY);
-    const refs = Object.values((entry.value ?? emptyDoc()).board.projects ?? {})
+    const refs = Object.values((await store.readBoard()).board.projects ?? {})
       .flatMap((cards) => cards ?? []).map((card) => card.pr);
     const validCount = refs.filter((ref) => parsePullRef(ref) !== null).length;
     if (validCount === 0) return json({});
@@ -729,68 +478,51 @@ async function handle(req: Request): Promise<Response> {
       if (!Number.isInteger(requestedRev) || requestedRev < 0) {
         return json({ error: "rev must be a non-negative integer" }, 400);
       }
-      const snap = await kv.get<Doc>([...KEY, requestedRev]);
-      if (!snap.value) {
-        return json({ error: `no snapshot for rev ${requestedRev} (only the last ${KEEP_REVISIONS} are kept)` }, 404);
+      const snap = await store.boardAt(requestedRev);
+      if (!snap) {
+        return json({ error: `no snapshot for rev ${requestedRev} (only the last ${store.limits.keptRevisions} are kept)` }, 404);
       }
-      return json(snap.value);
+      return json(snap);
     }
-    const entry = await kv.get<Doc>(KEY);
-    return json(entry.value ?? emptyDoc());
+    return json(await store.readBoard());
   }
 
   /* ---- GET /revisions: the kept restore points, newest first ---- */
   if (url.pathname === "/revisions" && req.method === "GET") {
-    const revisions: { rev: number; updatedAt: string | null }[] = [];
-    for await (const e of kv.list<Doc>({ prefix: KEY })) {
-      if (e.value) revisions.push({ rev: e.value.rev, updatedAt: e.value.updatedAt });
-    }
-    revisions.sort((a, b) => b.rev - a.rev);
-    return json({ revisions });
+    return json({ revisions: await store.listRevisions() });
   }
 
   /* ---- POST /state/restore: re-land a snapshot as a new head rev ----
    * Undo without rewinding: the old board becomes the newest rev, so clients
-   * pull it back through the normal rev>SYNC.rev path. Same atomic + retry
-   * shape as the ticket writers. The body's `rev` names the snapshot to
-   * restore FROM (history), which is a different thing from `doc.rev` below
-   * (the new HEAD this restore produces) — kept as separate locals so the
-   * two don't get confused. */
+   * pull it back through the normal rev>SYNC.rev path. The body's `rev`
+   * names the snapshot to restore FROM (history), which is a different thing
+   * from `restored.rev` below (the new HEAD this restore produces) — kept as
+   * separate locals so the two don't get confused. */
   if (url.pathname === "/state/restore" && req.method === "POST") {
     const body = await req.json().catch(() => null);
     if (!body || typeof body.rev !== "number" || !Number.isInteger(body.rev)) {
       return json({ error: "rev (integer) is required" }, 400);
     }
     const targetRev = body.rev;
-    const snap = await kv.get<Doc>([...KEY, targetRev]);
-    if (!snap.value) {
-      return json({ error: `no snapshot for rev ${targetRev} (only the last ${KEEP_REVISIONS} are kept)` }, 404);
+    const restored = await store.restore(targetRev);
+    if (!restored) {
+      return json({ error: `no snapshot for rev ${targetRev} (only the last ${store.limits.keptRevisions} are kept)` }, 404);
     }
-    for (let attempt = 0; attempt < 5; attempt++) {
-      const entry = await kv.get<Doc>(KEY);
-      const cur = entry.value ?? emptyDoc();
-      const doc: Doc = {
-        rev: cur.rev + 1,
-        updatedAt: new Date().toISOString(),
-        board: snap.value.board,
-      };
-      const res = await commitDoc(entry, doc);
-      if (res.ok) return json({ rev: doc.rev, restoredFrom: targetRev, updatedAt: doc.updatedAt });
-    }
-    return json({ error: "write contention, retry" }, 503);
+    return json({ rev: restored.rev, restoredFrom: targetRev, updatedAt: restored.updatedAt });
   }
 
   /* ---- PUT /state: full-board write, conditional on baseRev ---- */
   if (url.pathname === "/state" && req.method === "PUT") {
-    // The real size check is commitDoc's, against the stored encoding (see
-    // STORE_VALUE_MAX). This only refuses to parse a body that couldn't
+    // The real size check is the store's, against what it actually stores
+    // (see StoreFullError). This only refuses to parse a body that couldn't
     // possibly fit, with the same message shape.
+    const limit = store.limits.boardBytes;
     const raw = await req.text();
-    if (raw.length > 4 * STORE_VALUE_MAX) {
+    if (raw.length > 4 * limit) {
       return json({
         error: `board too large: request body is ${raw.length} characters,` +
-          ` store holds ${STORE_VALUE_MAX} bytes — archive done tickets to free space`,
-        limit: STORE_VALUE_MAX,
+          ` store holds ${limit} bytes — archive done tickets to free space`,
+        limit,
       }, 413);
     }
     let body: { baseRev?: unknown; board?: unknown };
@@ -802,27 +534,23 @@ async function handle(req: Request): Promise<Response> {
     if (!body || typeof body !== "object" || !isBoardShaped(body.board)) {
       return json({ error: "expected { baseRev, board } with board-shaped board" }, 400);
     }
-    const entry = await kv.get<Doc>(KEY);
-    const cur = entry.value ?? emptyDoc();
-    if (typeof body.baseRev !== "number" || body.baseRev !== cur.rev) {
-      return json({ error: "conflict: baseRev is stale", rev: cur.rev }, 409);
+    if (typeof body.baseRev !== "number") {
+      return json({ error: "conflict: baseRev is stale", rev: (await store.getHead()).rev }, 409);
     }
-    const doc: Doc = {
-      rev: cur.rev + 1,
-      updatedAt: new Date().toISOString(),
-      board: preserveWorkflowMetadata(body.board, cur.board),
-    };
-    let res: Deno.KvCommitResult | Deno.KvCommitError;
+    let res: PutResult;
     try {
-      res = await commitDoc(entry, doc);
+      // The store keeps the current server pr/prRev on every card, whatever
+      // the body says (see preserveWorkflowMetadata in store.ts).
+      res = await store.applyBoardPut(body.baseRev, body.board);
     } catch (err) {
       // The whole board was sent, so "too big" is the request's fault: 413,
       // which the PWA already reads as "archive done cards".
       if (err instanceof StoreFullError) return json(storeFullBody(err), 413);
       throw err;
     }
-    if (!res.ok) return json({ error: "conflict: concurrent write, retry" }, 409);
-    return json({ rev: doc.rev, updatedAt: doc.updatedAt });
+    if (res.kind === "stale") return json({ error: "conflict: baseRev is stale", rev: res.rev }, 409);
+    if (res.kind === "conflict") return json({ error: "conflict: concurrent write, retry" }, 409);
+    return json({ rev: res.rev, updatedAt: res.updatedAt });
   }
 
   /* ---- POST /archive: lift finished cards off the board ----
@@ -842,61 +570,37 @@ async function handle(req: Request): Promise<Response> {
     });
     if (!incoming.length) return json({ error: "no id/title-shaped cards in body" }, 400);
 
-    for (let attempt = 0; attempt < 5; attempt++) {
-      const chunks = await readArchiveChunks();
-      const seen = new Set(chunks.flatMap((c) => c.cards.map((card) => card.id)));
-      const fresh = incoming.filter((c) => !seen.has(c.id));
+    const res = await store.archive(incoming);
+    switch (res.kind) {
       // Already archived in full — an idempotent no-op, not an error, so a
       // client retrying a request that actually landed still gets to move on.
-      if (!fresh.length) {
-        return json({ archived: 0, duplicates: incoming.length, chunks: chunks.length });
-      }
-
-      const last = chunks[chunks.length - 1];
-      // Start a fresh chunk when appending would overflow the current one.
-      const sealed = !last ||
-        serialize([...last.cards, ...fresh]).byteLength > ARCHIVE_CHUNK_MAX;
-      const index = last ? (sealed ? last.index + 1 : last.index) : 0;
-
-      const entry = await kv.get<ArchivedCard[]>([...ARCHIVE_KEY, index]);
-      const next = [...(entry.value ?? []), ...fresh];
+      case "duplicates":
+        return json({ archived: 0, duplicates: res.duplicates, chunks: res.chunks });
       // A board under the cap can't produce this, but the body is the
-      // caller's, so refuse rather than let KV throw a bare 500.
-      const nextSize = serialize(next).byteLength;
-      if (nextSize > STORE_VALUE_MAX) {
+      // caller's, so refuse rather than let the store throw a bare 500.
+      case "tooLarge":
         return json({
-          error: `archive batch too large: ${nextSize} of ${STORE_VALUE_MAX} bytes — send fewer cards`,
-          size: nextSize,
-          limit: STORE_VALUE_MAX,
+          error: `archive batch too large: ${res.size} of ${res.limit} bytes — send fewer cards`,
+          size: res.size,
+          limit: res.limit,
         }, 413);
-      }
-      const res = await kv.atomic().check(entry)
-        .set([...ARCHIVE_KEY, index], next).commit();
-      if (res.ok) {
-        return json({
-          archived: fresh.length,
-          duplicates: incoming.length - fresh.length,
-          chunk: index,
-        });
-      }
+      case "archived":
+        return json({ archived: res.archived, duplicates: res.duplicates, chunk: res.chunk });
     }
-    return json({ error: "write contention, retry" }, 503);
   }
 
   /* ---- GET /archive: everything lifted off the board, newest first ---- */
   if (url.pathname === "/archive" && req.method === "GET") {
-    const chunks = await readArchiveChunks();
-    const cards = chunks.flatMap((c) => c.cards);
+    const { chunks, cards } = await store.readArchive();
     cards.sort((a, b) => (b.archivedAt ?? 0) - (a.archivedAt ?? 0));
-    return json({ count: cards.length, chunks: chunks.length, cards });
+    return json({ count: cards.length, chunks, cards });
   }
 
   /* ---- GET /tickets: compact read for agents ----
    * Flattens the projects board into one list with a `column` field, so a
    * caller can see work without understanding the board document. */
   if (url.pathname === "/tickets" && req.method === "GET") {
-    const entry = await kv.get<Doc>(KEY);
-    const board = (entry.value ?? emptyDoc()).board;
+    const board = (await store.readBoard()).board;
     const project = url.searchParams.get("project");
     const column = url.searchParams.get("column");
     const tickets: (Card & { column: string; ref: string })[] = [];
@@ -938,38 +642,10 @@ async function handle(req: Request): Promise<Response> {
    * board. The old board remains recoverable through revision snapshots. */
   if (ticketMatch && req.method === "DELETE") {
     const given = ticketMatch[1];
-    for (let attempt = 0; attempt < 5; attempt++) {
-      const entry = await kv.get<Doc>(KEY);
-      const cur = structuredClone(entry.value ?? emptyDoc());
-      // Resolve on every attempt, just like PATCH, so a newly ambiguous ref
-      // can never select an arbitrary ticket after write contention.
-      const resolved = resolveTicketId(cur.board, given);
-      if ("error" in resolved) return json(resolved.error, resolved.status);
-
-      let card: Card | null = null;
-      let column: string | null = null;
-      for (const [col, cards] of Object.entries(cur.board.projects ?? {})) {
-        const index = (cards ?? []).findIndex((candidate) => candidate.id === resolved.id);
-        if (index !== -1) {
-          card = cards.splice(index, 1)[0];
-          column = col;
-          break;
-        }
-      }
-      if (!card || column === null) {
-        return json({ error: `no ticket with id or ref "${given}"` }, 404);
-      }
-      const doc: Doc = {
-        rev: cur.rev + 1,
-        updatedAt: new Date().toISOString(),
-        board: cur.board,
-      };
-      const res = await commitDoc(entry, doc);
-      if (res.ok) {
-        return json({ card, ref: ticketRef(card), column, rev: doc.rev, board: doc.board });
-      }
-    }
-    return json({ error: "write contention, retry" }, 503);
+    const res = await store.deleteTicket(given);
+    if (res.kind === "unresolved") return json(res.error, res.status);
+    const { card, column, rev, board } = res;
+    return json({ card, ref: ticketRef(card), column, rev, board });
   }
 
   if (ticketMatch && req.method === "PATCH") {
@@ -988,42 +664,9 @@ async function handle(req: Request): Promise<Response> {
     if (column === undefined && Object.keys(edits).length === 0) {
       return json({ error: "nothing to patch", settable: SETTABLE_FIELDS }, 400);
     }
-    for (let attempt = 0; attempt < 5; attempt++) {
-      const entry = await kv.get<Doc>(KEY);
-      const cur = structuredClone(entry.value ?? emptyDoc());
-      // Resolved inside the retry loop, against the board this attempt will
-      // actually write: a ref could start matching a second ticket between
-      // attempts, and that has to be caught rather than raced past.
-      const resolved = resolveTicketId(cur.board, given);
-      if ("error" in resolved) return json(resolved.error, resolved.status);
-      const id = resolved.id;
-      let card: Card | null = null;
-      let from: string | null = null;
-      for (const [col, cards] of Object.entries(cur.board.projects ?? {})) {
-        const i = (cards ?? []).findIndex((c) => c.id === id);
-        if (i !== -1) {
-          from = col;
-          // Only lift the card out when we're moving it — an edit with no
-          // `column` must not reshuffle the column it already sits in.
-          card = column === undefined ? cards[i] : cards.splice(i, 1)[0];
-          break;
-        }
-      }
-      if (!card || from === null) return json({ error: `no ticket with id or ref "${given}"` }, 404);
-      Object.assign(card, edits);
-      if (column !== undefined) {
-        cur.board.projects ??= {};
-        (cur.board.projects[column] ??= []).push(card);
-      }
-      const doc: Doc = {
-        rev: cur.rev + 1,
-        updatedAt: new Date().toISOString(),
-        board: cur.board,
-      };
-      const res = await commitDoc(entry, doc);
-      if (res.ok) return json({ card, ref: ticketRef(card), column: column ?? from, rev: doc.rev });
-    }
-    return json({ error: "write contention, retry" }, 503);
+    const res = await store.patchTicket(given, { column, edits });
+    if (res.kind === "unresolved") return json(res.error, res.status);
+    return json({ card: res.card, ref: ticketRef(res.card), column: res.column, rev: res.rev });
   }
 
   /* ---- POST /tickets: the agent/CLI entrypoint ----
@@ -1065,21 +708,8 @@ async function handle(req: Request): Promise<Response> {
       project: fields.project ?? null,
     };
 
-    // Atomic append with a few retries in case a client PUT lands mid-flight.
-    for (let attempt = 0; attempt < 5; attempt++) {
-      const entry = await kv.get<Doc>(KEY);
-      const cur = structuredClone(entry.value ?? emptyDoc());
-      cur.board.projects ??= {};
-      (cur.board.projects[column] ??= []).push(card);
-      const doc: Doc = {
-        rev: cur.rev + 1,
-        updatedAt: new Date().toISOString(),
-        board: cur.board,
-      };
-      const res = await commitDoc(entry, doc);
-      if (res.ok) return json({ card, ref: ticketRef(card), rev: doc.rev }, 201);
-    }
-    return json({ error: "write contention, retry" }, 503);
+    const { rev } = await store.createTicket(card, column);
+    return json({ card, ref: ticketRef(card), rev }, 201);
   }
 
   return json({ error: "not found" }, 404);
