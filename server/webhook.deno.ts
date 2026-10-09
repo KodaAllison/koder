@@ -1490,6 +1490,552 @@ Deno.test({
         },
       );
 
+      /* ---- Routes the webhook-centred steps above don't reach: archive,
+       * revisions, restore/snapshot lookups, and ticket create/edit. Only
+       * behaviour every backend must share is asserted; anything that pins
+       * KV's limits is kvOnly (below). ---- */
+      const call = (method: string, path: string, body?: unknown, raw?: string) =>
+        fetch(`${baseUrl}${path}`, {
+          method,
+          headers: {
+            Authorization: `Bearer ${TOKEN}`,
+            ...(method === "GET" ? {} : { "Content-Type": "application/json" }),
+          },
+          body: method === "GET" ? undefined : (raw ?? JSON.stringify(body)),
+        });
+      const errorOf = async (res: Response) => (await res.json() as { error: unknown }).error;
+      // The board and rev are exactly as they were: a refused write left no trace.
+      const assertUntouched = async (before: Doc) => {
+        const after = await getState(baseUrl);
+        assert.equal(after.rev, before.rev);
+        assert.deepEqual(after.board, before.board);
+      };
+
+      type ArchiveRead = { count: number; chunks: number; cards: (Card & { archivedAt?: number })[] };
+      const readArchive = async () => {
+        const res = await call("GET", "/archive");
+        assert.equal(res.status, 200);
+        return await res.json() as ArchiveRead;
+      };
+      const archived = (id: string, archivedAt: number) => ({
+        ...card(id, "koder", { note: `note for ${id}` }),
+        board: "projects",
+        archivedAt,
+      });
+
+      await t.step(
+        "archive is append-only and idempotent by id, listed newest first",
+        async () => {
+          const boardBefore = await seedBoard(baseUrl, { todo: [card()] });
+          const before = await readArchive();
+          assert.deepEqual(Object.keys(before).sort(), ["cards", "chunks", "count"]);
+          assert.equal(before.count, before.cards.length);
+          assert.ok(Number.isInteger(before.chunks) && before.chunks >= 0);
+
+          const a = archived("t_arch_a001", 1000);
+          const b = archived("t_arch_b002", 3000);
+          const c = archived("t_arch_c003", 2000);
+          const first = await call("POST", "/archive", { cards: [a, b] });
+          assert.equal(first.status, 200);
+          const firstBody = await first.json() as Record<string, number>;
+          assert.deepEqual(Object.keys(firstBody).sort(), ["archived", "chunk", "duplicates"]);
+          assert.equal(firstBody.archived, 2);
+          assert.equal(firstBody.duplicates, 0);
+          assert.ok(Number.isInteger(firstBody.chunk) && firstBody.chunk >= 0);
+
+          const afterFirst = await readArchive();
+          assert.equal(afterFirst.count, before.count + 2);
+          assert.ok(afterFirst.chunks >= 1);
+          const mine = (read: ArchiveRead) => read.cards.filter((x) => x.id.startsWith("t_arch_"));
+          assert.deepEqual(mine(afterFirst).map((x) => x.id), ["t_arch_b002", "t_arch_a001"]);
+          assert.deepEqual(mine(afterFirst)[1], a);
+
+          // Retrying a request that already landed is a no-op, not an error.
+          const repeat = await call("POST", "/archive", { cards: [a, b] });
+          assert.equal(repeat.status, 200);
+          assert.deepEqual(await repeat.json(), {
+            archived: 0,
+            duplicates: 2,
+            chunks: afterFirst.chunks,
+          });
+          assert.equal((await readArchive()).count, before.count + 2);
+
+          // A mixed batch archives only the new ids and counts the rest.
+          const mixed = await call("POST", "/archive", { cards: [b, c] });
+          assert.equal(mixed.status, 200);
+          const mixedBody = await mixed.json() as { archived: number; duplicates: number };
+          assert.equal(mixedBody.archived, 1);
+          assert.equal(mixedBody.duplicates, 1);
+          const afterMixed = await readArchive();
+          assert.equal(afterMixed.count, before.count + 3);
+          assert.deepEqual(mine(afterMixed).map((x) => x.id), ["t_arch_b002", "t_arch_c003", "t_arch_a001"]);
+
+          // Entries that aren't id/title-shaped are dropped, not archived.
+          const junk = await call("POST", "/archive", {
+            cards: [{ id: "t_arch_notitle" }, 5, null, archived("t_arch_d004", 4000)],
+          });
+          assert.equal(junk.status, 200);
+          const junkBody = await junk.json() as { archived: number; duplicates: number };
+          assert.equal(junkBody.archived, 1);
+          assert.equal(junkBody.duplicates, 0);
+          const afterJunk = await readArchive();
+          assert.equal(afterJunk.count, before.count + 4);
+          assert.ok(!afterJunk.cards.some((x) => x.id === "t_arch_notitle"));
+
+          // The archive is a separate store: the board never moved.
+          await assertUntouched(boardBefore);
+        },
+      );
+
+      await t.step("archive refuses malformed bodies and needs the bearer token", async () => {
+        const boardBefore = await getState(baseUrl);
+        const before = await readArchive();
+        for (
+          const [name, body, raw] of [
+            ["not JSON", undefined, "not json"],
+            ["no body fields", {}, undefined],
+            ["cards not an array", { cards: "t_x" }, undefined],
+            ["empty cards", { cards: [] }, undefined],
+            ["no id/title-shaped card", { cards: [{ id: "t_arch_x" }, { title: "y" }, null, 7] }, undefined],
+          ] as [string, unknown, string | undefined][]
+        ) {
+          const res = await call("POST", "/archive", body, raw);
+          assert.equal(res.status, 400, name);
+          assert.equal(typeof await errorOf(res), "string", name);
+        }
+        assert.equal((await readArchive()).count, before.count);
+        await assertUntouched(boardBefore);
+
+        assert.equal((await fetch(`${baseUrl}/archive`)).status, 401);
+        const noAuthPost = await fetch(`${baseUrl}/archive`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ cards: [archived("t_arch_noauth", 1)] }),
+        });
+        assert.equal(noAuthPost.status, 401);
+        assert.equal((await readArchive()).count, before.count);
+      });
+
+      await t.step("GET /revisions lists restore points newest first and includes the head", async () => {
+        await seedBoard(baseUrl, { todo: [card()] });
+        const listed = async () => {
+          const res = await call("GET", "/revisions");
+          assert.equal(res.status, 200);
+          const body = await res.json() as { revisions: { rev: number; updatedAt: string }[] };
+          assert.deepEqual(Object.keys(body), ["revisions"]);
+          return body.revisions;
+        };
+        const revisions = await listed();
+        const head = await getState(baseUrl);
+        assert.ok(revisions.length >= 1);
+        for (const r of revisions) {
+          assert.deepEqual(Object.keys(r).sort(), ["rev", "updatedAt"]);
+          assert.ok(Number.isInteger(r.rev));
+          assert.ok(!Number.isNaN(Date.parse(r.updatedAt)));
+        }
+        for (let i = 1; i < revisions.length; i++) {
+          assert.ok(revisions[i - 1].rev > revisions[i].rev, "strictly newest first");
+        }
+        assert.deepEqual(revisions[0], { rev: head.rev, updatedAt: head.updatedAt });
+        // Every listed restore point is one GET /state?rev=N can actually serve.
+        for (const r of revisions) {
+          const snap = await getState(baseUrl, `/state?rev=${r.rev}`);
+          assert.equal(snap.rev, r.rev);
+          assert.equal(snap.updatedAt, r.updatedAt);
+        }
+
+        // A write adds exactly one entry on top; the old head stays reachable.
+        const created = await call("POST", "/tickets", { title: "revision probe" });
+        assert.equal(created.status, 201);
+        const after = await listed();
+        assert.equal(after[0].rev, head.rev + 1);
+        assert.equal(after[1].rev, head.rev);
+
+        assert.equal((await fetch(`${baseUrl}/revisions`)).status, 401);
+      });
+
+      await t.step(
+        "restore re-lands a snapshot as a new head and leaves history intact",
+        async () => {
+          const a = await seedBoard(baseUrl, { todo: [card("t_ticket_1a2b"), card("t_other_0001")] });
+          const b = await putBoard(baseUrl, {
+            ...a.board,
+            projects: { todo: [card("t_ticket_1a2b", "koder", { title: "B edit" })], done: [card("t_other_0001")] },
+          });
+          const c = await putBoard(baseUrl, { ...b.board, projects: { doing: [card("t_new_0002")] } });
+          assert.ok(a.rev < b.rev && b.rev < c.rev);
+
+          const res = await call("POST", "/state/restore", { rev: a.rev });
+          assert.equal(res.status, 200);
+          const body = await res.json() as { rev: number; restoredFrom: number; updatedAt: string };
+          assert.deepEqual(Object.keys(body).sort(), ["restoredFrom", "rev", "updatedAt"]);
+          assert.equal(body.restoredFrom, a.rev);
+          // Rev never rewinds: the old board becomes the newest rev.
+          assert.equal(body.rev, c.rev + 1);
+
+          const now = await getState(baseUrl);
+          assert.equal(now.rev, body.rev);
+          assert.equal(now.updatedAt, body.updatedAt);
+          assert.deepEqual(now.board, a.board);
+          // It is a snapshotted head like any write, and the old snapshots didn't change.
+          assert.deepEqual(await getState(baseUrl, `/state?rev=${body.rev}`), now);
+          assert.deepEqual((await getState(baseUrl, `/state?rev=${a.rev}`)).board, a.board);
+          assert.deepEqual((await getState(baseUrl, `/state?rev=${c.rev}`)).board, c.board);
+          const listed = await (await call("GET", "/revisions")).json() as { revisions: { rev: number }[] };
+          assert.equal(listed.revisions[0].rev, body.rev);
+
+          // Restoring the head itself is still a write of its own.
+          const again = await call("POST", "/state/restore", { rev: body.rev });
+          assert.equal(again.status, 200);
+          assert.equal((await again.json() as { rev: number }).rev, body.rev + 1);
+          assert.deepEqual((await getState(baseUrl)).board, a.board);
+        },
+      );
+
+      await t.step("restore and snapshot lookups refuse bad or unknown revs", async () => {
+        const before = await seedBoard(baseUrl, { todo: [card()] });
+        for (
+          const [name, body, raw] of [
+            ["not JSON", undefined, "nope"],
+            ["no rev", {}, undefined],
+            ["rev as a string", { rev: String(before.rev) }, undefined],
+            ["rev null", { rev: null }, undefined],
+            ["rev fractional", { rev: 1.5 }, undefined],
+          ] as [string, unknown, string | undefined][]
+        ) {
+          const res = await call("POST", "/state/restore", body, raw);
+          assert.equal(res.status, 400, name);
+          assert.equal(typeof await errorOf(res), "string", name);
+        }
+        const unknown = before.rev + 1000;
+        const missing = await call("POST", "/state/restore", { rev: unknown });
+        assert.equal(missing.status, 404);
+        assert.match(String(await errorOf(missing)), new RegExp(`^no snapshot for rev ${unknown}\\b`));
+        await assertUntouched(before);
+
+        for (const bad of ["abc", "-1", "1.5"]) {
+          const res = await call("GET", `/state?rev=${bad}`);
+          assert.equal(res.status, 400, bad);
+          assert.equal(typeof await errorOf(res), "string", bad);
+        }
+        const none = await call("GET", `/state?rev=${unknown}`);
+        assert.equal(none.status, 404);
+        assert.match(String(await errorOf(none)), new RegExp(`^no snapshot for rev ${unknown}\\b`));
+      });
+
+      const createTicket = (body: unknown, raw?: string) => call("POST", "/tickets", body, raw);
+
+      await t.step("POST /tickets validates input and refuses without touching the board", async () => {
+        const before = await seedBoard(baseUrl, { todo: [card()] });
+        for (
+          const [name, body, raw] of [
+            ["not JSON", undefined, "not json"],
+            ["null body", null, undefined],
+            ["no title", { note: "n" }, undefined],
+            ["empty title", { title: "" }, undefined],
+            ["blank title", { title: "   " }, undefined],
+            ["non-string title", { title: 7 }, undefined],
+            ["title over 300 chars", { title: "x".repeat(301) }, undefined],
+            ["note over 5000 chars", { title: "ok", note: "n".repeat(5001) }, undefined],
+            ["unknown column", { title: "ok", column: "archive" }, undefined],
+          ] as [string, unknown, string | undefined][]
+        ) {
+          const res = await createTicket(body, raw);
+          assert.equal(res.status, 400, name);
+          assert.equal(typeof await errorOf(res), "string", name);
+        }
+        await assertUntouched(before);
+      });
+
+      await t.step("POST /tickets creates one card, one revision, with its ref", async () => {
+        const before = await seedBoard(baseUrl, { todo: [card("t_existing_0001")] });
+        const res = await createTicket({
+          title: "  Make it so  ",
+          note: " a note ",
+          priority: "high",
+          project: "koder",
+          column: "todo",
+          pr: "KodaAllison/koder#1",
+          prRev: 5,
+        });
+        assert.equal(res.status, 201);
+        const made = await res.json() as { card: Card; ref: string; rev: number };
+        assert.deepEqual(Object.keys(made).sort(), ["card", "ref", "rev"]);
+        assert.equal(made.rev, before.rev + 1);
+        assert.equal(typeof made.card.id, "string");
+        assert.match(made.ref, /^KODER-[0-9A-Z]{4}$/);
+        assert.equal(made.ref, `KODER-${made.card.id.slice(-4).toUpperCase()}`);
+        assert.equal(made.card.title, "Make it so");
+        assert.equal(made.card.note, "a note");
+        assert.equal(made.card.priority, "high");
+        assert.equal(made.card.project, "koder");
+        assert.equal(typeof made.card.created, "number");
+        // pr/prRev are the webhook's; a create can't set them.
+        assert.equal("pr" in made.card, false);
+        assert.equal("prRev" in made.card, false);
+
+        const now = await getState(baseUrl);
+        assert.equal(now.rev, made.rev);
+        assert.deepEqual(now.board.projects.todo.map((c) => c.id), ["t_existing_0001", made.card.id]);
+        assert.deepEqual(now.board.projects.todo[1], made.card);
+        assert.deepEqual(
+          (await getState(baseUrl, `/state?rev=${made.rev}`)).board.projects.todo[1],
+          made.card,
+        );
+        const listed = await (await call("GET", "/tickets?project=koder&column=todo")).json() as {
+          tickets: (Card & { ref: string; column: string })[];
+        };
+        const found = listed.tickets.find((x) => x.id === made.card.id);
+        assert.equal(found?.ref, made.ref);
+        assert.equal(found?.column, "todo");
+
+        // Every create is exactly one revision.
+        const second = await createTicket({ title: "Second", column: "todo" });
+        assert.equal((await second.json() as { rev: number }).rev, made.rev + 1);
+        assert.equal((await getState(baseUrl)).rev, made.rev + 1);
+      });
+
+      await t.step("POST /tickets fills defaults and ignores unusable optional values", async () => {
+        await seedBoard(baseUrl, {});
+        const plain = await createTicket({ title: "Just a title" });
+        assert.equal(plain.status, 201);
+        const made = await plain.json() as { card: Card; ref: string };
+        assert.equal(made.card.priority, "med");
+        assert.equal(made.card.note, "");
+        assert.equal(made.card.project, null);
+        assert.match(made.ref, /^NOPROJ-[0-9A-Z]{4}$/);
+        assert.deepEqual((await getState(baseUrl)).board.projects.backlog.map((c) => c.id), [made.card.id]);
+
+        // POST has always been lenient about optional fields: bad ones fall back.
+        const lenient = await createTicket({
+          title: "Lenient",
+          priority: "urgent",
+          note: 5,
+          project: 7,
+          column: "",
+        });
+        assert.equal(lenient.status, 201);
+        const card2 = (await lenient.json() as { card: Card }).card;
+        assert.equal(card2.priority, "med");
+        assert.equal(card2.note, "");
+        assert.equal(card2.project, null);
+        assert.deepEqual(
+          (await getState(baseUrl)).board.projects.backlog.map((c) => c.id),
+          [made.card.id, card2.id],
+        );
+
+        // The caps are inclusive.
+        const edge = await createTicket({ title: "x".repeat(300), note: "n".repeat(5000) });
+        assert.equal(edge.status, 201);
+      });
+
+      const patchBody = (id: string, fields: unknown, raw?: string) =>
+        call("PATCH", `/tickets/${id}`, fields, raw);
+      type Patched = { card: Card; ref: string; column: string; rev: number };
+      const seedThree = () =>
+        seedBoard(baseUrl, {
+          todo: [
+            card("t_aaaa_0001", "koder", { title: "A" }),
+            card("t_bbbb_0002", "koder", { title: "B", note: "keep me" }),
+            card("t_cccc_0003", "koder", { title: "C" }),
+          ],
+          doing: [],
+        });
+
+      await t.step("PATCH edits each field in place, one revision per write", async () => {
+        const seeded = await seedThree();
+        let rev = seeded.rev;
+        const edit = async (given: string, fields: Record<string, unknown>) => {
+          const res = await patchBody(given, fields);
+          assert.equal(res.status, 200, JSON.stringify(fields));
+          const body = await res.json() as Patched;
+          assert.deepEqual(Object.keys(body).sort(), ["card", "column", "ref", "rev"]);
+          assert.equal(body.rev, ++rev);
+          assert.equal(body.column, "todo");
+          assert.equal((await getState(baseUrl)).rev, rev);
+          return body;
+        };
+
+        const titled = await edit("t_bbbb_0002", { title: "  Renamed  " });
+        assert.equal(titled.card.title, "Renamed");
+        assert.equal(titled.ref, "KODER-0002");
+        assert.equal(titled.card.note, "keep me");
+        const afterTitle = await getState(baseUrl);
+        // An edit leaves the card where it sat; the neighbours are untouched.
+        assert.deepEqual(afterTitle.board.projects.todo.map((c) => c.id), ["t_aaaa_0001", "t_bbbb_0002", "t_cccc_0003"]);
+        assert.deepEqual(afterTitle.board.projects.todo[0], seeded.board.projects.todo[0]);
+        assert.deepEqual(afterTitle.board.projects.todo[2], seeded.board.projects.todo[2]);
+        assert.deepEqual(afterTitle.board.projects.todo[1], titled.card);
+
+        assert.equal((await edit("t_bbbb_0002", { note: "  new note " })).card.note, "new note");
+        assert.equal((await edit("t_bbbb_0002", { note: "" })).card.note, "");
+        for (const priority of ["high", "low", "med"]) {
+          assert.equal((await edit("t_bbbb_0002", { priority })).card.priority, priority);
+        }
+
+        // project feeds the ref, so changing it renames the ref the card answers to.
+        const moved = await edit("t_bbbb_0002", { project: "holitrackr" });
+        assert.equal(moved.card.project, "holitrackr");
+        assert.equal(moved.ref, "HOLIT-0002");
+        assert.equal((await patchBody("KODER-0002", { title: "stale ref" })).status, 404);
+        assert.equal((await edit("HOLIT-0002", { project: null })).ref, "NOPROJ-0002");
+        assert.equal((await edit("t_bbbb_0002", { project: "holitrackr" })).card.project, "holitrackr");
+        // "" and null both mean unassigned.
+        assert.equal((await edit("t_bbbb_0002", { project: "" })).card.project, null);
+        rev = (await getState(baseUrl)).rev; // the 404 above wrote nothing
+
+        // Several fields in one call are one write.
+        const several = await edit("t_bbbb_0002", { title: "Multi", note: "n2", priority: "high", project: "koder" });
+        assert.deepEqual(
+          [several.card.title, several.card.note, several.card.priority, several.card.project],
+          ["Multi", "n2", "high", "koder"],
+        );
+        const final = (await getState(baseUrl)).board.projects.todo[1];
+        assert.deepEqual(final, several.card);
+        assert.equal(final.created, seeded.board.projects.todo[1].created);
+        // And that revision is snapshotted.
+        assert.deepEqual((await getState(baseUrl, `/state?rev=${rev}`)).board.projects.todo[1], final);
+      });
+
+      await t.step("PATCH column moves the card to the end of its new column", async () => {
+        const seeded = await seedBoard(baseUrl, {
+          todo: [card("t_aaaa_0001", "koder", { title: "A" }), card("t_bbbb_0002", "koder", { title: "B" })],
+          doing: [card("t_cccc_0003", "koder", { title: "C" })],
+        });
+        const toDoing = await patchBody("KODER-0001", { column: "doing" });
+        assert.equal(toDoing.status, 200);
+        const body = await toDoing.json() as Patched;
+        assert.equal(body.column, "doing");
+        assert.equal(body.rev, seeded.rev + 1);
+        assert.equal(body.card.title, "A");
+        const afterMove = await getState(baseUrl);
+        assert.deepEqual(afterMove.board.projects.todo.map((c) => c.id), ["t_bbbb_0002"]);
+        assert.deepEqual(afterMove.board.projects.doing.map((c) => c.id), ["t_cccc_0003", "t_aaaa_0001"]);
+
+        // A move and an edit together are still one write.
+        const both = await patchBody("t_bbbb_0002", { column: "done", title: "Shipped" });
+        assert.equal(both.status, 200);
+        const bothBody = await both.json() as Patched;
+        assert.equal(bothBody.column, "done");
+        assert.equal(bothBody.card.title, "Shipped");
+        assert.equal(bothBody.rev, body.rev + 1);
+        const afterBoth = await getState(baseUrl);
+        assert.deepEqual(afterBoth.board.projects.todo, []);
+        assert.deepEqual(afterBoth.board.projects.done.map((c) => c.title), ["Shipped"]);
+
+        // Every project column is a valid target; anything else is refused.
+        for (const column of ["backlog", "todo", "doing", "review", "done"]) {
+          const res = await patchBody("t_cccc_0003", { column });
+          assert.equal(res.status, 200, column);
+          assert.equal((await res.json() as Patched).column, column);
+        }
+        const bad = await patchBody("t_cccc_0003", { column: "archive" });
+        assert.equal(bad.status, 400);
+        assert.deepEqual((await bad.json() as { valid: string[] }).valid, ["backlog", "todo", "doing", "review", "done"]);
+      });
+
+      await t.step("PATCH resolves ids and refs, and refuses unknown or ambiguous ones", async () => {
+        const seeded = await seedThree();
+        // Id, ref, and a ref in any case all name the same card.
+        for (const [given, title] of [["t_aaaa_0001", "by id"], ["KODER-0001", "by ref"], ["koder-0001", "by lowercase ref"]]) {
+          const res = await patchBody(given, { title });
+          assert.equal(res.status, 200, given);
+          const body = await res.json() as Patched;
+          assert.equal(body.card.id, "t_aaaa_0001");
+          assert.equal(body.ref, "KODER-0001");
+          assert.equal(body.card.title, title);
+        }
+
+        const head = await getState(baseUrl);
+        assert.equal(head.rev, seeded.rev + 3);
+        for (const given of ["KODER-DEAD", "t_nope_0000"]) {
+          const res = await patchBody(given, { title: "ghost" });
+          assert.equal(res.status, 404, given);
+          assert.equal(typeof await errorOf(res), "string");
+        }
+        await assertUntouched(head);
+
+        const twins = await seedBoard(baseUrl, {
+          todo: [card("t_first_abcd"), card("t_second_abcd")],
+        });
+        const ambiguous = await patchBody("KODER-ABCD", { title: "which one" });
+        assert.equal(ambiguous.status, 409);
+        const ambiguousBody = await ambiguous.json() as { error: string; ids: string[] };
+        assert.equal(typeof ambiguousBody.error, "string");
+        assert.deepEqual(ambiguousBody.ids, ["t_first_abcd", "t_second_abcd"]);
+        await assertUntouched(twins);
+        // The raw id still gets through.
+        const byId = await patchBody("t_second_abcd", { title: "this one" });
+        assert.equal(byId.status, 200);
+        assert.equal((await getState(baseUrl)).board.projects.todo[1].title, "this one");
+      });
+
+      await t.step("PATCH refuses invalid bodies and applies nothing when any field is bad", async () => {
+        const before = await seedThree();
+        for (
+          const [name, body, raw] of [
+            ["not JSON", undefined, "not json"],
+            ["null body", null, undefined],
+            ["array body", [], undefined],
+            ["empty object", {}, undefined],
+            ["only unknown fields", { colour: "red" }, undefined],
+            ["empty title", { title: "" }, undefined],
+            ["blank title", { title: "  " }, undefined],
+            ["non-string title", { title: 5 }, undefined],
+            ["title over 300 chars", { title: "x".repeat(301) }, undefined],
+            ["non-string note", { note: 5 }, undefined],
+            ["note over 5000 chars", { note: "n".repeat(5001) }, undefined],
+            ["unknown priority", { priority: "urgent" }, undefined],
+            ["non-string priority", { priority: 3 }, undefined],
+            ["non-string project", { project: 5 }, undefined],
+            ["non-string column", { column: 5 }, undefined],
+            ["valid title with a bad priority", { title: "applied?", priority: "urgent" }, undefined],
+          ] as [string, unknown, string | undefined][]
+        ) {
+          const res = await patchBody("t_bbbb_0002", body, raw);
+          assert.equal(res.status, 400, name);
+          assert.equal(typeof await errorOf(res), "string", name);
+        }
+        await assertUntouched(before);
+
+        // The caps are inclusive.
+        const edge = await patchBody("t_bbbb_0002", { title: "x".repeat(300), note: "n".repeat(5000) });
+        assert.equal(edge.status, 200);
+      });
+
+      await t.step("PATCH cannot set pr or prRev", async () => {
+        await seedBoard(baseUrl, { todo: [card("t_ticket_1a2b"), card("t_plain_0002")] });
+        assert.equal((await openPr(20, "KODER-1A2B")).status, 200);
+        const linked = await getState(baseUrl);
+        assert.equal(linked.board.projects.review[0].pr, "KodaAllison/koder#20");
+
+        // Alone they're not settable fields at all.
+        const only = await patchBody("KODER-1A2B", { pr: "evil/repo#9", prRev: 99 });
+        assert.equal(only.status, 400);
+        await assertUntouched(linked);
+
+        // Alongside a real edit they are ignored, and the webhook's values stand.
+        const mixed = await patchBody("KODER-1A2B", { title: "retitled", pr: "evil/repo#9", prRev: 99 });
+        assert.equal(mixed.status, 200);
+        const mixedCard = (await mixed.json() as Patched).card;
+        assert.equal(mixedCard.title, "retitled");
+        assert.equal(mixedCard.pr, "KodaAllison/koder#20");
+        assert.equal(mixedCard.prRev, 1);
+        const after = await getState(baseUrl);
+        assert.equal(after.board.projects.review[0].pr, "KodaAllison/koder#20");
+        assert.equal(after.board.projects.review[0].prRev, 1);
+
+        // A card with no link can't acquire one this way either.
+        const plain = await patchBody("t_plain_0002", { title: "still plain", pr: "evil/repo#9", prRev: 1 });
+        assert.equal(plain.status, 200);
+        const plainCard = (await plain.json() as Patched).card;
+        assert.equal("pr" in plainCard, false);
+        assert.equal("prRev" in plainCard, false);
+        const stored = (await getState(baseUrl)).board.projects.todo[0];
+        assert.equal("pr" in stored, false);
+        assert.equal("prRev" in stored, false);
+      });
+
       await kvOnly(
         "a ticket write that would overflow the board store is a 507 with a clear message",
         async () => {
@@ -1586,6 +2132,62 @@ Deno.test({
           assert.equal(response.status, 413);
           assertStoreFullBody(await response.json());
           assert.equal((await getState(baseUrl)).rev, before.rev);
+        },
+      );
+
+      await kvOnly(
+        "revisions are pruned to the last 20, and a pruned rev's 404 says so",
+        async () => {
+          while ((await getState(baseUrl)).rev < 25) {
+            assert.equal((await createTicket({ title: "pad history" })).status, 201);
+          }
+          const head = await getState(baseUrl);
+          const listed = await (await call("GET", "/revisions")).json() as { revisions: { rev: number }[] };
+          assert.deepEqual(
+            listed.revisions.map((r) => r.rev),
+            Array.from({ length: 20 }, (_, i) => head.rev - i),
+          );
+          const pruned = head.rev - 20;
+          const message = `no snapshot for rev ${pruned} (only the last 20 are kept)`;
+          const lookup = await call("GET", `/state?rev=${pruned}`);
+          assert.equal(lookup.status, 404);
+          assert.equal(await errorOf(lookup), message);
+          const restore = await call("POST", "/state/restore", { rev: pruned });
+          assert.equal(restore.status, 404);
+          assert.equal(await errorOf(restore), message);
+          await assertUntouched(head);
+        },
+      );
+
+      await kvOnly(
+        "an archive batch too big for one KV value is a 413 and nothing is archived",
+        async () => {
+          const before = await readArchive();
+          const res = await call("POST", "/archive", {
+            cards: [{ ...archived("t_arch_huge", 1), note: "—".repeat(40_000) }],
+          });
+          assert.equal(res.status, 413);
+          const body = await res.json() as { error: string; size: number; limit: number };
+          assert.match(body.error, /^archive batch too large: \d+ of 65536 bytes — send fewer cards$/);
+          assert.equal(body.limit, STORE_VALUE_MAX);
+          assert.ok(body.size > body.limit);
+          assert.deepEqual(await readArchive(), before);
+        },
+      );
+
+      await kvOnly(
+        "PUT /state refuses a body past 4x the stored cap before parsing it",
+        async () => {
+          const before = await getState(baseUrl);
+          const chars = 4 * STORE_VALUE_MAX + 1;
+          const res = await call("PUT", "/state", undefined, "x".repeat(chars));
+          assert.equal(res.status, 413);
+          assert.deepEqual(await res.json(), {
+            error: `board too large: request body is ${chars} characters,` +
+              ` store holds ${STORE_VALUE_MAX} bytes — archive done tickets to free space`,
+            limit: STORE_VALUE_MAX,
+          });
+          await assertUntouched(before);
         },
       );
     } finally {
