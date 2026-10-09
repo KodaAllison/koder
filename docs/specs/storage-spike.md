@@ -186,36 +186,54 @@ cliff to avoid (my arithmetic from the vendor's 0.25 CU / 400 h figure, not a ve
 - **Turso Free:** 5 GB storage, 500 million rows read/month, 10 million rows written/month, 100 databases, 1-day
   point-in-time restore (https://turso.tech/pricing). Matches the spec on rows; the spec did not give a database count.
 
-## 5. Recommendation for Q1 (host)
+## 5. Q1 decided: Neon (measured 2026-10-08)
 
-**Start with Neon for the Phase 0 measurement and as the default if the numbers are close; keep Deno Deploy's
-attached Postgres as the thing to beat on convenience.** Reasoning, from facts above only:
+**Decision (Koda, 2026-10-08): Neon**, connected through the `NEON_DATABASE_URL` env var. The deciding fact was not
+latency. It was a platform limit found during provisioning:
 
-1. Neon's limits are published, current and mutually consistent across three Neon/Prisma pages, and it meters
-   compute time, which suits a bursty personal board. The Deno-attached option has two unreconciled quota sets,
-   no stated region, no stated idle behaviour and no stated cap-hit behaviour. Those are exactly the unknowns that
-   hurt a webhook receiver.
-2. Neon's known cost is a few hundred ms on the first request after 5 idle minutes. That is tolerable for
-   the webhook (idempotent, GitHub retries) and for the board (localStorage-first paint).
-3. Deno-attached wins only if it is genuinely lower latency from the Deploy region and the ops counting is
-   per query. That is unmeasurable from here.
-4. Both are plain Postgres reached over TCP with `npm:postgres`, so the choice is an env var, not a rewrite. The
-   decision is cheap to reverse; do not block Phase 1 on it.
+> "It is not currently possible to link multiple database instances to a single app. It is thus not possible to link
+> both a Deno KV and a PostgreSQL database to the same app at this time."
+> (https://docs.deno.com/deploy/reference/databases/)
 
-This does not change the spec's decision rule in section 4 (lower p95 from the Deploy region, no suspend inside the
-webhook retry window); it says which side to expect to win.
+Attaching the Deno-provisioned Prisma Postgres to the koder app detached its KV database. Every new deployment then
+crashed at startup (`Deno.openKv() failed: no KV database is attached to this app`), while the previous deployment
+kept serving. Reassigning the original KV instance restored it, with the board intact at rev 624 (KV data survives
+detaching). The §8 migration needs KV and Postgres live together (backfill, dual-write, rollback), so an attached
+database is out. Neon is reached by connection string and sits alongside KV without touching the attachment.
 
-### Still for Koda to measure (ticket KODER-2B82; I can't provision or deploy anything)
+### Measured from the deployed server (`GET /spike/db`, KODER-6784)
 
-1. Provision both (Deno Deploy "Provision Postgres" and a Neon free project in the region nearest the Deploy
-   region) and run, from a **deployed** server, `SELECT 1` through `npm:postgres` to each. Confirm `npm:postgres` works
-   at all with the Deno-injected `DATABASE_URL` and with Neon's TLS settings.
-2. p95 of 50-100 sequential `SELECT 1` and one 3-statement transaction, per host, from the Deploy region (10-minute probe).
-3. Neon cold start: query after >5 minutes idle, 5 samples; compare with GitHub's webhook timeout.
-4. Deno-attached: the region, the plan actually attached (100K or 200K ops; view in the Prisma console after
-   claiming), and whether a 3-statement transaction increments the operation counter by 1 or 3.
-5. What the Deno-attached database does at the operations cap (error, throttle, suspend), if readable in the console.
-6. Connection-count behaviour: `postgres.js` pool `max` against each host's connection limit from Deploy isolates.
+Deploy region `ams` (Amsterdam); Neon project `koder-spike` in AWS eu-central-1 (Frankfurt), pooled connection
+string (`-pooler`, `prepare: false`), PostgreSQL 18.6. Each request opens one fresh connection.
+
+| Run | Connect | First query | `SELECT 1` p50 / p95 / max (n=100) | 3-statement txn p50 / p95 (n=100) |
+|---|---|---|---|---|
+| Warm | 74.4 ms | 7.3 ms | 7.3 / 8.4 / 17.4 ms | 37 / 57 ms |
+| First request after creation (compute idle) | 1199.7 ms | 34.0 ms | 7.7 / 10.9 / 16.7 ms | 37.7 / 47.5 ms |
+
+Cold start, first query after more than 6 minutes idle (Neon suspends after 5):
+
+| Sample | Idle before | Connect (incl. wake) | First query |
+|---|---|---|---|
+| 0 | since project creation | 1199.7 ms | 34.0 ms |
+| 1 | 6 min | 1289.9 ms | 34.8 ms |
+| 2 | overnight (PC slept) | 1208.3 ms | 21.2 ms |
+
+Three samples, not the planned five: the PC slept mid-run, and the readings already agree within ~90 ms.
+
+What this means for PgStore:
+
+- **A query is about one round trip, ~7-8 ms** Amsterdam→Frankfurt. `GET /state` as one query and a diff-apply
+  `PUT` as one transaction of a handful of statements both land well under 100 ms warm.
+- **A transaction costs ~4-5 round trips** (BEGIN, statement, statement, COMMIT), ~37 ms p50. That's a reason to
+  keep §7.2's diff-apply to few statements, e.g. multi-row `INSERT … ON CONFLICT` rather than per-card writes.
+- **Opening a connection costs ~75 ms warm.** Reuse one per isolate (module-level `postgres()` client) rather than
+  connecting per request, as the probe deliberately did.
+- **Cold start is about 1.2-1.3 s (3 samples), almost all of it in connect.** The webhook is idempotent and GitHub retries, so it tolerates this. The board
+  paints from localStorage first, so a slow first sync after idle is invisible beyond the sync badge. The 30-second
+  poll keeps Neon awake while a tab is open (the CU-hour cost noted in §4.2).
+
+Not measured, and moot after the decision: the Deno-attached Postgres's latency, region and ops counting.
 
 ## 6. Net effects on the spec
 

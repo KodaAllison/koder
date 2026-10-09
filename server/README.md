@@ -52,6 +52,12 @@ This targets the new Deno Deploy (https://console.deno.com). Deploy Classic
 4. Attach a KV database: org dashboard → **Databases** → your Deno KV instance →
    **Assign** → pick the app. Each timeline gets its own database, and
    `Deno.openKv()` needs no URL on Deploy. Redeploy after assigning.
+   **An app can have only one attached database.** Attaching or linking a
+   Postgres database under **Databases** detaches KV, and every new deployment
+   then crashes at startup with "no KV database is attached". Connect Postgres
+   (Neon) through the `NEON_DATABASE_URL` env var instead, never by attaching it.
+   ([docs](https://docs.deno.com/deploy/reference/databases/): "It is not
+   currently possible to link multiple database instances to a single app.")
    (Unverified: the exact flow for *creating* the KV instance, and whether
    `--unstable-kv` matters on Deploy; the docs say nothing about it.)
 5. The app is served at `https://<app>.<org>.deno.net`. Put that URL + the token
@@ -71,12 +77,10 @@ KODER-6784). It does nothing unless you enable it.
 - Route: `GET /spike/db?target=deploy|neon[&n=100][&cold=1]`, bearer auth like
   every other API route. `404 {"error":"db spike disabled"}` unless
   `KODER_DB_SPIKE=1`.
-- Env: `KODER_DB_SPIKE=1`; `DATABASE_URL` for `target=deploy` (Deploy injects
-  `DATABASE_URL`, `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER` and `PGPASSWORD` once
-  a database is provisioned or linked under Databases, with a separate logical
-  database per deployment environment; the docs don't say whether you can
-  override an injected value, but it is an ordinary env var, so you can also set
-  it by hand, which is unverified); `NEON_DATABASE_URL` for `target=neon`. A
+- Env: `KODER_DB_SPIKE=1`; `NEON_DATABASE_URL` for `target=neon`. `target=deploy`
+  reads `DATABASE_URL`, which Deploy injects only when a Postgres database is
+  attached, and on koder that detaches KV (see Deploy step 4). So `deploy` is
+  effectively unusable here. Neon was chosen (storage spec Q1). A
   missing URL is a `400 {"error":"<VAR> not set"}`. Remove `KODER_DB_SPIKE` when
   the measurement is done.
 - Each request opens a fresh single connection (so connect time is measured) and

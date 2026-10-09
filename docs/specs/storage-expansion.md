@@ -505,8 +505,9 @@ Phases 0-3 are the commitment (about 4 weekends of work); everything after is in
 
 ## 13. Open questions for Koda
 
-1. Host DB: Deno Deploy's built-in Postgres (simplest, 100K ops/mo cap, hosted by Prisma) or Neon (compute-hours
-   cap, cold starts)? I lean Deploy-attached for ops simplicity if Phase 0 latency is fine.
+1. **Answered (2026-10-08): Neon**, connected through the `NEON_DATABASE_URL` env var. Deno Deploy allows only one
+   attached database per app, so its built-in Postgres would detach KV, which rules out the §8 dual-write cutover.
+   Measurements are in `storage-spike.md` §5. (Was: Deno Deploy's built-in Postgres or Neon?)
 2. **Answered: "plain SQL first with npm:postgres (decided 2026-10-08)".** (Was: plain SQL first then Drizzle, or Drizzle from day one?)
 3. Is a 2 MB request cap and keeping the client-side 48 KB warning for now acceptable until Phase 4, or should Phase 4
    come before Phase 3 so the ceiling truly disappears for users first?
