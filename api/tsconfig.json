@@ -1,0 +1,28 @@
+{
+  /* Type checking only: Node runs these .ts files directly by stripping the
+   * types (Node >= 22.18), so there is no build and nothing is emitted.
+   * erasableSyntaxOnly keeps every file strippable (no enums, namespaces or
+   * parameter properties), and the .ts extensions in imports are what Node
+   * itself resolves. allowJs lets ../js/ref.js be imported with the types its
+   * JSDoc declares; checkJs stays off because the root `npm run check` owns
+   * the frontend's own type check. */
+  "compilerOptions": {
+    "target": "es2023",
+    "lib": ["es2023"],
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "types": ["node"],
+    "strict": true,
+    "noEmit": true,
+    "erasableSyntaxOnly": true,
+    "verbatimModuleSyntax": true,
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": false,
+    "allowJs": true,
+    "checkJs": false,
+    "skipLibCheck": true,
+    "noFallthroughCasesInSwitch": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": ["src/**/*.ts", "tests/**/*.ts"]
+}
