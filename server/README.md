@@ -163,6 +163,14 @@ make the server exit at startup with a "not implemented yet" error.
 `webhook.deno.ts` drives the server purely over HTTP and passes `KODER_STORE`
 through, so it is the contract suite every backend must pass.
 
+A backend declares its own `limits` (`StoreLimits`): `boardBytes` (capacity of
+one stored board), `requestBytes` (the longest `PUT /state` body the server will
+JSON-parse; KV sets 4x `boardBytes`) and `keptRevisions` (how many past boards
+`GET /state?rev=N` and restore can reach, or `null` when none are ever pruned —
+the "only the last N are kept" hint in the 404 is then omitted). Board writes
+from `PUT /state` carry an `Actor` (`"browser"`); KV ignores it, as it has no
+changes log.
+
 ## API
 
 The board endpoints below require `Authorization: Bearer $KODER_TOKEN`. The

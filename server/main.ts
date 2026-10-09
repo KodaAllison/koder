@@ -21,7 +21,8 @@
  *    both land on the same rev.
  *
  * History / undo: every write also snapshots the new doc, and the store keeps
- * the last N (Store.limits.keptRevisions), so a bad push is recoverable.
+ * the last N (Store.limits.keptRevisions; null means it keeps them all), so a
+ * bad push is recoverable.
  * Restore rolls the chosen snapshot forward as a fresh rev (rev never
  * rewinds), so open tabs pull it back like any other change.
  *
@@ -91,6 +92,7 @@ import {
   type Board,
   type Card,
   type Doc,
+  noSnapshotMessage,
   type PutResult,
   type Store,
   StoreContentionError,
@@ -534,7 +536,7 @@ async function handle(req: Request): Promise<Response> {
       }
       const snap = await store.boardAt(requestedRev);
       if (!snap) {
-        return json({ error: `no snapshot for rev ${requestedRev} (only the last ${store.limits.keptRevisions} are kept)` }, 404);
+        return json({ error: noSnapshotMessage(requestedRev, store.limits.keptRevisions) }, 404);
       }
       // Immutable per rev, so the same ETag fits (still no-cache: a pruned
       // snapshot becomes a 404 that a cached copy must not hide).
@@ -570,7 +572,7 @@ async function handle(req: Request): Promise<Response> {
     const targetRev = body.rev;
     const restored = await store.restore(targetRev);
     if (!restored) {
-      return json({ error: `no snapshot for rev ${targetRev} (only the last ${store.limits.keptRevisions} are kept)` }, 404);
+      return json({ error: noSnapshotMessage(targetRev, store.limits.keptRevisions) }, 404);
     }
     return json({ rev: restored.rev, restoredFrom: targetRev, updatedAt: restored.updatedAt });
   }
@@ -578,11 +580,12 @@ async function handle(req: Request): Promise<Response> {
   /* ---- PUT /state: full-board write, conditional on baseRev ---- */
   if (url.pathname === "/state" && req.method === "PUT") {
     // The real size check is the store's, against what it actually stores
-    // (see StoreFullError). This only refuses to parse a body that couldn't
-    // possibly fit, with the same message shape.
+    // (see StoreFullError). This only refuses to parse a body longer than the
+    // store's requestBytes, with the same message shape; the reported limit
+    // stays the store's capacity.
     const limit = store.limits.boardBytes;
     const raw = await req.text();
-    if (raw.length > 4 * limit) {
+    if (raw.length > store.limits.requestBytes) {
       return json({
         error: `board too large: request body is ${raw.length} characters,` +
           ` store holds ${limit} bytes — archive done tickets to free space`,
@@ -605,7 +608,7 @@ async function handle(req: Request): Promise<Response> {
     try {
       // The store keeps the current server pr/prRev on every card, whatever
       // the body says (see preserveWorkflowMetadata in store.ts).
-      res = await store.applyBoardPut(body.baseRev, body.board);
+      res = await store.applyBoardPut(body.baseRev, body.board, "browser");
     } catch (err) {
       // The whole board was sent, so "too big" is the request's fault: 413,
       // which the PWA already reads as "archive done cards".
