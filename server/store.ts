@@ -135,9 +135,28 @@ export type WebhookResult =
 export type StoreLimits = {
   // The most one stored board can hold, in the backend's own measure.
   boardBytes: number;
-  // How many past revisions boardAt/restore can still reach.
-  keptRevisions: number;
+  // The most characters PUT /state will JSON.parse, checked before parsing. A
+  // separate knob from boardBytes: that one is capacity (in KV a measure of the
+  // V8 encoding, not of JSON), this one is only "too big to even look at".
+  requestBytes: number;
+  // How many past revisions boardAt/restore can still reach; null when every
+  // revision stays reachable (no pruning).
+  keptRevisions: number | null;
 };
+
+/* The 404 body for a revision the store can't give back. The "(only the last
+ * N are kept)" hint is only true for a backend that prunes, so it is dropped
+ * when keptRevisions is null. */
+export function noSnapshotMessage(rev: number, keptRevisions: number | null): string {
+  return `no snapshot for rev ${rev}` +
+    (keptRevisions === null ? "" : ` (only the last ${keptRevisions} are kept)`);
+}
+
+/* Who is behind a board write, for backends that keep a changes log. Only
+ * PUT /state passes one so far; the other writers get theirs in a later slice.
+ * An agent run (agent:<run>) joins this union when agents land — left out until
+ * then rather than typed as a template string now. */
+export type Actor = "browser" | "cli" | "webhook" | "restore" | "migration";
 
 export interface Store {
   readonly limits: StoreLimits;
@@ -147,9 +166,10 @@ export interface Store {
   getHead(): Promise<Head>;
   // The current doc (or an empty rev-0 doc on first run).
   readBoard(): Promise<Doc>;
-  // The kept snapshot of a past revision, or null if it was pruned / never was.
+  // The snapshot of a past revision, or null if it was pruned / never was (a
+  // backend with keptRevisions null never prunes).
   boardAt(rev: number): Promise<Doc | null>;
-  // The kept restore points, newest first.
+  // The reachable restore points, newest first.
   listRevisions(): Promise<Head[]>;
   // Every archived card in archive order (oldest append first), plus how many
   // storage chunks hold them — reported by GET /archive.
@@ -162,8 +182,9 @@ export interface Store {
    * fit. Server-initiated read-modify-writes throw StoreContentionError if
    * they can't land. ---- */
   // Full-board replace, conditional on baseRev. Server-owned pr/prRev are kept
-  // from the current board, never taken from `board`.
-  applyBoardPut(baseRev: number, board: Board): Promise<PutResult>;
+  // from the current board, never taken from `board`. `actor` names who wrote
+  // it, for backends that record a changes log.
+  applyBoardPut(baseRev: number, board: Board, actor: Actor): Promise<PutResult>;
   // Append a new card to a projects-board column.
   createTicket(card: Card, column: string): Promise<{ rev: number }>;
   // Edit a ticket (by id or ref) in place and/or move it to `column`.

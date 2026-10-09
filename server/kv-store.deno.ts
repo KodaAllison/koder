@@ -5,7 +5,7 @@
 
 import assert from "node:assert/strict";
 import { KvStore } from "./kv-store.ts";
-import { restoreWorkflowMetadata } from "./store.ts";
+import { noSnapshotMessage, restoreWorkflowMetadata } from "./store.ts";
 import type { ArchivedCard, Card } from "./store.ts";
 
 function card(id: string, extra: Partial<ArchivedCard> = {}): ArchivedCard {
@@ -49,6 +49,17 @@ Deno.test("KvStore", async (t) => {
       assert.equal(kept?.rev, 4);
       assert.equal(kept?.board.projects.todo.length, 4);
       assert.equal(revisions.find((r) => r.rev === 4)?.updatedAt, kept?.updatedAt);
+    }));
+
+  await t.step("the missing-snapshot message names the retention only when revisions are pruned", () => {
+    assert.equal(noSnapshotMessage(3, 20), "no snapshot for rev 3 (only the last 20 are kept)");
+    assert.equal(noSnapshotMessage(3, null), "no snapshot for rev 3");
+  });
+
+  await t.step("the PUT body cap is four times the stored cap", () =>
+    withStore((store) => {
+      assert.equal(store.limits.requestBytes, 4 * store.limits.boardBytes);
+      return Promise.resolve();
     }));
 
   await t.step("restoreWorkflowMetadata covers every board, any column, and orphans", () => {

@@ -34,6 +34,7 @@ import {
   applyWebhookEvent,
   type ArchivedCard,
   type ArchiveResult,
+  type Actor,
   type Board,
   type Card,
   type Doc,
@@ -88,7 +89,13 @@ type DeliveryGuard = {
 };
 
 export class KvStore implements Store {
-  readonly limits: StoreLimits = { boardBytes: STORE_VALUE_MAX, keptRevisions: KEEP_REVISIONS };
+  // requestBytes: a PUT body longer than 4x the stored cap can't fit once
+  // parsed, so PUT /state refuses it without parsing.
+  readonly limits: StoreLimits = {
+    boardBytes: STORE_VALUE_MAX,
+    requestBytes: 4 * STORE_VALUE_MAX,
+    keptRevisions: KEEP_REVISIONS,
+  };
 
   constructor(private readonly kv: Deno.Kv) {}
 
@@ -186,7 +193,9 @@ export class KvStore implements Store {
     return Boolean((await this.kv.get<boolean>([...GITHUB_DELIVERY_KEY, deliveryId])).value);
   }
 
-  async applyBoardPut(baseRev: number, board: Board): Promise<PutResult> {
+  // `actor` is part of the Store interface and ignored here: KV has no changes
+  // log to attribute a write in.
+  async applyBoardPut(baseRev: number, board: Board, _actor: Actor): Promise<PutResult> {
     const entry = await this.kv.get<Doc>(KEY);
     const cur = entry.value ?? emptyDoc();
     if (baseRev !== cur.rev) return { kind: "stale", rev: cur.rev };
