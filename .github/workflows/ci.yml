@@ -8,6 +8,11 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same ref supersedes the run in flight.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   # The PWA and its tooling: JSDoc type check + node --test over tests/.
   frontend:
@@ -78,6 +83,8 @@ jobs:
             -e KODER_WEBHOOK_SECRET="$KODER_WEBHOOK_SECRET" \
             koder-api
       - name: Wait for the container to be healthy
+        # Bounded at 90s. Docker's first probe runs one HEALTHCHECK interval (30s)
+        # after start, so 90s leaves room for two more tries before giving up.
         run: |
           for _ in $(seq 1 45); do
             status="$(docker inspect -f '{{.State.Health.Status}}' koder-api)"

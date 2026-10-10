@@ -152,20 +152,13 @@ docker run --rm -p 8000:8000 \
   koder-api
 ```
 
-| Variable | |
-|---|---|
-| `NEON_DATABASE_URL` | Required. Postgres connection string. Startup exits 1 with a message if it is missing or the database can't be reached or migrated. |
-| `KODER_TOKEN` | Required. Bearer token for every API request (without it every API route is a 500). |
-| `KODER_WEBHOOK_SECRET` | Needed for `POST /webhooks/github`. |
-| `GITHUB_TOKEN` | Optional. Read-only token for `GET /pr-status`. |
-| `KODER_ORIGIN` | Optional. Locks CORS to one origin (default `*`). |
-| `PORT` | Optional; default 8000. |
-| `KODER_PG_MAX` | Optional pool size; default 3. |
+The image takes the variables in the Environment table above (`NEON_DATABASE_URL` and
+`KODER_TOKEN` are required); `PORT` defaults to 8000.
 
-Neon: use the **direct** connection string (host without `-pooler`), not the pooled one.
-Through the pooler the driver can't use prepared statements and a write costs about 15
-round trips instead of 4. To reach a Postgres on the host machine from Docker Desktop, use
-`host.docker.internal` and `sslmode=disable`.
+Neon: use the **direct** connection string (host without `-pooler`), not the pooled one:
+through the pooler the driver can't use prepared statements and a small `PUT /state` costs
+about 14 round trips instead of 4 (see the connection details above). To reach a Postgres on
+the host machine from Docker Desktop, use `host.docker.internal` and `sslmode=disable`.
 
 Health check: the image declares a `HEALTHCHECK` that runs `fetch` on `GET /` with node
 itself (no curl in the image). `GET /` is served from disk, needs no token and makes no
