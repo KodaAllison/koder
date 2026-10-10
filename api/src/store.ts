@@ -160,8 +160,9 @@ export function noSnapshotMessage(rev: number, keptRevisions: number | null): st
     (keptRevisions === null ? "" : ` (only the last ${keptRevisions} are kept)`);
 }
 
-/* Who is behind a board write, for backends that keep a changes log. Only
- * PUT /state passes one so far; the other writers get theirs in a later slice.
+/* Who is behind a board write, for backends that keep a changes log. PUT /state
+ * ("browser") and the ticket routes ("cli": they serve the CLI and agents)
+ * pass one; the other writers get theirs in a later slice.
  * An agent run (agent:<run>) joins this union when agents land — left out until
  * then rather than typed as a template string now. */
 export type Actor = "browser" | "cli" | "webhook" | "restore" | "migration";
@@ -194,15 +195,17 @@ export interface Store {
   // it, for backends that record a changes log.
   applyBoardPut(baseRev: number, board: Board, actor: Actor): Promise<PutResult>;
   // Append a new card to a projects-board column.
-  createTicket(card: Card, column: string): Promise<{ rev: number }>;
+  createTicket(card: Card, column: string, actor: Actor): Promise<{ rev: number }>;
   // Edit a ticket (by id or ref) in place and/or move it to `column`.
   patchTicket(
     given: string,
     change: { column?: string; edits: TicketEdits },
+    actor: Actor,
   ): Promise<{ kind: "ok"; card: Card; column: string; rev: number } | Unresolved>;
-  // Hard-delete a ticket (by id or ref); `board` is the committed result.
+  // Remove a ticket (by id or ref); `board` is the committed result.
   deleteTicket(
     given: string,
+    actor: Actor,
   ): Promise<{ kind: "ok"; card: Card; column: string; rev: number; board: Board } | Unresolved>;
   // Re-land a kept snapshot as a new head rev; null if it was pruned. Must apply
   // restoreWorkflowMetadata: surviving cards keep their CURRENT pr/prRev, and

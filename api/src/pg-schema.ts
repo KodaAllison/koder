@@ -131,6 +131,28 @@ export const MIGRATIONS: Migration[] = [
       `INSERT INTO life_notes (owner_id) VALUES ('${OWNER}') ON CONFLICT DO NOTHING`,
     ],
   },
+  {
+    // The archive is its own append-only table, not a flag on a card: archiving
+    // must not change GET /state or bump rev, as on KV (the client archives
+    // cards that are still live, then drops them with a later PUT). So the two
+    // columns that flagged an archived card are dead, and so is the partial
+    // index that filtered on one.
+    id: 2,
+    name: "archive",
+    statements: [
+      `CREATE TABLE archived_cards (
+         id       text PRIMARY KEY,
+         owner_id text   NOT NULL REFERENCES owners(id),
+         seq      bigint GENERATED ALWAYS AS IDENTITY,
+         card     jsonb  NOT NULL
+       )`,
+      `CREATE INDEX archived_cards_seq ON archived_cards (owner_id, seq)`,
+      `DROP INDEX cards_board_col`,
+      `ALTER TABLE cards DROP COLUMN archived_at, DROP COLUMN archived_from`,
+      `CREATE INDEX cards_board_col ON cards (owner_id, board_id, column_id, rank)
+         WHERE deleted_at IS NULL`,
+    ],
+  },
 ];
 
 /* Bring the database up to the newest migration. Returns how many were
