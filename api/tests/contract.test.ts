@@ -27,51 +27,10 @@ import { PGlite } from "@electric-sql/pglite";
 import { PGLiteSocketServer } from "@electric-sql/pglite-socket";
 import { nextWebhookRevision } from "../src/workflow.ts";
 
-/* ---- KODER-EE05 slices 1-2 only: steps that need a Store method PgStore does
- * not implement yet (after slice 2: boardAt, listRevisions, restore,
- * hasDelivery, recordDelivery, commitWebhookMove). A step whose name starts with one of these prefixes is
- * reported as skipped (with the reason) instead of failing on the method's
- * "not implemented yet" 500. SLICE 3 MUST EMPTY THIS LIST AND DELETE THE
- * MECHANISM (this constant and pendingAware below): the contract suite has no
- * business skipping steps once PgStore is whole. ---- */
-const PG_PENDING: [prefix: string, needs: string][] = [
-  ["GET /state sends an ETag and answers 304", "boardAt (?rev=N)"],
-  ["PR status route enforces read auth and stays read-only", "hasDelivery, commitWebhookMove"],
-  ["only the four active repositories are trusted", "hasDelivery, commitWebhookMove"],
-  ["repository identity requires exact canonical casing", "hasDelivery, recordDelivery"],
-  ["full-board PUT cannot forge, strip, or replace workflow metadata", "hasDelivery, commitWebhookMove"],
-  ["fork pull requests cannot mutate", "hasDelivery, recordDelivery"],
-  ["untrusted events and actions are ignored", "hasDelivery, recordDelivery"],
-  ["every authenticated no-op delivery is permanently deduplicated", "hasDelivery, recordDelivery, commitWebhookMove"],
-  ["opened moves a visible-ref ticket to review", "hasDelivery, commitWebhookMove"],
-  ["reopened finds a ref in the body", "hasDelivery, commitWebhookMove"],
-  ["closed and merged moves the ticket to done", "hasDelivery, commitWebhookMove"],
-  ["done is terminal for delayed or replacement open events", "hasDelivery, commitWebhookMove"],
-  ["only a newer same-repo PR can replace", "hasDelivery, commitWebhookMove"],
-  ["closed without merge is a board-revision no-op", "hasDelivery, recordDelivery"],
-  ["an ambiguous visible ref is refused", "hasDelivery, commitWebhookMove"],
-  ["DELETE removes one resolved ticket", "commitWebhookMove, boardAt, restore"],
-  ["restore keeps the current PR link", "commitWebhookMove, restore, boardAt"],
-  ["restore after the PR link changed", "commitWebhookMove, restore"],
-  ["restore matches cards by id across columns", "commitWebhookMove, restore"],
-  ["restore keeps a deleted card's own link", "commitWebhookMove, restore"],
-  ["a restored deleted card may carry a link", "commitWebhookMove, restore"],
-  ["redelivery is idempotent and the changed revision is snapshotted", "hasDelivery, commitWebhookMove, boardAt"],
-  ["GET /revisions lists restore points", "listRevisions, boardAt"],
-  ["restore re-lands a snapshot as a new head", "restore, boardAt, listRevisions"],
-  ["restore and snapshot lookups refuse bad or unknown revs", "restore, boardAt"],
-  ["POST /tickets creates one card", "boardAt"],
-  ["PATCH edits each field in place", "boardAt"],
-  ["PATCH cannot set pr or prRev", "commitWebhookMove"],
-];
-
-/* Wraps the subtest call once, so the ported steps read as they did under
- * Deno (`await step(name, fn)`) and none of them is edited to be skipped. */
-function pendingAware(t: TestContext) {
-  return (name: string, fn: () => void | Promise<void>) => {
-    const pending = PG_PENDING.find(([prefix]) => name.startsWith(prefix));
-    return t.test(name, { skip: pending ? `KODER-EE05 slice 3: needs PgStore.${pending[1]}` : false }, fn);
-  };
+/* The subtest call, so the ported steps read as they did under Deno
+ * (`await step(name, fn)`). Every step runs: none is skipped or pended. */
+function stepper(t: TestContext) {
+  return (name: string, fn: () => void | Promise<void>) => t.test(name, fn);
 }
 
 const TOKEN = "webhook-test-token";
@@ -452,7 +411,7 @@ test("Koder API contract (Postgres)", async (t) => {
     const server = await startServer(database.url);
     const baseUrl = server.baseUrl;
     const db = database.db;
-    const step = pendingAware(t);
+    const step = stepper(t);
 
     try {
       await waitForServer(baseUrl);
@@ -2738,6 +2697,435 @@ test("Koder API contract (Postgres)", async (t) => {
           const res = await raw(path);
           assert.equal(res.status, 404, path);
         }
+      });
+
+      /* ---- History, restore and the webhook, seen from Postgres. There are
+       * no snapshots: board@N is the live rows with the `changes` log undone
+       * back to N, so these check that every writer logs enough for that to
+       * come out byte for byte, and that the webhook's delivery row and its
+       * move are one transaction. ---- */
+
+      // GET /state as sent: the body text, which is what a client stores.
+      const stateText = async (path = "/state") => {
+        const res = await call("GET", path);
+        assert.equal(res.status, 200, path);
+        const text = await res.text();
+        return { text, doc: JSON.parse(text) as Doc };
+      };
+      const listRevisions = async () => {
+        const res = await call("GET", "/revisions");
+        assert.equal(res.status, 200);
+        return (await res.json() as { revisions: { rev: number; updatedAt: string }[] }).revisions;
+      };
+      const tableCounts = async () =>
+        (await db.query<Record<string, number>>(
+          `SELECT (SELECT count(*) FROM revisions)::int AS revisions,
+                  (SELECT count(*) FROM changes)::int AS changes,
+                  (SELECT count(*) FROM webhook_deliveries)::int AS deliveries,
+                  (SELECT count(*) FROM archived_cards)::int AS archived`,
+        )).rows[0];
+      const deliveryRow = async (id: string) =>
+        (await db.query<{ outcome: string; rev: number }>(
+          `SELECT outcome, rev::int AS rev FROM webhook_deliveries WHERE delivery_id = $1`, [id],
+        )).rows;
+      const pullRequest = (number: number, title: string, action = "opened") => ({
+        action,
+        repository: { full_name: "KodaAllison/koder" },
+        pull_request: { number, title, body: null, merged: action === "closed" },
+      });
+
+      await step("history: after a random run of every kind of write, GET /state?rev=N is byte for byte what GET /state said at N", async () => {
+        const seed = Number(process.env.KODER_TEST_SEED ?? Math.floor(Math.random() * 2 ** 31));
+        let action = "";
+        try {
+          for (const runSeed of [seed, seed + 1]) {
+            const g = generator(runSeed);
+            // Start from a full random board: both boards, lifeMeta items, notes.
+            await seedBoard(baseUrl, {});
+            const start = await call("PUT", "/state", {
+              baseRev: (await getState(baseUrl)).rev,
+              board: randomBoard(g, `h${runSeed % 1000}`),
+            });
+            assert.equal(start.status, 200);
+            const seen = new Map<number, string>(); // rev -> GET /state body
+            const first = await stateText();
+            seen.set(first.doc.rev, first.text);
+            let current = first.doc;
+            let graveyard: AnyCard[] = [];
+            let prNumber = 1000;
+            const projectCards = () =>
+              Object.entries(current.board.projects).flatMap(([column, cards]) => cards.map((c) => ({ ...c, column })));
+            for (let n = 0; n < 80; n++) {
+              const kind = g.int(12);
+              const target = g.pick(projectCards());
+              action = `run ${runSeed}, write #${n}, kind ${kind}`;
+              let res: Response;
+              if (kind <= 3 || (kind >= 5 && kind <= 7 && !target)) {
+                // A tab's sync: moves, reorders, deletes, re-adds, edits,
+                // columns, lifeMeta, and now and then an unknown top-level key.
+                const columns = Object.keys(current.board.projects).length + Object.keys(current.board.life).length;
+                const base = structuredClone(current.board) as unknown as AnyBoard;
+                Object.defineProperty(base, "_deleted", { value: graveyard, enumerable: false });
+                const board = columns ? mutateBoard(g, base, `h${runSeed % 1000}x${n}`) : randomBoard(g, `h${runSeed % 1000}x${n}`);
+                graveyard = (board as unknown as { _deleted?: AnyCard[] })._deleted ?? [];
+                const top = board as unknown as Record<string, unknown>;
+                if (g.chance(0.15)) top.settings = { theme: g.pick(["dark", "light"]), n };
+                else if (g.chance(0.1)) delete top.settings;
+                res = await call("PUT", "/state", { baseRev: current.rev, board });
+              } else if (kind === 4) {
+                res = await createTicket({
+                  title: text(g),
+                  column: g.pick(["backlog", "todo", "doing", "review", "done"]),
+                  project: g.pick(["koder", "holitrackr", null]),
+                });
+              } else if (kind === 5) {
+                res = await patchBody(target!.id, g.chance(0.5) ? { title: text(g) } : { note: text(g), priority: "high" });
+              } else if (kind === 6) {
+                res = await patchBody(target!.id, { column: g.pick(["backlog", "todo", "doing", "review", "done"]) });
+              } else if (kind === 7) {
+                res = await call("DELETE", `/tickets/${target!.id}`);
+              } else if (kind === 8) {
+                // A webhook for a ticket with a quotable ref (any outcome will do:
+                // moved, unchanged, ignored or refused; only a move bumps rev).
+                const tickets = (await (await call("GET", "/tickets")).json() as { tickets: { ref: string }[] }).tickets
+                  .filter((t) => /^[A-Z0-9]+-[A-Z0-9]{4}$/.test(t.ref));
+                const ref = tickets.length ? g.pick(tickets).ref : "KODER-NONE";
+                res = await postWebhook(baseUrl, pullRequest(prNumber++, `${ref} history`, g.chance(0.5) ? "opened" : "closed"));
+              } else if (kind === 9) {
+                res = await call("POST", "/state/restore", { rev: g.pick([...seen.keys()]) });
+              } else if (kind === 10 && target) {
+                // Archive is not a board write: no rev, no change to GET /state.
+                res = await call("POST", "/archive", { cards: [{ ...target, board: "projects", archivedAt: n }] });
+              } else {
+                res = await createTicket({ title: `filler ${n}` });
+              }
+              assert.ok(res.status < 500, `${res.status} ${await res.text()}`);
+              const after = await stateText();
+              assert.ok(after.doc.rev === current.rev || after.doc.rev === current.rev + 1, "one write is at most one rev");
+              if (seen.has(after.doc.rev)) assert.equal(after.text, seen.get(after.doc.rev), "a rev is one body");
+              seen.set(after.doc.rev, after.text);
+              current = after.doc;
+            }
+
+            action = `run ${runSeed}, checking history`;
+            const revs = [...seen.keys()].sort((a, b) => a - b);
+            assert.deepEqual(revs, revs.map((_, i) => revs[0] + i), "every rev in the run was seen");
+            for (const rev of revs) {
+              const res = await call("GET", `/state?rev=${rev}`);
+              assert.equal(res.status, 200, `rev ${rev}`);
+              assert.equal(await res.text(), seen.get(rev), `GET /state?rev=${rev}`);
+            }
+            const listed = await listRevisions();
+            assert.equal(listed[0].rev, current.rev);
+            for (let i = 1; i < listed.length; i++) assert.equal(listed[i].rev, listed[i - 1].rev - 1, "newest first, none missing");
+            for (const r of listed) {
+              if (!seen.has(r.rev)) continue;
+              const doc = JSON.parse(seen.get(r.rev)!) as Doc;
+              assert.deepEqual(r, { rev: doc.rev, updatedAt: doc.updatedAt });
+            }
+          }
+        } catch (err) {
+          // A new error, not an edited message: the seed is the part that matters.
+          throw new Error(
+            `history failed at ${action}; rerun with KODER_TEST_SEED=${seed}: ` +
+              (err instanceof Error ? err.message : String(err)),
+            { cause: err },
+          );
+        }
+      });
+
+      await step("restore: an older rev, twice, from before a card existed, then forward writes; links follow the current card", async () => {
+        const seen = new Map<number, string>();
+        const record = async () => {
+          const { text, doc } = await stateText();
+          seen.set(doc.rev, text);
+          return doc;
+        };
+        const find = (doc: Doc, id: string) => Object.values(doc.board.projects).flat().find((c) => c.id === id);
+
+        await seedBoard(baseUrl, { todo: [card("t_rest_aaaa"), card("t_rest_bbbb", "koder", { title: "B" })] });
+        const unlinked = await record();
+        assert.equal((await openPr(40, "KODER-AAAA")).status, 200);
+        assert.equal((await openPr(41, "KODER-BBBB")).status, 200);
+        const linked = await record();
+        const created = await createTicket({ title: "born later", column: "todo" });
+        assert.equal(created.status, 201);
+        const later = (await created.json() as { card: Card }).card;
+        const withLater = await record();
+        // A is relinked to a newer PR; B is deleted, link and all.
+        assert.equal((await openPr(42, "KODER-AAAA")).status, 200);
+        assert.equal((await call("DELETE", "/tickets/t_rest_bbbb")).status, 200);
+        const current = await record();
+        assert.deepEqual([find(current, "t_rest_aaaa")?.pr, find(current, "t_rest_aaaa")?.prRev], ["KodaAllison/koder#42", 2]);
+
+        // Back to `linked`: A keeps its CURRENT link (#42, 2), B (deleted since)
+        // comes back with its own (#41, 1), and the later card is gone. All
+        // else is `linked` exactly, key order included.
+        const first = await restoreRev(linked.rev);
+        assert.equal(first.rev, current.rev + 1);
+        const restored = await record();
+        const expected = structuredClone(linked.board);
+        const a = Object.values(expected.projects).flat().find((c) => c.id === "t_rest_aaaa")!;
+        a.pr = "KodaAllison/koder#42";
+        a.prRev = 2;
+        assert.equal(JSON.stringify(restored.board), JSON.stringify(expected));
+        assert.deepEqual([find(restored, "t_rest_bbbb")?.pr, find(restored, "t_rest_bbbb")?.prRev], ["KodaAllison/koder#41", 1]);
+        assert.equal(find(restored, later.id), undefined);
+        const log = await logged(first.rev);
+        assert.deepEqual(log.revisions.map((r) => r.actor), ["restore"]);
+        assert.ok(log.changes.every((c) => c.actor === "restore"));
+
+        // Restoring the same rev again is a write of its own, to the same board.
+        const second = await restoreRev(linked.rev);
+        assert.equal(second.rev, first.rev + 1);
+        const twice = await record();
+        assert.equal(JSON.stringify(twice.board), JSON.stringify(restored.board));
+        assert.deepEqual((await logged(second.rev)).changes, []);
+
+        // The rev after the later card was made brings it back as it was.
+        await restoreRev(withLater.rev);
+        const back = await record();
+        assert.deepEqual(find(back, later.id), find(withLater, later.id));
+
+        // From before any link: both survive now, so both keep their current links.
+        await restoreRev(unlinked.rev);
+        const oldest = await record();
+        assert.deepEqual(oldest.board.projects.todo.map((c) => [c.id, c.pr, c.prRev]), [
+          ["t_rest_aaaa", "KodaAllison/koder#42", 2],
+          ["t_rest_bbbb", "KodaAllison/koder#41", 1],
+        ]);
+
+        // Forward writes after all that: a PUT, a PATCH, a webhook move.
+        const edited = structuredClone(oldest.board);
+        edited.projects.todo[0].title = "after restore";
+        assert.equal((await call("PUT", "/state", { baseRev: oldest.rev, board: edited })).status, 200);
+        await record();
+        assert.equal((await patchBody("t_rest_bbbb", { column: "doing" })).status, 200);
+        await record();
+        assert.equal((await openPr(43, "KODER-BBBB")).status, 200);
+        const end = await record();
+        assert.deepEqual([find(end, "t_rest_bbbb")?.pr, find(end, "t_rest_bbbb")?.prRev], ["KodaAllison/koder#43", 2]);
+
+        // Every rev seen on the way is served back byte for byte.
+        for (const [rev, text] of seen) assert.equal((await stateText(`/state?rev=${rev}`)).text, text, `rev ${rev}`);
+      });
+
+      await step("webhook: one delivery id fired concurrently moves the card once and bumps rev once", async () => {
+        const before = await seedBoard(baseUrl, { doing: [card("t_conc_hook")] });
+        /* PGlite runs one transaction at a time and the server pool is 1, so
+         * these deliveries are serialised, not truly concurrent: this proves
+         * the predicate (the delivery check loaded under the head lock, and
+         * ON CONFLICT on the delivery id), not the lock wait itself. */
+        const delivery = freshDelivery();
+        const responses = await Promise.all(
+          Array.from({ length: 6 }, () => postWebhook(baseUrl, pullRequest(60, "KODER-HOOK concurrent"), { delivery })),
+        );
+        const bodies = await Promise.all(responses.map(async (r) => {
+          assert.equal(r.status, 200);
+          return await r.json() as { updated: boolean; redelivered?: boolean; rev: number };
+        }));
+        assert.equal(bodies.filter((b) => b.updated).length, 1, JSON.stringify(bodies));
+        assert.equal(bodies.filter((b) => b.redelivered).length, 5, JSON.stringify(bodies));
+        assert.ok(bodies.every((b) => b.rev === before.rev + 1), JSON.stringify(bodies));
+        const after = await getState(baseUrl);
+        assert.equal(after.rev, before.rev + 1);
+        assert.deepEqual(after.board.projects.review.map((c) => [c.id, c.pr, c.prRev]), [["t_conc_hook", "KodaAllison/koder#60", 1]]);
+        assert.deepEqual(await deliveryRow(delivery), [{ outcome: "moved", rev: before.rev + 1 }]);
+        assert.deepEqual((await logged(after.rev)).revisions.map((r) => r.actor), ["webhook"]);
+        // The card, and the review column it created.
+        assert.deepEqual(
+          (await logged(after.rev)).changes.map((c) => [c.entity, c.entity_id, c.op, c.actor]),
+          [["card", "t_conc_hook", "update", "webhook"], ["board", "koda", "update", "webhook"]],
+        );
+
+        // One id, two payloads racing: a no-op (recordDelivery) and a move
+        // (commitWebhookMove). Whichever records first decides; the rest are
+        // redeliveries, and the board moved at most once.
+        const mixed = freshDelivery();
+        const base = await seedBoard(baseUrl, { doing: [card("t_conc_hook")] });
+        const raced = await Promise.all(Array.from({ length: 6 }, (_, i) =>
+          postWebhook(baseUrl, pullRequest(61, "KODER-HOOK mixed", i % 2 ? "synchronize" : "opened"), { delivery: mixed })
+        ));
+        const raceBodies = await Promise.all(raced.map((r) => r.json())) as { updated?: boolean; ignored?: string }[];
+        const rows = await deliveryRow(mixed);
+        assert.equal(rows.length, 1);
+        const final = await getState(baseUrl);
+        const moves = raceBodies.filter((b) => b.updated === true).length;
+        if (rows[0].outcome === "moved") {
+          assert.equal(moves, 1);
+          assert.equal(final.rev, base.rev + 1);
+        } else {
+          assert.equal(rows[0].outcome, "noop");
+          assert.equal(moves, 0);
+          assert.equal(final.rev, base.rev);
+        }
+        assert.equal(raceBodies.filter((b) => b.updated === undefined && b.ignored === undefined).length, 0);
+      });
+
+      /* Fault injection through the database the harness holds: a trigger that
+       * raises a chosen SQLSTATE on insert, installed and removed from the
+       * test. Nothing in the server knows about it.
+       *
+       * Two quirks of PGlite behind pglite-socket 0.2.11 shape these steps;
+       * neither is Postgres behaviour (on a real server each connection is
+       * its own session and replies come in order):
+       *  - when a statement in the MIDDLE of a pipelined batch fails, replies
+       *    get out of step (the server can see 25P02 instead of the injected
+       *    code, and PGlite answer a later query with the wrong rows), so each
+       *    fault sits on the LAST statement of the write's batch: the
+       *    revisions row; the delivery row for a webhook move; the only
+       *    statement of a delivery no-op or an archive. That still fails the
+       *    transaction after every other write in it;
+       *  - after a failed transaction the server can answer before PGlite has
+       *    run its ROLLBACK, and the test's `db` shares PGlite's one session,
+       *    so settled() waits for the session to leave the aborted transaction
+       *    before the test touches the database. */
+      const settled = async () => {
+        for (let attempt = 0; attempt < 100; attempt++) {
+          try {
+            await db.query("SELECT 1");
+            return;
+          } catch {
+            await new Promise((resolve) => setTimeout(resolve, 20));
+          }
+        }
+        throw new Error("PGlite's session never left the failed transaction");
+      };
+      await db.exec(`
+        CREATE FUNCTION koder_test_fault() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          RAISE EXCEPTION 'injected fault on %', TG_TABLE_NAME USING ERRCODE = TG_ARGV[0];
+        END $$`);
+      const injectFault = (table: string, code: string) =>
+        db.exec(`CREATE TRIGGER koder_test_fault BEFORE INSERT ON ${table} FOR EACH ROW EXECUTE FUNCTION koder_test_fault('${code}')`);
+      const removeFault = (table: string) => db.exec(`DROP TRIGGER koder_test_fault ON ${table}`);
+
+      await step("a webhook move and its delivery row commit together or not at all", async () => {
+        const before = await seedBoard(baseUrl, { doing: [card("t_atom_hook")] });
+        const counts = await tableCounts();
+        const delivery = freshDelivery();
+        const payload = pullRequest(70, "KODER-HOOK atomic");
+        // The delivery insert fails after the head update, the card's new
+        // row, its changes row and the revisions row have all been written
+        // in the same transaction.
+        await injectFault("webhook_deliveries", "P0001");
+        try {
+          assert.equal((await postWebhook(baseUrl, payload, { delivery })).status, 500);
+        } finally {
+          await settled();
+          await removeFault("webhook_deliveries");
+        }
+        await assertUntouched(before);
+        assert.deepEqual(await tableCounts(), counts);
+        assert.deepEqual(await deliveryRow(delivery), []);
+        assert.deepEqual(
+          (await db.query(`SELECT pr FROM cards WHERE id = 't_atom_hook'`)).rows,
+          [{ pr: null }],
+        );
+
+        // GitHub's redelivery of the same id then lands, once.
+        const retry = await postWebhook(baseUrl, payload, { delivery });
+        assert.equal(retry.status, 200);
+        assert.equal((await retry.json() as { updated: boolean }).updated, true);
+        assert.equal((await getState(baseUrl)).rev, before.rev + 1);
+        assert.deepEqual(await deliveryRow(delivery), [{ outcome: "moved", rev: before.rev + 1 }]);
+      });
+
+      await step("contention (40001, 55P03) on any write is a 503 that leaves no trace, and the retry lands", async () => {
+        const contention = { error: "write contention, retry" };
+        /* Fault on `table`, send `request`: 503, and the board, rev and every
+         * history/delivery/archive table exactly as they were. Then remove the
+         * fault and send the same request again: `ok`. */
+        const faulted = async (code: string, table: string, request: () => Promise<Response>, ok: number) => {
+          const before = await getState(baseUrl);
+          const counts = await tableCounts();
+          await injectFault(table, code);
+          try {
+            const res = await request();
+            assert.equal(res.status, 503, `${code} on ${table}`);
+            assert.deepEqual(await res.json(), contention);
+          } finally {
+            await settled();
+            await removeFault(table);
+          }
+          await assertUntouched(before);
+          assert.deepEqual(await tableCounts(), counts, `${code} on ${table}`);
+          const res = await request();
+          assert.equal(res.status, ok, `${code} on ${table}, retried: ${await res.clone().text()}`);
+          return res;
+        };
+        for (const code of ["40001", "55P03"]) {
+          const seeded = await seedBoard(baseUrl, {
+            todo: [card("t_fault_0001"), card("t_fault_0002"), card("t_fault_hook")],
+          });
+          const edited = structuredClone(seeded.board);
+          edited.projects.todo[0].title = `edited under ${code}`;
+          await faulted(code, "revisions", () => call("PUT", "/state", { baseRev: seeded.rev, board: edited }), 200);
+          await faulted(code, "revisions", () => createTicket({ title: `made under ${code}` }), 201);
+          await faulted(code, "revisions", () => patchBody("t_fault_0001", { column: "doing" }), 200);
+          await faulted(code, "revisions", () => call("DELETE", "/tickets/t_fault_0002"), 200);
+          await faulted(code, "revisions", () => call("POST", "/state/restore", { rev: seeded.rev }), 200);
+
+          // The webhook: a move (board write), a no-op decided on the board
+          // (commitWebhookMove), and one decided without it (recordDelivery).
+          const move = freshDelivery();
+          const moved = await faulted(code, "webhook_deliveries", () => postWebhook(baseUrl, pullRequest(80, "KODER-HOOK fault"), { delivery: move }), 200);
+          assert.equal((await moved.json() as { updated: boolean }).updated, true);
+          assert.equal((await deliveryRow(move))[0].outcome, "moved");
+          const noRef = freshDelivery();
+          await faulted(code, "webhook_deliveries", () => postWebhook(baseUrl, pullRequest(81, "no ref here"), { delivery: noRef }), 202);
+          assert.equal((await deliveryRow(noRef))[0].outcome, "ignored: no ticket ref");
+          const noop = freshDelivery();
+          await faulted(code, "webhook_deliveries", () => postWebhook(baseUrl, pullRequest(82, "KODER-HOOK", "synchronize"), { delivery: noop }), 202);
+          assert.equal((await deliveryRow(noop))[0].outcome, "noop");
+
+          // The archive.
+          const lifted = await faulted(code, "archived_cards", () => call("POST", "/archive", { cards: [archived(`t_fault_arch${code}`, 1)] }), 200);
+          assert.equal((await lifted.json() as { archived: number }).archived, 1);
+        }
+        await db.exec(`DROP FUNCTION koder_test_fault()`);
+      });
+
+      await step("a long history: /revisions lists the newest 200, and older revs are still served and restorable", async () => {
+        const seeded = await seedBoard(baseUrl, { todo: [card("t_long_0001")] });
+        const oldestOfStep = await stateText();
+        let rev = seeded.rev;
+        for (let i = 0; i < 300; i++) {
+          const todo = [card("t_long_0001", "koder", { title: `v${i}` })];
+          if (i % 3 === 0) todo.push(card(`t_long_x${i}`));
+          const res = await call("PUT", "/state", { baseRev: rev, board: { projects: { todo }, life: {}, lifeMeta: {} } });
+          assert.equal(res.status, 200);
+          rev = (await res.json() as { rev: number }).rev;
+        }
+        const head = await stateText();
+        assert.equal(head.doc.rev, seeded.rev + 300);
+
+        const listed = await listRevisions();
+        assert.equal(listed.length, 200);
+        assert.deepEqual(listed[0], { rev: head.doc.rev, updatedAt: head.doc.updatedAt });
+        assert.deepEqual(listed.map((r) => r.rev), Array.from({ length: 200 }, (_, i) => head.doc.rev - i));
+
+        // Older than anything listed, and still there.
+        assert.equal((await stateText(`/state?rev=${seeded.rev}`)).text, oldestOfStep.text);
+        const first = await stateText("/state?rev=1");
+        assert.equal(first.doc.rev, 1);
+        assert.equal((await call("GET", "/state?rev=0")).status, 404);
+        // Integers past 2^53 (and past bigint) are unknown revs, not a 500.
+        for (const huge of ["9007199254740993", "99999999999999999999", "1e30"]) {
+          const res = await call("GET", `/state?rev=${huge}`);
+          assert.equal(res.status, 404, huge);
+          assert.match(String(await errorOf(res)), /^no snapshot for rev /);
+          assert.equal((await call("POST", "/state/restore", undefined, `{"rev": ${huge}}`)).status, 404, huge);
+        }
+
+        // Restoring the database's very first rev, and this step's oldest.
+        await restoreRev(1);
+        assert.equal(JSON.stringify((await getState(baseUrl)).board), JSON.stringify(first.doc.board));
+        await restoreRev(seeded.rev);
+        const now = await getState(baseUrl);
+        assert.equal(now.rev, head.doc.rev + 2);
+        assert.equal(JSON.stringify(now.board), JSON.stringify(oldestOfStep.doc.board));
+        assert.equal((await listRevisions())[0].rev, now.rev);
       });
     } finally {
       await server.stop();

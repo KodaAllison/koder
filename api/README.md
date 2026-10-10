@@ -11,23 +11,35 @@ origin.
 entrypoint is `server/main.ts`, redeployed from `main`. Nothing here is deployed yet, and
 nothing in `server/` changes until the cutover (KODER-EE05 slice 4).
 
-## Not finished yet
+## Status
 
-This is slice 2 of 4. What works: `GET /state` (with the `ETag`/`304` validators), `PUT
-/state` (diff-applied into rows, with the `409`/`413` behaviour of the old server), `POST
-/tickets`, `PATCH`/`DELETE /tickets/:id`, `GET /tickets`, `POST`/`GET /archive`, `GET
-/pr-status`, the webhook's authentication and size checks, all request validation, CORS,
-auth and the static PWA. These `Store` methods in `src/pg-store.ts` still throw
-`PgStore.<method> is not implemented yet`, so the routes that need them answer a bare 500:
+Slice 3 of 4: every route is implemented, and the whole contract suite ported from
+`server/` passes against Postgres with no step skipped. What is left is the cutover
+(slice 4): deploying this, importing the KV board, and retiring `server/`.
 
-| Method | Routes |
-|---|---|
-| `boardAt`, `listRevisions`, `restore` | `GET /state?rev=N`, `GET /revisions`, `POST /state/restore` (slice 3) |
-| `hasDelivery`, `recordDelivery`, `commitWebhookMove` | `POST /webhooks/github` past its signature check (slice 3) |
+## History, restore and the webhook
 
-The contract suite reports every step that needs one of these as skipped, with the
-methods it is waiting for (`PG_PENDING` in `tests/contract.test.ts`); slice 3 empties
-that list.
+There are no snapshots. Every board write (PUT, the ticket routes, restore, a webhook move)
+logs one `changes` row per entity it touched (a card, a lifeMeta item, the life notes, the
+board's own column layout and unknown top-level keys), holding that entity's whole stored
+state before and after, plus one `revisions` row, in the same transaction as the write.
+
+- `GET /state?rev=N` is the live rows with every change after N undone, newest first
+  (`rewind()` in `src/pg-store.ts`): one statement, and the same body, byte for byte, that
+  `GET /state` returned at N. The cost grows with the number of changes since N. It is a
+  404 exactly when no `revisions` row names N: rev 0, a rev past the head, or one from
+  before this database's history began.
+- The log is kept whole, with no retention cap, so every rev stays reachable. `GET
+  /revisions` lists the newest 200 (newest first, same shape as before); older revs are
+  still served by `GET /state?rev=N` and restorable.
+- `POST /state/restore` rewinds to N under the `board_head` lock, applies the restore rule
+  (cards that still exist keep their CURRENT `pr`/`prRev`; a card deleted since N comes back
+  with N's own), and diff-applies that against the live board like a PUT, logged as
+  `restore`. Rev never rewinds; restoring the head is a write of its own.
+- The webhook decides each event under the `board_head` lock and records the delivery in
+  `webhook_deliveries` in the SAME transaction as the move it made, or as the decision not
+  to move. A replayed delivery id changes nothing. It is the only writer of `pr`/`pr_rev`
+  apart from restore putting back the values above.
 
 ## Run it
 
@@ -88,12 +100,21 @@ What differs from the Deno server on purpose:
   (a `json` column, so key order is kept too), the first of two equal ids in one batch wins
   (KV kept both), a batch over 2 MiB is a 413, and there are no chunks: `chunk` is always
   0 and `chunks` is 1 once anything is archived.
-- `POST`/`PATCH`/`DELETE /tickets` lock `board_head` and rewrite from the current board in
-  one transaction, instead of retrying a compare-and-swap five times. A lock wait over 5
-  seconds, a deadlock or a serialization failure is the same 503 `write contention, retry`.
-  Their `changes` rows are attributed to `cli`. A deleted ticket is soft-deleted, and a
-  title or note with U+0000 or a lone surrogate is stored (and later read) with U+FFFD, as
-  for `PUT`, though the create response still echoes what was sent.
+- `POST`/`PATCH`/`DELETE /tickets`, `POST /state/restore` and the webhook lock `board_head`
+  and rewrite from the current board in one transaction, instead of retrying a
+  compare-and-swap five times. A lock wait over 5 seconds, a deadlock or a serialization
+  failure is the same 503 `write contention, retry`, and so is a serialization failure or
+  deadlock on `PUT /state` (KV had no such case; a stale `baseRev` is still the 409). The
+  ticket routes' `changes` rows are attributed to `cli`. A deleted ticket is soft-deleted,
+  and a title or note with U+0000 or a lone surrogate is stored (and later read) with
+  U+FFFD, as for `PUT`, though the create response still echoes what was sent.
+- History: every revision stays reachable (KV kept the last 20), so the 404 for an unknown
+  rev no longer says "(only the last 20 are kept)", and `GET /revisions` lists the newest
+  200 rather than every reachable rev (see above). A rev past 2^53 is a 404 like any other
+  unknown rev. The 20 KV snapshots are not migrated: history starts at the cutover, after
+  the safety export to dated JSON.
+- A webhook move that would take the board past 2 MiB is a 507 and records nothing, so
+  GitHub's retry can land it later (KV did the same with its 64KB).
 - What `GET /state` gives back after a `PUT` differs from what was sent in a few corner
   cases of storing a board as rows; each is listed, with its reason, at the top of
   `src/pg-store.ts`:
@@ -120,10 +141,14 @@ npm test                # node --test
 `node src/main.ts` and drives it only over HTTP. Postgres is PGlite (Postgres compiled to
 WASM, in the test process) behind `@electric-sql/pglite-socket`, so the server talks to it
 with the same driver and wire protocol it uses against Neon; every server gets a fresh
-database, so nothing outside `api/` is needed. Set `KODER_TEST_SEED` to replay the
-round-trip property step with the seed a failure printed. PGlite runs one transaction at a
-time, so the concurrency step proves the compare-and-swap on `baseRev`, not real lock
-contention.
+database, so nothing outside `api/` is needed. No step is skipped. Set `KODER_TEST_SEED`
+to replay the round-trip and history property steps with the seed a failure printed (the
+history step runs a random mix of every kind of write, then checks every rev's `GET
+/state?rev=N` byte for byte against what `GET /state` said at the time). PGlite runs one
+transaction at a time, so the concurrency steps (racing PUTs, ticket writes, duplicate
+webhook deliveries) prove the predicates, not real lock contention. The 503 contention
+path is proven by fault injection: the test installs a trigger that raises `40001` or
+`55P03`, through the PGlite handle it holds; the server has no test hooks.
 
 The root `npm test` stays the frontend's (type check of `js/` plus `tests/`); it doesn't
 look in `api/`.

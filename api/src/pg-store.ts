@@ -1,8 +1,7 @@
 /* PgStore — the Store (store.ts) backed by Postgres (Neon in production,
- * reached through NEON_DATABASE_URL; PGlite in the tests). INCOMPLETE until
- * KODER-EE05 slice 3: reads, PUT /state, the ticket routes and the archive
- * work; history (boardAt, listRevisions, restore) and the webhook throw until
- * slice 3 lands them.
+ * reached through NEON_DATABASE_URL; PGlite in the tests). Every Store method
+ * is implemented: reads, PUT /state, the ticket routes, the archive, history
+ * (boardAt, listRevisions, restore) and the webhook.
  *
  * Layout (pg-schema.ts): the board is rows, not one document. A card is a row
  * in `cards` keyed by its client id, placed by (board_id, column_id, rank);
@@ -15,6 +14,17 @@
  * (archived_cards), written without touching the head, as the KV server kept
  * it in separate keys. A card is archived while still live on the board; the
  * client drops it with a later PUT.
+ *
+ * History: there are no snapshots. Every board write logs one `changes` row
+ * per entity it touched (a card, a lifeMeta item, the life notes, the board's
+ * own layout/extra), holding the entity's full stored state before and after,
+ * plus one `revisions` row; board@N is the live rows with every change after
+ * N undone, newest first (rewind() below). The log is kept whole (no
+ * retention cap), so every rev a revisions row names stays reachable.
+ *
+ * Webhook deliveries: one row in webhook_deliveries per delivery id, kept
+ * forever, inserted in the SAME transaction as the board write its outcome
+ * was decided against (commitWebhookMove), under the board_head lock.
  *
  * Round-tripping a board: whatever a client PUTs comes back from GET /state
  * as it was sent, as KV did, with these exceptions, each forced by keying
@@ -50,6 +60,7 @@ import postgres from "postgres";
 import { migrate, OWNER } from "./pg-schema.ts";
 import {
   type Actor,
+  applyWebhookEvent,
   type ArchivedCard,
   type ArchiveResult,
   type Board,
@@ -60,12 +71,14 @@ import {
   type PutResult,
   type Store,
   resolveTicketId,
+  restoreWorkflowMetadata,
   StoreContentionError,
   StoreFullError,
   type StoreLimits,
   type TicketEdits,
   type Unresolved,
   type WebhookEvent,
+  type WebhookOutcome,
   type WebhookResult,
 } from "./store.ts";
 
@@ -348,6 +361,206 @@ type Change = {
 type StoredCard = CardRow & { deleted: boolean };
 type StoredItem = ItemRow & { deleted: boolean };
 
+/* ---- History: board@N from the live rows and the `changes` log ----
+ * A logged change as rewind() needs it. `before` is the entity's stored state
+ * (cardState, itemState, the notes row, or the board's {layout, extra}) as it
+ * was before that rev, or null when the rev brought it into being: an insert,
+ * a resurrection from a soft delete included. */
+export type LoggedChange = {
+  rev: number;
+  seq: number;
+  entity: Change["entity"];
+  entity_id: string;
+  before: any;
+};
+
+/* Undo `changes` (every change after rev N, NEWEST FIRST) on the rows of the
+ * head, giving the rows as they stood at N. Each change puts its entity back
+ * to `before`, or removes it when `before` is null; as every write logs each
+ * entity it touches with its whole state, nothing else is needed, and
+ * rowsToBoard() turns the result into the board GET /state returned at N:
+ * same column order (layout), same card order (rank), same field order. The
+ * cost is linear in the changes since N, so a deep rev reads more of the log;
+ * at personal scale that is a few thousand small rows. */
+export function rewind(rows: BoardRows, changes: LoggedChange[]): BoardRows {
+  const cards = new Map(rows.cards.map((row) => [row.id, row]));
+  const items = new Map(rows.items.map((row) => [row.id, row]));
+  let { layout, extra, notes, notesExtra } = rows.meta;
+  for (const change of changes) {
+    const { entity_id: id, before } = change;
+    switch (change.entity) {
+      case "card":
+        if (before === null) cards.delete(id);
+        else cards.set(id, { id, ...before });
+        break;
+      case "life_item":
+        if (before === null) items.delete(id);
+        else items.set(id, { id, ...before });
+        break;
+      case "life_notes":
+        notes = before.notes;
+        notesExtra = before.extra;
+        break;
+      case "board":
+        layout = before.layout;
+        extra = before.extra;
+        break;
+    }
+  }
+  return { meta: { layout, extra, notes, notesExtra }, cards: [...cards.values()], items: [...items.values()] };
+}
+
+/* ---- Diff-apply: what takes the stored board to a planned one ----
+ * Shared by PUT /state and restore, which differ only in where a card's
+ * pr/pr_rev come from (`workflowFor`). `stored` is the head's rows: every
+ * live card and item, plus (PUT only) soft-deleted rows the body names. */
+type Stored = {
+  head: { layout: Layout; extra: Json };
+  cards: StoredCard[];
+  items: StoredItem[];
+  notes: { notes: string; extra: Json };
+};
+type Workflow = { pr: string | null; pr_rev: number | null };
+type Diff = {
+  changes: Change[];
+  nextCards: CardRow[]; // the live cards after the write
+  nextItems: ItemRow[];
+  upserts: CardRow[];
+  removedCards: string[];
+  itemUpserts: ItemRow[];
+  removedItems: string[];
+  notesChanged: boolean;
+};
+
+function diffBoard(
+  plan: Plan,
+  stored: Stored,
+  workflowFor: (card: Json, prior: StoredCard | undefined) => Workflow,
+): Diff {
+  const changes: Change[] = [];
+  const change = (c: Omit<Change, "seq">) => changes.push({ seq: changes.length + 1, ...c });
+
+  /* ---- Cards ---- */
+  const storedCards = new Map(stored.cards.map((row) => [row.id, row]));
+  const nextRank = new Map<string, number>();
+  const nextCards: CardRow[] = [];
+  const upserts: CardRow[] = [];
+  for (const { card, board_id, column_id } of plan.cards) {
+    const id = card.id as string;
+    const prior = storedCards.get(id);
+    const slot = `${board_id}\u0000${column_id}`;
+    const index = nextRank.get(slot) ?? 0;
+    nextRank.set(slot, index + 1);
+    const row = cardToRow(card, board_id, column_id, rankAt(index), workflowFor(card, prior));
+    nextCards.push(row);
+    if (!prior || prior.deleted) {
+      // New, or resurrected from a soft delete: back on the board as a fresh card.
+      upserts.push(row);
+      change({ entity: "card", entity_id: id, op: "insert", before: null, after: cardState(row) });
+    } else if (canonical(cardState(prior)) !== canonical(cardState(row))) {
+      upserts.push(row);
+      change({ entity: "card", entity_id: id, op: "update", before: cardState(prior), after: cardState(row) });
+    }
+  }
+  const kept = new Set(nextCards.map((row) => row.id));
+  const removedCards: string[] = [];
+  for (const row of stored.cards) {
+    if (row.deleted || kept.has(row.id)) continue;
+    removedCards.push(row.id);
+    change({ entity: "card", entity_id: row.id, op: "delete", before: cardState(row), after: null });
+  }
+
+  /* ---- lifeMeta items ---- */
+  const storedItems = new Map(stored.items.map((row) => [row.id, row]));
+  const itemRank = new Map<LifeKind, number>();
+  const nextItems: ItemRow[] = [];
+  const itemUpserts: ItemRow[] = [];
+  for (const { item, kind } of plan.items) {
+    const index = itemRank.get(kind) ?? 0;
+    itemRank.set(kind, index + 1);
+    const row = itemToRow(item, kind, rankAt(index));
+    nextItems.push(row);
+    const prior = storedItems.get(row.id);
+    if (!prior || prior.deleted) {
+      itemUpserts.push(row);
+      change({ entity: "life_item", entity_id: row.id, op: "insert", before: null, after: itemState(row) });
+    } else if (canonical(itemState(prior)) !== canonical(itemState(row))) {
+      itemUpserts.push(row);
+      change({ entity: "life_item", entity_id: row.id, op: "update", before: itemState(prior), after: itemState(row) });
+    }
+  }
+  const keptItems = new Set(nextItems.map((row) => row.id));
+  const removedItems: string[] = [];
+  for (const row of stored.items) {
+    if (row.deleted || keptItems.has(row.id)) continue;
+    removedItems.push(row.id);
+    change({ entity: "life_item", entity_id: row.id, op: "delete", before: itemState(row), after: null });
+  }
+
+  /* ---- life notes, and the board's own shape ---- */
+  const notesAfter = { notes: plan.meta.notes, extra: plan.meta.notesExtra };
+  const notesChanged = canonical(stored.notes) !== canonical(notesAfter);
+  if (notesChanged) {
+    change({ entity: "life_notes", entity_id: OWNER, op: "update", before: stored.notes, after: notesAfter });
+  }
+  const boardBefore = { layout: stored.head.layout, extra: stored.head.extra };
+  const boardAfter = { layout: plan.meta.layout, extra: plan.meta.extra };
+  if (canonical(boardBefore) !== canonical(boardAfter) ||
+    // canonical() sorts keys, but column ORDER lives in the arrays and
+    // board.extra's key order is part of what GET returns.
+    JSON.stringify(Object.keys(boardBefore.extra)) !== JSON.stringify(Object.keys(boardAfter.extra))) {
+    change({ entity: "board", entity_id: OWNER, op: "update", before: boardBefore, after: boardAfter });
+  }
+  return { changes, nextCards, nextItems, upserts, removedCards, itemUpserts, removedItems, notesChanged };
+}
+
+/* The size check, on the board exactly as GET /state will return it after a
+ * diff-apply, before anything is written. */
+function checkDiffSize(plan: Plan, diff: Diff): void {
+  const size = Buffer.byteLength(
+    JSON.stringify(rowsToBoard({ meta: plan.meta, cards: diff.nextCards, items: diff.nextItems })),
+  );
+  if (size > BOARD_MAX) throw new StoreFullError(size, BOARD_MAX);
+}
+
+/* The row writes of a diff-apply, for commitWrite to pipeline after the
+ * head's compare-and-swap. Statements with nothing to do aren't sent.
+ * Set-based throughout: each statement takes its rows as one jsonb array, so
+ * a write costs the same round trips whether it touches one card or five
+ * hundred. JSON goes in as `${…}::text::jsonb`: as a text parameter
+ * postgres.js sends the string as is, prepared or not (Neon's pooler runs
+ * unprepared); a bare `::jsonb` makes a prepared statement's jsonb serializer
+ * JSON-encode the string again, storing a jsonb string instead of the
+ * object. `workflow` is upsertCards' (only restore passes "write"). */
+function diffWrites(tx: PgTx, plan: Plan, diff: Diff, now: Date, workflow: "keep" | "write"): PromiseLike<unknown>[] {
+  const writes: PromiseLike<unknown>[] = [];
+  if (diff.upserts.length) writes.push(upsertCards(tx, diff.upserts, workflow));
+  if (diff.removedCards.length) writes.push(softDeleteCards(tx, diff.removedCards, now));
+  if (diff.itemUpserts.length) {
+    writes.push(tx`
+      INSERT INTO life_items AS l (id, owner_id, kind, rank, data, field_order)
+      SELECT r.id, ${OWNER}, r.kind, r.rank, r.data, r.field_order
+        FROM jsonb_to_recordset(${JSON.stringify(diff.itemUpserts)}::text::jsonb) AS r(
+               id text, kind text, rank text, data jsonb, field_order text[])
+      ON CONFLICT (id) DO UPDATE SET
+        kind = EXCLUDED.kind, rank = EXCLUDED.rank, data = EXCLUDED.data,
+        field_order = EXCLUDED.field_order, deleted_at = NULL
+      WHERE l.owner_id = EXCLUDED.owner_id`);
+  }
+  if (diff.removedItems.length) {
+    writes.push(tx`
+      UPDATE life_items SET deleted_at = ${now}
+       WHERE owner_id = ${OWNER} AND id = ANY(${diff.removedItems}::text[]) AND deleted_at IS NULL`);
+  }
+  if (diff.notesChanged) {
+    writes.push(tx`
+      UPDATE life_notes
+         SET notes = ${plan.meta.notes}, extra = ${JSON.stringify(plan.meta.notesExtra)}::text::jsonb
+       WHERE owner_id = ${OWNER}`);
+  }
+  return writes;
+}
+
 // Thrown inside the transaction to roll it back when the compare-and-swap on
 // board_head finds another writer got there first.
 class LostRace extends Error {}
@@ -372,10 +585,11 @@ function isContention(err: unknown): boolean {
  * then the `changes` rows and the `revisions` row, all pipelined; the row
  * count of the head update is checked once the batch is back, and a miss
  * rolls the transaction back with LostRace. `writes` are queries the caller
- * built from tx; they run in the order given, after the head update. The
- * timestamp is taken in JS, at millisecond precision, so the `updatedAt`
- * returned is exactly what GET /state and revisions.updated_at hold. Returns
- * the new rev (baseRev + 1). */
+ * built from tx; they run in the order given, after the head update. `after`
+ * runs last, behind the revisions row: the webhook's delivery row, which
+ * records the rev this write produced. The timestamp is taken in JS, at
+ * millisecond precision, so the `updatedAt` returned is exactly what GET
+ * /state and revisions.updated_at hold. Returns the new rev (baseRev + 1). */
 async function commitWrite(tx: PgTx, w: {
   baseRev: number;
   now: Date;
@@ -384,6 +598,7 @@ async function commitWrite(tx: PgTx, w: {
   extra: Json;
   changes: Change[];
   writes: PromiseLike<unknown>[];
+  after?: PromiseLike<unknown>[];
 }): Promise<number> {
   const { baseRev, now, actor, changes } = w;
   const rev = baseRev + 1;
@@ -405,30 +620,37 @@ async function commitWrite(tx: PgTx, w: {
   writes.push(tx`
     INSERT INTO revisions (owner_id, rev, updated_at, actor, summary)
     VALUES (${OWNER}, ${rev}, ${now}, ${actor}, ${summarize(changes)})`);
+  writes.push(...w.after ?? []);
   await Promise.all(writes);
   if ((await headUpdate as unknown[]).length !== 1) throw new LostRace();
   return rev;
 }
 
 /* Upsert card rows. A conflict is a soft-deleted row coming back, or a live
- * one being rewritten; pr/pr_rev are never taken from `rows`: a live card keeps
- * its own, a resurrected one comes back without. */
-function upsertCards(tx: PgTx, rows: CardRow[]) {
+ * one being rewritten. With workflow "keep" (PUT /state and the ticket
+ * routes) pr/pr_rev are never taken from `rows`: a live card keeps its own, a
+ * new or resurrected one comes back without. Only the webhook and restore
+ * pass "write", which stores the pr/pr_rev the row carries (the webhook's
+ * new link; restore's restoreWorkflowMetadata result). */
+function upsertCards(tx: PgTx, rows: CardRow[], workflow: "keep" | "write" = "keep") {
+  const write = workflow === "write";
   return tx`
     INSERT INTO cards AS c (id, owner_id, board_id, column_id, rank, title, note, priority,
-                            created, project_id, field_order, extra)
+                            created, project_id, field_order, extra, pr, pr_rev)
     SELECT r.id, ${OWNER}, r.board_id, r.column_id, r.rank, r.title, r.note, r.priority,
-           r.created, r.project_id, r.field_order, r.extra
+           r.created, r.project_id, r.field_order, r.extra,
+           CASE WHEN ${write}::boolean THEN r.pr END, CASE WHEN ${write}::boolean THEN r.pr_rev END
       FROM jsonb_to_recordset(${JSON.stringify(rows)}::text::jsonb) AS r(
              id text, board_id text, column_id text, rank text, title text, note text,
-             priority text, created bigint, project_id text, field_order text[], extra jsonb)
+             priority text, created bigint, project_id text, field_order text[], extra jsonb,
+             pr text, pr_rev bigint)
     ON CONFLICT (id) DO UPDATE SET
       board_id = EXCLUDED.board_id, column_id = EXCLUDED.column_id, rank = EXCLUDED.rank,
       title = EXCLUDED.title, note = EXCLUDED.note, priority = EXCLUDED.priority,
       created = EXCLUDED.created, project_id = EXCLUDED.project_id,
       field_order = EXCLUDED.field_order, extra = EXCLUDED.extra,
-      pr = CASE WHEN c.deleted_at IS NULL THEN c.pr END,
-      pr_rev = CASE WHEN c.deleted_at IS NULL THEN c.pr_rev END,
+      pr = CASE WHEN ${write}::boolean THEN EXCLUDED.pr WHEN c.deleted_at IS NULL THEN c.pr END,
+      pr_rev = CASE WHEN ${write}::boolean THEN EXCLUDED.pr_rev WHEN c.deleted_at IS NULL THEN c.pr_rev END,
       deleted_at = NULL,
       row_version = c.row_version + 1
     WHERE c.owner_id = EXCLUDED.owner_id`;
@@ -464,13 +686,63 @@ export function scrubSecret(message: string, url: string): string {
   return out.replace(/postgres(ql)?:\/\/[^\s'"]+/gi, "<url>");
 }
 
-// What a server-initiated write loads under the head lock: the live board.
+// What a server-initiated write loads under the head lock: the live board,
+// and on request the history after a rev and whether a delivery is recorded.
 type Locked = {
   head: { rev: number; layout: Layout; extra: Json };
   cards: CardRow[];
   items: ItemRow[];
   notes: { notes: string; extra: Json };
+  // With LockOptions.historyFrom = N: when rev N was written (null if no
+  // revisions row names it) and every change after it, newest first.
+  history?: { at: Date | null; changes: LoggedChange[] };
+  // With LockOptions.delivery: whether that delivery id is already recorded.
+  delivered?: boolean;
 };
+type LockOptions = { historyFrom?: number; delivery?: string };
+
+// The live board as rows, for rowsToBoard() and rewind().
+function lockedRows(cur: Locked): BoardRows {
+  return {
+    meta: { layout: cur.head.layout, extra: cur.head.extra, notes: cur.notes.notes, notesExtra: cur.notes.extra },
+    cards: cur.cards,
+    items: cur.items,
+  };
+}
+
+/* Thrown inside the webhook's transaction when its webhook_deliveries insert
+ * found the id already there (a concurrent recordDelivery got in first): the
+ * transaction rolls back and the delivery is reported as redelivered. */
+class AlreadyRecorded extends Error {}
+
+/* Record a delivery inside the caller's transaction. ON CONFLICT DO NOTHING
+ * waits for a concurrent insert of the same id to commit or roll back, so of
+ * two racing inserts exactly one returns its row. `outcome` is for people
+ * reading the table: "noop" (recordDelivery: decided without the board),
+ * "moved", "unchanged", "ignored: <why>" or "refused: <status>"; `rev` is the
+ * head the outcome was decided against, or the one a move produced. */
+function insertDelivery(tx: PgTx, deliveryId: string, outcome: string, rev: number) {
+  return tx<{ delivery_id: string }[]>`
+    INSERT INTO webhook_deliveries (delivery_id, outcome, rev)
+    VALUES (${deliveryId}, ${outcome}, ${rev})
+    ON CONFLICT (delivery_id) DO NOTHING
+    RETURNING delivery_id`;
+}
+
+function outcomeText(outcome: WebhookOutcome): string {
+  switch (outcome.kind) {
+    case "ignored":
+      return `ignored: ${outcome.ignored}`;
+    case "refused":
+      return `refused: ${outcome.status}`;
+    default:
+      return outcome.kind;
+  }
+}
+
+// The most revisions GET /revisions lists (newest first). Older ones stay
+// reachable through GET /state?rev=N and POST /state/restore.
+const LISTED_REVISIONS = 200;
 
 /* The rank that puts a card after everything now in a projects column: one
  * past the highest rank there (ranks are the zero-padded positions a PUT
@@ -519,10 +791,6 @@ function findTicket(cur: Locked, given: string): { prior: CardRow } | Unresolved
     return { kind: "unresolved", status: 404, error: { error: `no ticket with id or ref "${given}"` } };
   }
   return { prior };
-}
-
-function notYet(method: string): never {
-  throw new Error(`PgStore.${method} is not implemented yet (KODER-EE05 slice 3)`);
 }
 
 // int8 (rev, created, pr_rev, counts) arrives as a string by default. Every
@@ -648,12 +916,71 @@ export class PgStore implements Store {
     };
   }
 
-  boardAt(_rev: number): Promise<Doc | null> {
-    notYet("boardAt");
+  /* board@N in ONE statement (one snapshot, one round trip): the live rows,
+   * the revisions row for N, and every change after N, newest first, then
+   * rewind() in JS. null exactly when no revisions row names N: rev 0 (the
+   * empty board before the first write, which KV never snapshotted either),
+   * a rev past the head, or one from before this database's history began
+   * (the KV snapshots are not migrated). The changes are only read when N
+   * exists, so an unknown rev costs no log scan. */
+  async boardAt(rev: number): Promise<Doc | null> {
+    // main.ts passes any integer; one past 2^53 can't name a rev (and past
+    // 2^63 would be a bigint overflow, a 500), so it is unknown, as on KV.
+    if (!Number.isSafeInteger(rev)) return null;
+    const [row] = await this.sql<{
+      at: Date | null;
+      layout: Layout;
+      extra: Json;
+      notes: { notes: string; extra: Json } | null;
+      cards: CardRow[];
+      items: ItemRow[];
+      changes: LoggedChange[];
+    }[]>`
+      SELECT r.updated_at AS at, h.layout, h.extra,
+        (SELECT row_to_json(n) FROM (
+           SELECT notes, extra FROM life_notes WHERE owner_id = h.owner_id) n) AS notes,
+        (SELECT coalesce(json_agg(c ORDER BY c.board_id, c.column_id, c.rank), '[]') FROM (
+           SELECT id, board_id, column_id, rank, title, note, priority, created, project_id,
+                  field_order, extra, pr, pr_rev
+             FROM cards
+            WHERE owner_id = h.owner_id AND deleted_at IS NULL) c) AS cards,
+        (SELECT coalesce(json_agg(i ORDER BY i.kind, i.rank), '[]') FROM (
+           SELECT id, kind, rank, data, field_order
+             FROM life_items
+            WHERE owner_id = h.owner_id AND deleted_at IS NULL) i) AS items,
+        (SELECT coalesce(json_agg(x ORDER BY x.rev DESC, x.seq DESC), '[]') FROM (
+           SELECT rev, seq, entity, entity_id, before
+             FROM changes
+            WHERE owner_id = h.owner_id AND rev > ${rev} AND r.rev IS NOT NULL) x) AS changes
+      FROM board_head h
+      LEFT JOIN revisions r ON r.owner_id = h.owner_id AND r.rev = ${rev}
+      WHERE h.owner_id = ${OWNER}`;
+    if (!row.at) return null;
+    const head: BoardRows = {
+      meta: {
+        layout: row.layout,
+        extra: row.extra,
+        notes: row.notes?.notes ?? "",
+        notesExtra: row.notes?.extra ?? {},
+      },
+      cards: row.cards,
+      items: row.items,
+    };
+    return { rev, updatedAt: row.at.toISOString(), board: rowsToBoard(rewind(head, row.changes)) };
   }
 
-  listRevisions(): Promise<Head[]> {
-    notYet("listRevisions");
+  /* Newest first, one entry per revisions row, capped at the newest
+   * LISTED_REVISIONS (the spec's "list capped (say 200)"): KV listed its 20
+   * kept snapshots; every rev is kept here, and listing them all would grow
+   * without bound. Older revs stay reachable through GET /state?rev=N and
+   * POST /state/restore; the response shape is unchanged. */
+  async listRevisions(): Promise<Head[]> {
+    const rows = await this.sql<{ rev: number; updated_at: Date }[]>`
+      SELECT rev, updated_at FROM revisions
+       WHERE owner_id = ${OWNER}
+       ORDER BY rev DESC
+       LIMIT ${LISTED_REVISIONS}`;
+    return rows.map((row) => ({ rev: row.rev, updatedAt: row.updated_at.toISOString() }));
   }
 
   /* Oldest append first (the route sorts by archivedAt itself). There are no
@@ -666,8 +993,10 @@ export class PgStore implements Store {
     return { chunks: rows.length ? 1 : 0, cards: rows.map((row) => row.card) };
   }
 
-  hasDelivery(_deliveryId: string): Promise<boolean> {
-    notYet("hasDelivery");
+  async hasDelivery(deliveryId: string): Promise<boolean> {
+    const [row] = await this.sql<{ found: boolean }[]>`
+      SELECT EXISTS (SELECT 1 FROM webhook_deliveries WHERE delivery_id = ${deliveryId}) AS found`;
+    return row.found;
   }
 
   /* PUT /state as diff-apply (spec section 7.2), in ONE transaction and four
@@ -713,165 +1042,74 @@ export class PgStore implements Store {
         const head = heads[0];
         if (head.rev !== baseRev) return { kind: "stale", rev: head.rev } as PutResult;
 
-        const changes: Change[] = [];
-        const change = (c: Omit<Change, "seq">) => changes.push({ seq: changes.length + 1, ...c });
-
-        /* ---- Cards ---- */
-        const stored = new Map(storedCards.map((row) => [row.id, row]));
-        const nextRank = new Map<string, number>();
-        const nextCards: CardRow[] = [];
-        const upserts: CardRow[] = [];
-        for (const { card, board_id, column_id } of plan.cards) {
-          const id = card.id as string;
-          const prior = stored.get(id);
-          const slot = `${board_id}\u0000${column_id}`;
-          const index = nextRank.get(slot) ?? 0;
-          nextRank.set(slot, index + 1);
-          const live = prior && !prior.deleted;
-          const row = cardToRow(card, board_id, column_id, rankAt(index), {
-            pr: live ? prior.pr : null,
-            pr_rev: live ? prior.pr_rev : null,
-          });
-          nextCards.push(row);
-          if (!prior) {
-            upserts.push(row);
-            change({ entity: "card", entity_id: id, op: "insert", before: null, after: cardState(row) });
-          } else if (prior.deleted) {
-            // Resurrected: back on the board as a fresh card.
-            upserts.push(row);
-            change({ entity: "card", entity_id: id, op: "insert", before: null, after: cardState(row) });
-          } else if (canonical(cardState(prior)) !== canonical(cardState(row))) {
-            upserts.push(row);
-            change({ entity: "card", entity_id: id, op: "update", before: cardState(prior), after: cardState(row) });
-          }
-        }
-        const kept = new Set(nextCards.map((row) => row.id));
-        const removedCards: string[] = [];
-        for (const row of storedCards) {
-          if (row.deleted || kept.has(row.id)) continue;
-          removedCards.push(row.id);
-          change({ entity: "card", entity_id: row.id, op: "delete", before: cardState(row), after: null });
-        }
-
-        /* ---- lifeMeta items ---- */
-        const storedItemMap = new Map(storedItems.map((row) => [row.id, row]));
-        const itemRank = new Map<LifeKind, number>();
-        const nextItems: ItemRow[] = [];
-        const itemUpserts: ItemRow[] = [];
-        for (const { item, kind } of plan.items) {
-          const index = itemRank.get(kind) ?? 0;
-          itemRank.set(kind, index + 1);
-          const row = itemToRow(item, kind, rankAt(index));
-          nextItems.push(row);
-          const prior = storedItemMap.get(row.id);
-          if (!prior || prior.deleted) {
-            itemUpserts.push(row);
-            change({ entity: "life_item", entity_id: row.id, op: "insert", before: null, after: itemState(row) });
-          } else if (canonical(itemState(prior)) !== canonical(itemState(row))) {
-            itemUpserts.push(row);
-            change({ entity: "life_item", entity_id: row.id, op: "update", before: itemState(prior), after: itemState(row) });
-          }
-        }
-        const keptItems = new Set(nextItems.map((row) => row.id));
-        const removedItems: string[] = [];
-        for (const row of storedItems) {
-          if (row.deleted || keptItems.has(row.id)) continue;
-          removedItems.push(row.id);
-          change({ entity: "life_item", entity_id: row.id, op: "delete", before: itemState(row), after: null });
-        }
-
-        /* ---- life notes, and the board's own shape ---- */
-        const priorNotes = notesRows[0] ?? { notes: "", extra: {} };
-        const notesAfter = { notes: plan.meta.notes, extra: plan.meta.notesExtra };
-        const notesChanged = canonical(priorNotes) !== canonical(notesAfter);
-        if (notesChanged) {
-          change({ entity: "life_notes", entity_id: OWNER, op: "update", before: priorNotes, after: notesAfter });
-        }
-        const boardBefore = { layout: head.layout, extra: head.extra };
-        const boardAfter = { layout: plan.meta.layout, extra: plan.meta.extra };
-        if (canonical(boardBefore) !== canonical(boardAfter) ||
-          // canonical() sorts keys, but column ORDER lives in the arrays and
-          // board.extra's key order is part of what GET returns.
-          JSON.stringify(Object.keys(boardBefore.extra)) !== JSON.stringify(Object.keys(boardAfter.extra))) {
-          change({ entity: "board", entity_id: OWNER, op: "update", before: boardBefore, after: boardAfter });
-        }
-
-        /* The size check, on the board exactly as GET /state will return it,
-         * before anything is written. */
-        const size = Buffer.byteLength(
-          JSON.stringify(rowsToBoard({ meta: plan.meta, cards: nextCards, items: nextItems })),
+        const diff = diffBoard(
+          plan,
+          { head, cards: storedCards, items: storedItems, notes: notesRows[0] ?? { notes: "", extra: {} } },
+          (_card, prior) =>
+            prior && !prior.deleted ? { pr: prior.pr, pr_rev: prior.pr_rev } : { pr: null, pr_rev: null },
         );
-        if (size > BOARD_MAX) throw new StoreFullError(size, BOARD_MAX);
-
-        /* ---- Writes: one pipelined batch through commitWrite, which puts the
-         * head's compare-and-swap first. Statements with nothing to do aren't
-         * sent. Set-based throughout: each statement takes its rows as one
-         * jsonb array, so a PUT costs the same round trips whether it touches
-         * one card or five hundred. JSON goes in as `${…}::text::jsonb`: as a
-         * text parameter postgres.js sends the string as is, prepared or not
-         * (Neon's pooler runs unprepared); a bare `::jsonb` makes a prepared
-         * statement's jsonb serializer JSON-encode the string again, storing a
-         * jsonb string instead of the object. ---- */
-        const writes: PromiseLike<unknown>[] = [];
-        if (upserts.length) writes.push(upsertCards(tx, upserts));
-        if (removedCards.length) writes.push(softDeleteCards(tx, removedCards, now));
-        if (itemUpserts.length) {
-          writes.push(tx`
-            INSERT INTO life_items AS l (id, owner_id, kind, rank, data, field_order)
-            SELECT r.id, ${OWNER}, r.kind, r.rank, r.data, r.field_order
-              FROM jsonb_to_recordset(${JSON.stringify(itemUpserts)}::text::jsonb) AS r(
-                     id text, kind text, rank text, data jsonb, field_order text[])
-            ON CONFLICT (id) DO UPDATE SET
-              kind = EXCLUDED.kind, rank = EXCLUDED.rank, data = EXCLUDED.data,
-              field_order = EXCLUDED.field_order, deleted_at = NULL
-            WHERE l.owner_id = EXCLUDED.owner_id`);
-        }
-        if (removedItems.length) {
-          writes.push(tx`
-            UPDATE life_items SET deleted_at = ${now}
-             WHERE owner_id = ${OWNER} AND id = ANY(${removedItems}::text[]) AND deleted_at IS NULL`);
-        }
-        if (notesChanged) {
-          writes.push(tx`
-            UPDATE life_notes
-               SET notes = ${plan.meta.notes}, extra = ${JSON.stringify(plan.meta.notesExtra)}::text::jsonb
-             WHERE owner_id = ${OWNER}`);
-        }
+        checkDiffSize(plan, diff);
+        // One pipelined batch through commitWrite, which puts the head's
+        // compare-and-swap first.
         const rev = await commitWrite(tx, {
           baseRev,
           now,
           actor,
           layout: plan.meta.layout,
           extra: plan.meta.extra,
-          changes,
-          writes,
+          changes: diff.changes,
+          writes: diffWrites(tx, plan, diff, now, "keep"),
         });
         return { kind: "ok", rev, updatedAt: now.toISOString() } as PutResult;
       });
     } catch (err) {
       if (err instanceof LostRace) return { kind: "conflict" };
+      // A serialization failure, deadlock or lock timeout is no 409 (nothing
+      // says the body is stale): it is the 503 the server's own writes answer.
+      if (isContention(err)) throw new StoreContentionError();
       throw err;
     }
   }
 
-  /* ---- Server-initiated writes: POST/PATCH/DELETE tickets ----
+  /* ---- Server-initiated writes: POST/PATCH/DELETE tickets, restore, the
+   * webhook ----
    * Read-modify-write under the head lock, in ONE transaction: BEGIN; the lock
    * and the loads, pipelined (as in applyBoardPut); the writes, pipelined;
-   * COMMIT. Four round trips, whatever the ticket. They need no baseRev: the
+   * COMMIT. Four round trips, whatever the write. They need no baseRev: the
    * lock is taken first, so the board they change is the current one, and the
    * second of two racing writers simply sees the first's result. The loads are
    * the whole live board (it is capped at 2 MiB), because resolving a ref and
-   * the size check both need all of it.
+   * the size check both need all of it. `opts` adds loads to the same batch,
+   * after the lock so they see everything committed before it: restore's
+   * history (the revisions row for a rev and the changes after it) and the
+   * webhook's delivery check.
    *
    * Waiting for the lock is bounded by LOCK_TIMEOUT; a timeout, a deadlock or
    * a serialization failure is StoreContentionError (a 503 the caller retries).
    *
-   * Like KV's, every successful call bumps rev by exactly 1, a PATCH that
+   * Like KV's, every successful write bumps rev by exactly 1, a PATCH that
    * changes nothing included. */
-  private async locked<T>(fn: (tx: PgTx, cur: Locked) => Promise<T>): Promise<T> {
+  private async locked<T>(fn: (tx: PgTx, cur: Locked) => Promise<T>, opts: LockOptions = {}): Promise<T> {
     try {
       return await this.sql.begin(async (tx): Promise<T> => {
-        const [, heads, cards, items, notes] = await Promise.all([
+        const extra: PromiseLike<unknown>[] = [];
+        if (opts.historyFrom !== undefined) {
+          extra.push(
+            tx<{ updated_at: Date }[]>`
+              SELECT updated_at FROM revisions WHERE owner_id = ${OWNER} AND rev = ${opts.historyFrom}`,
+            tx<LoggedChange[]>`
+              SELECT rev, seq, entity, entity_id, before
+                FROM changes
+               WHERE owner_id = ${OWNER} AND rev > ${opts.historyFrom}
+                 AND EXISTS (SELECT 1 FROM revisions WHERE owner_id = ${OWNER} AND rev = ${opts.historyFrom})
+               ORDER BY rev DESC, seq DESC`,
+          );
+        }
+        if (opts.delivery !== undefined) {
+          extra.push(tx<{ found: boolean }[]>`
+            SELECT EXISTS (SELECT 1 FROM webhook_deliveries WHERE delivery_id = ${opts.delivery}) AS found`);
+        }
+        const [, heads, cards, items, notes, ...more] = await Promise.all([
           tx.unsafe(`SET LOCAL lock_timeout = '${LOCK_TIMEOUT}'`),
           tx<{ rev: number; layout: Layout; extra: Json }[]>`
             SELECT rev, layout, extra FROM board_head WHERE owner_id = ${OWNER} FOR UPDATE`,
@@ -884,8 +1122,15 @@ export class PgStore implements Store {
               FROM life_items WHERE owner_id = ${OWNER} AND deleted_at IS NULL`,
           tx<{ notes: string; extra: Json }[]>`
             SELECT notes, extra FROM life_notes WHERE owner_id = ${OWNER}`,
+          ...extra,
         ]);
-        return await fn(tx, { head: heads[0], cards, items, notes: notes[0] ?? { notes: "", extra: {} } });
+        const cur: Locked = { head: heads[0], cards, items, notes: notes[0] ?? { notes: "", extra: {} } };
+        if (opts.historyFrom !== undefined) {
+          const [at, changes] = more.splice(0, 2) as [{ updated_at: Date }[], LoggedChange[]];
+          cur.history = { at: at[0]?.updated_at ?? null, changes };
+        }
+        if (opts.delivery !== undefined) cur.delivered = (more.shift() as { found: boolean }[])[0].found;
+        return await fn(tx, cur);
       }) as T;
     } catch (err) {
       if (err instanceof LostRace || isContention(err)) {
@@ -905,6 +1150,7 @@ export class PgStore implements Store {
     cards: CardRow[];
     changes: Change[];
     writes: PromiseLike<unknown>[];
+    after?: PromiseLike<unknown>[];
   }): Promise<{ rev: number; board: Board }> {
     const board = rowsToBoard({
       meta: { layout: w.layout, extra: cur.head.extra, notes: cur.notes.notes, notesExtra: cur.notes.extra },
@@ -921,6 +1167,7 @@ export class PgStore implements Store {
       extra: cur.head.extra,
       changes: w.changes,
       writes: w.writes,
+      after: w.after,
     });
     return { rev, board };
   }
@@ -1025,8 +1272,50 @@ export class PgStore implements Store {
     });
   }
 
-  restore(_rev: number): Promise<{ rev: number; updatedAt: string } | null> {
-    notYet("restore");
+  /* Re-land board@`rev` as a new head, under the head lock, as one write:
+   * rewind() the live rows to `rev` (its history is loaded in the same batch
+   * as the lock), apply restoreWorkflowMetadata against the CURRENT board
+   * (surviving cards keep their current pr/prRev; a card deleted since keeps
+   * the snapshot's own), then diff-apply the result against the live rows
+   * exactly as a PUT would, logged with actor "restore". Rev never rewinds;
+   * restoring the head itself is still a write of its own. null, with
+   * nothing written, when no revisions row names `rev`. Four round trips
+   * (three for an unknown rev); the log read is every change since `rev`. */
+  async restore(rev: number): Promise<{ rev: number; updatedAt: string } | null> {
+    if (!Number.isSafeInteger(rev)) return null; // as in boardAt
+    const now = new Date();
+    return await this.locked(async (tx, cur) => {
+      const { at, changes } = cur.history!;
+      if (!at) return null;
+      const live = lockedRows(cur);
+      const board = restoreWorkflowMetadata(rowsToBoard(rewind(live, changes)), rowsToBoard(live));
+      const plan = planBoard(board);
+      const diff = diffBoard(
+        plan,
+        {
+          head: cur.head,
+          cards: cur.cards.map((row) => ({ ...row, deleted: false })),
+          items: cur.items.map((row) => ({ ...row, deleted: false })),
+          notes: cur.notes,
+        },
+        // restoreWorkflowMetadata has already decided each card's link.
+        (card) => ({
+          pr: typeof card.pr === "string" ? card.pr : null,
+          pr_rev: typeof card.prRev === "number" ? card.prRev : null,
+        }),
+      );
+      checkDiffSize(plan, diff);
+      const head = await commitWrite(tx, {
+        baseRev: cur.head.rev,
+        now,
+        actor: "restore",
+        layout: plan.meta.layout,
+        extra: plan.meta.extra,
+        changes: diff.changes,
+        writes: diffWrites(tx, plan, diff, now, "write"),
+      });
+      return { rev: head, updatedAt: now.toISOString() };
+    }, { historyFrom: rev });
   }
 
   /* Append-only and idempotent by card id, in ONE autocommit statement: no
@@ -1061,12 +1350,97 @@ export class PgStore implements Store {
     return { kind: "archived", archived: landed.length, duplicates: cards.length - landed.length, chunk: 0 };
   }
 
-  recordDelivery(_deliveryId: string): Promise<{ kind: "recorded" } | { kind: "redelivered"; rev: number }> {
-    notYet("recordDelivery");
+  /* A delivery whose outcome doesn't depend on the board, in ONE autocommit
+   * statement: no head lock, as there is no board write to keep it atomic
+   * with. ON CONFLICT DO NOTHING makes a replay, or a race with another
+   * delivery of the same id (commitWebhookMove included), record it exactly
+   * once; the loser reads the head for its "redelivered" answer, as KV did. */
+  async recordDelivery(deliveryId: string): Promise<{ kind: "recorded" } | { kind: "redelivered"; rev: number }> {
+    try {
+      const landed = await this.sql<{ delivery_id: string }[]>`
+        INSERT INTO webhook_deliveries (delivery_id, outcome, rev)
+        SELECT ${deliveryId}, 'noop', rev FROM board_head WHERE owner_id = ${OWNER}
+        ON CONFLICT (delivery_id) DO NOTHING
+        RETURNING delivery_id`;
+      if (landed.length) return { kind: "recorded" };
+    } catch (err) {
+      if (isContention(err)) throw new StoreContentionError();
+      throw err;
+    }
+    return { kind: "redelivered", rev: (await this.getHead()).rev };
   }
 
-  commitWebhookMove(_event: WebhookEvent): Promise<WebhookResult> {
-    notYet("commitWebhookMove");
+  /* Decide the event against the board and record the delivery, in ONE
+   * transaction under the head lock (locked(): four round trips, the
+   * delivery check loaded in the same batch as the lock):
+   *  - already recorded: "redelivered" with the head rev; nothing is written;
+   *  - applyWebhookEvent (store.ts) on the board as GET /state shows it, and
+   *    for every outcome but "moved" only the delivery row is written; the
+   *    result carries the head rev it was decided against, as on KV;
+   *  - "moved": the one path that writes pr/pr_rev. The card's row (moved to
+   *    the END of the target column, or left where it is when only the link
+   *    changed), its `changes` row (actor "webhook"), the revisions row, the
+   *    head (rev + 1) and the delivery row all commit together, and the
+   *    result carries the new rev.
+   * The size check applies to a move as to any write: StoreFullError rolls
+   * it all back, the delivery included, so GitHub's retry can land it once
+   * there is room (KV's commitDoc threw before committing too). Two
+   * deliveries of one id serialise on the lock, and the second sees the
+   * first's row; a racing PUT either lands first (the webhook moves the card
+   * on the board it left) or finds its baseRev stale (409, and the client
+   * merges the move in). */
+  async commitWebhookMove(event: WebhookEvent): Promise<WebhookResult> {
+    const now = new Date();
+    try {
+      return await this.locked(async (tx, cur): Promise<WebhookResult> => {
+        if (cur.delivered) return { kind: "redelivered", rev: cur.head.rev };
+        const board = rowsToBoard(lockedRows(cur));
+        const outcome = applyWebhookEvent(board, event);
+        if (outcome.kind !== "moved") {
+          const landed = await insertDelivery(tx, event.deliveryId, outcomeText(outcome), cur.head.rev);
+          if (!landed.length) throw new AlreadyRecorded();
+          return { ...outcome, rev: cur.head.rev };
+        }
+        // The one card the event changed: it moved column or took a new link.
+        const target = outcome.column;
+        const live = new Map(cur.cards.map((row) => [row.id, row]));
+        const card = board.projects[target].find((c) => {
+          const prior = live.get(c.id);
+          return prior !== undefined &&
+            (prior.column_id !== target || prior.pr !== (c.pr ?? null) || prior.pr_rev !== (c.prRev ?? null));
+        })!;
+        const prior = live.get(card.id)!;
+        const others = cur.cards.filter((row) => row.id !== prior.id);
+        const row = cardToRow(
+          card as unknown as Json,
+          "projects",
+          target,
+          prior.column_id === target ? prior.rank : endRank(others, target),
+          { pr: card.pr ?? null, pr_rev: card.prRev ?? null },
+        );
+        const layout = withColumn(cur.head.layout, target);
+        const changes: Change[] = [];
+        const change = (c: Omit<Change, "seq">) => changes.push({ seq: changes.length + 1, ...c });
+        change({ entity: "card", entity_id: row.id, op: "update", before: cardState(prior), after: cardState(row) });
+        layoutChange(change, cur.head, layout);
+        const delivery = insertDelivery(tx, event.deliveryId, "moved", cur.head.rev + 1);
+        const { rev } = await this.commitTicketWrite(tx, cur, {
+          now,
+          actor: "webhook",
+          layout,
+          cards: cur.cards.map((r) => (r.id === prior.id ? row : r)),
+          changes,
+          writes: [upsertCards(tx, [row], "write")],
+          after: [delivery],
+        });
+        if (!(await delivery).length) throw new AlreadyRecorded();
+        return { ...outcome, rev };
+      }, { delivery: event.deliveryId });
+    } catch (err) {
+      // A concurrent recordDelivery of the same id committed first.
+      if (err instanceof AlreadyRecorded) return { kind: "redelivered", rev: (await this.getHead()).rev };
+      throw err;
+    }
   }
 }
 
