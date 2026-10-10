@@ -1,8 +1,7 @@
 /* PgStore — the Store (store.ts) backed by Postgres (Neon in production,
- * reached through NEON_DATABASE_URL; PGlite in the tests). INCOMPLETE until
- * KODER-EE05 slice 3 finishes: reads, PUT /state, the ticket routes, the
- * archive and history (boardAt, listRevisions, restore) work; the webhook
- * throws until slice 3 lands it.
+ * reached through NEON_DATABASE_URL; PGlite in the tests). Every Store method
+ * is implemented: reads, PUT /state, the ticket routes, the archive, history
+ * (boardAt, listRevisions, restore) and the webhook.
  *
  * Layout (pg-schema.ts): the board is rows, not one document. A card is a row
  * in `cards` keyed by its client id, placed by (board_id, column_id, rank);
@@ -22,6 +21,10 @@
  * plus one `revisions` row; board@N is the live rows with every change after
  * N undone, newest first (rewind() below). The log is kept whole (no
  * retention cap), so every rev a revisions row names stays reachable.
+ *
+ * Webhook deliveries: one row in webhook_deliveries per delivery id, kept
+ * forever, inserted in the SAME transaction as the board write its outcome
+ * was decided against (commitWebhookMove), under the board_head lock.
  *
  * Round-tripping a board: whatever a client PUTs comes back from GET /state
  * as it was sent, as KV did, with these exceptions, each forced by keying
@@ -57,6 +60,7 @@ import postgres from "postgres";
 import { migrate, OWNER } from "./pg-schema.ts";
 import {
   type Actor,
+  applyWebhookEvent,
   type ArchivedCard,
   type ArchiveResult,
   type Board,
@@ -74,6 +78,7 @@ import {
   type TicketEdits,
   type Unresolved,
   type WebhookEvent,
+  type WebhookOutcome,
   type WebhookResult,
 } from "./store.ts";
 
@@ -580,10 +585,11 @@ function isContention(err: unknown): boolean {
  * then the `changes` rows and the `revisions` row, all pipelined; the row
  * count of the head update is checked once the batch is back, and a miss
  * rolls the transaction back with LostRace. `writes` are queries the caller
- * built from tx; they run in the order given, after the head update. The
- * timestamp is taken in JS, at millisecond precision, so the `updatedAt`
- * returned is exactly what GET /state and revisions.updated_at hold. Returns
- * the new rev (baseRev + 1). */
+ * built from tx; they run in the order given, after the head update. `after`
+ * runs last, behind the revisions row: the webhook's delivery row, which
+ * records the rev this write produced. The timestamp is taken in JS, at
+ * millisecond precision, so the `updatedAt` returned is exactly what GET
+ * /state and revisions.updated_at hold. Returns the new rev (baseRev + 1). */
 async function commitWrite(tx: PgTx, w: {
   baseRev: number;
   now: Date;
@@ -592,6 +598,7 @@ async function commitWrite(tx: PgTx, w: {
   extra: Json;
   changes: Change[];
   writes: PromiseLike<unknown>[];
+  after?: PromiseLike<unknown>[];
 }): Promise<number> {
   const { baseRev, now, actor, changes } = w;
   const rev = baseRev + 1;
@@ -613,6 +620,7 @@ async function commitWrite(tx: PgTx, w: {
   writes.push(tx`
     INSERT INTO revisions (owner_id, rev, updated_at, actor, summary)
     VALUES (${OWNER}, ${rev}, ${now}, ${actor}, ${summarize(changes)})`);
+  writes.push(...w.after ?? []);
   await Promise.all(writes);
   if ((await headUpdate as unknown[]).length !== 1) throw new LostRace();
   return rev;
@@ -679,7 +687,7 @@ export function scrubSecret(message: string, url: string): string {
 }
 
 // What a server-initiated write loads under the head lock: the live board,
-// and on request the history after a rev.
+// and on request the history after a rev and whether a delivery is recorded.
 type Locked = {
   head: { rev: number; layout: Layout; extra: Json };
   cards: CardRow[];
@@ -688,8 +696,10 @@ type Locked = {
   // With LockOptions.historyFrom = N: when rev N was written (null if no
   // revisions row names it) and every change after it, newest first.
   history?: { at: Date | null; changes: LoggedChange[] };
+  // With LockOptions.delivery: whether that delivery id is already recorded.
+  delivered?: boolean;
 };
-type LockOptions = { historyFrom?: number };
+type LockOptions = { historyFrom?: number; delivery?: string };
 
 // The live board as rows, for rowsToBoard() and rewind().
 function lockedRows(cur: Locked): BoardRows {
@@ -700,8 +710,34 @@ function lockedRows(cur: Locked): BoardRows {
   };
 }
 
-function notYet(method: string): never {
-  throw new Error(`PgStore.${method} is not implemented yet (KODER-EE05 slice 3)`);
+/* Thrown inside the webhook's transaction when its webhook_deliveries insert
+ * found the id already there (a concurrent recordDelivery got in first): the
+ * transaction rolls back and the delivery is reported as redelivered. */
+class AlreadyRecorded extends Error {}
+
+/* Record a delivery inside the caller's transaction. ON CONFLICT DO NOTHING
+ * waits for a concurrent insert of the same id to commit or roll back, so of
+ * two racing inserts exactly one returns its row. `outcome` is for people
+ * reading the table: "noop" (recordDelivery: decided without the board),
+ * "moved", "unchanged", "ignored: <why>" or "refused: <status>"; `rev` is the
+ * head the outcome was decided against, or the one a move produced. */
+function insertDelivery(tx: PgTx, deliveryId: string, outcome: string, rev: number) {
+  return tx<{ delivery_id: string }[]>`
+    INSERT INTO webhook_deliveries (delivery_id, outcome, rev)
+    VALUES (${deliveryId}, ${outcome}, ${rev})
+    ON CONFLICT (delivery_id) DO NOTHING
+    RETURNING delivery_id`;
+}
+
+function outcomeText(outcome: WebhookOutcome): string {
+  switch (outcome.kind) {
+    case "ignored":
+      return `ignored: ${outcome.ignored}`;
+    case "refused":
+      return `refused: ${outcome.status}`;
+    default:
+      return outcome.kind;
+  }
 }
 
 // The most revisions GET /revisions lists (newest first). Older ones stay
@@ -957,8 +993,10 @@ export class PgStore implements Store {
     return { chunks: rows.length ? 1 : 0, cards: rows.map((row) => row.card) };
   }
 
-  hasDelivery(_deliveryId: string): Promise<boolean> {
-    notYet("hasDelivery");
+  async hasDelivery(deliveryId: string): Promise<boolean> {
+    const [row] = await this.sql<{ found: boolean }[]>`
+      SELECT EXISTS (SELECT 1 FROM webhook_deliveries WHERE delivery_id = ${deliveryId}) AS found`;
+    return row.found;
   }
 
   /* PUT /state as diff-apply (spec section 7.2), in ONE transaction and four
@@ -1033,7 +1071,8 @@ export class PgStore implements Store {
     }
   }
 
-  /* ---- Server-initiated writes: POST/PATCH/DELETE tickets, restore ----
+  /* ---- Server-initiated writes: POST/PATCH/DELETE tickets, restore, the
+   * webhook ----
    * Read-modify-write under the head lock, in ONE transaction: BEGIN; the lock
    * and the loads, pipelined (as in applyBoardPut); the writes, pipelined;
    * COMMIT. Four round trips, whatever the write. They need no baseRev: the
@@ -1042,7 +1081,8 @@ export class PgStore implements Store {
    * the whole live board (it is capped at 2 MiB), because resolving a ref and
    * the size check both need all of it. `opts` adds loads to the same batch,
    * after the lock so they see everything committed before it: restore's
-   * history (the revisions row for a rev and the changes after it).
+   * history (the revisions row for a rev and the changes after it) and the
+   * webhook's delivery check.
    *
    * Waiting for the lock is bounded by LOCK_TIMEOUT; a timeout, a deadlock or
    * a serialization failure is StoreContentionError (a 503 the caller retries).
@@ -1065,6 +1105,10 @@ export class PgStore implements Store {
                ORDER BY rev DESC, seq DESC`,
           );
         }
+        if (opts.delivery !== undefined) {
+          extra.push(tx<{ found: boolean }[]>`
+            SELECT EXISTS (SELECT 1 FROM webhook_deliveries WHERE delivery_id = ${opts.delivery}) AS found`);
+        }
         const [, heads, cards, items, notes, ...more] = await Promise.all([
           tx.unsafe(`SET LOCAL lock_timeout = '${LOCK_TIMEOUT}'`),
           tx<{ rev: number; layout: Layout; extra: Json }[]>`
@@ -1085,6 +1129,7 @@ export class PgStore implements Store {
           const [at, changes] = more.splice(0, 2) as [{ updated_at: Date }[], LoggedChange[]];
           cur.history = { at: at[0]?.updated_at ?? null, changes };
         }
+        if (opts.delivery !== undefined) cur.delivered = (more.shift() as { found: boolean }[])[0].found;
         return await fn(tx, cur);
       }) as T;
     } catch (err) {
@@ -1105,6 +1150,7 @@ export class PgStore implements Store {
     cards: CardRow[];
     changes: Change[];
     writes: PromiseLike<unknown>[];
+    after?: PromiseLike<unknown>[];
   }): Promise<{ rev: number; board: Board }> {
     const board = rowsToBoard({
       meta: { layout: w.layout, extra: cur.head.extra, notes: cur.notes.notes, notesExtra: cur.notes.extra },
@@ -1121,6 +1167,7 @@ export class PgStore implements Store {
       extra: cur.head.extra,
       changes: w.changes,
       writes: w.writes,
+      after: w.after,
     });
     return { rev, board };
   }
@@ -1303,12 +1350,97 @@ export class PgStore implements Store {
     return { kind: "archived", archived: landed.length, duplicates: cards.length - landed.length, chunk: 0 };
   }
 
-  recordDelivery(_deliveryId: string): Promise<{ kind: "recorded" } | { kind: "redelivered"; rev: number }> {
-    notYet("recordDelivery");
+  /* A delivery whose outcome doesn't depend on the board, in ONE autocommit
+   * statement: no head lock, as there is no board write to keep it atomic
+   * with. ON CONFLICT DO NOTHING makes a replay, or a race with another
+   * delivery of the same id (commitWebhookMove included), record it exactly
+   * once; the loser reads the head for its "redelivered" answer, as KV did. */
+  async recordDelivery(deliveryId: string): Promise<{ kind: "recorded" } | { kind: "redelivered"; rev: number }> {
+    try {
+      const landed = await this.sql<{ delivery_id: string }[]>`
+        INSERT INTO webhook_deliveries (delivery_id, outcome, rev)
+        SELECT ${deliveryId}, 'noop', rev FROM board_head WHERE owner_id = ${OWNER}
+        ON CONFLICT (delivery_id) DO NOTHING
+        RETURNING delivery_id`;
+      if (landed.length) return { kind: "recorded" };
+    } catch (err) {
+      if (isContention(err)) throw new StoreContentionError();
+      throw err;
+    }
+    return { kind: "redelivered", rev: (await this.getHead()).rev };
   }
 
-  commitWebhookMove(_event: WebhookEvent): Promise<WebhookResult> {
-    notYet("commitWebhookMove");
+  /* Decide the event against the board and record the delivery, in ONE
+   * transaction under the head lock (locked(): four round trips, the
+   * delivery check loaded in the same batch as the lock):
+   *  - already recorded: "redelivered" with the head rev; nothing is written;
+   *  - applyWebhookEvent (store.ts) on the board as GET /state shows it, and
+   *    for every outcome but "moved" only the delivery row is written; the
+   *    result carries the head rev it was decided against, as on KV;
+   *  - "moved": the one path that writes pr/pr_rev. The card's row (moved to
+   *    the END of the target column, or left where it is when only the link
+   *    changed), its `changes` row (actor "webhook"), the revisions row, the
+   *    head (rev + 1) and the delivery row all commit together, and the
+   *    result carries the new rev.
+   * The size check applies to a move as to any write: StoreFullError rolls
+   * it all back, the delivery included, so GitHub's retry can land it once
+   * there is room (KV's commitDoc threw before committing too). Two
+   * deliveries of one id serialise on the lock, and the second sees the
+   * first's row; a racing PUT either lands first (the webhook moves the card
+   * on the board it left) or finds its baseRev stale (409, and the client
+   * merges the move in). */
+  async commitWebhookMove(event: WebhookEvent): Promise<WebhookResult> {
+    const now = new Date();
+    try {
+      return await this.locked(async (tx, cur): Promise<WebhookResult> => {
+        if (cur.delivered) return { kind: "redelivered", rev: cur.head.rev };
+        const board = rowsToBoard(lockedRows(cur));
+        const outcome = applyWebhookEvent(board, event);
+        if (outcome.kind !== "moved") {
+          const landed = await insertDelivery(tx, event.deliveryId, outcomeText(outcome), cur.head.rev);
+          if (!landed.length) throw new AlreadyRecorded();
+          return { ...outcome, rev: cur.head.rev };
+        }
+        // The one card the event changed: it moved column or took a new link.
+        const target = outcome.column;
+        const live = new Map(cur.cards.map((row) => [row.id, row]));
+        const card = board.projects[target].find((c) => {
+          const prior = live.get(c.id);
+          return prior !== undefined &&
+            (prior.column_id !== target || prior.pr !== (c.pr ?? null) || prior.pr_rev !== (c.prRev ?? null));
+        })!;
+        const prior = live.get(card.id)!;
+        const others = cur.cards.filter((row) => row.id !== prior.id);
+        const row = cardToRow(
+          card as unknown as Json,
+          "projects",
+          target,
+          prior.column_id === target ? prior.rank : endRank(others, target),
+          { pr: card.pr ?? null, pr_rev: card.prRev ?? null },
+        );
+        const layout = withColumn(cur.head.layout, target);
+        const changes: Change[] = [];
+        const change = (c: Omit<Change, "seq">) => changes.push({ seq: changes.length + 1, ...c });
+        change({ entity: "card", entity_id: row.id, op: "update", before: cardState(prior), after: cardState(row) });
+        layoutChange(change, cur.head, layout);
+        const delivery = insertDelivery(tx, event.deliveryId, "moved", cur.head.rev + 1);
+        const { rev } = await this.commitTicketWrite(tx, cur, {
+          now,
+          actor: "webhook",
+          layout,
+          cards: cur.cards.map((r) => (r.id === prior.id ? row : r)),
+          changes,
+          writes: [upsertCards(tx, [row], "write")],
+          after: [delivery],
+        });
+        if (!(await delivery).length) throw new AlreadyRecorded();
+        return { ...outcome, rev };
+      }, { delivery: event.deliveryId });
+    } catch (err) {
+      // A concurrent recordDelivery of the same id committed first.
+      if (err instanceof AlreadyRecorded) return { kind: "redelivered", rev: (await this.getHead()).rev };
+      throw err;
+    }
   }
 }
 
