@@ -13,22 +13,21 @@ nothing in `server/` changes until the cutover (KODER-EE05 slice 4).
 
 ## Not finished yet
 
-This is slice 1 of 4. What works: `GET /state` (with the `ETag`/`304` validators), `PUT
-/state` (diff-applied into rows, with the `409`/`413` behaviour of the old server), `GET
+This is slice 2 of 4. What works: `GET /state` (with the `ETag`/`304` validators), `PUT
+/state` (diff-applied into rows, with the `409`/`413` behaviour of the old server), `POST
+/tickets`, `PATCH`/`DELETE /tickets/:id`, `GET /tickets`, `POST`/`GET /archive`, `GET
 /pr-status`, the webhook's authentication and size checks, all request validation, CORS,
 auth and the static PWA. These `Store` methods in `src/pg-store.ts` still throw
 `PgStore.<method> is not implemented yet`, so the routes that need them answer a bare 500:
 
 | Method | Routes |
 |---|---|
-| `boardAt`, `listRevisions`, `restore` | `GET /state?rev=N`, `GET /revisions`, `POST /state/restore` (slice 2/3) |
-| `createTicket`, `patchTicket`, `deleteTicket` | `POST /tickets`, `PATCH`/`DELETE /tickets/:id` (slice 2/3) |
-| `archive`, `readArchive` | `POST`/`GET /archive` (slice 2/3) |
-| `hasDelivery`, `recordDelivery`, `commitWebhookMove` | `POST /webhooks/github` past its signature check (slice 2/3) |
+| `boardAt`, `listRevisions`, `restore` | `GET /state?rev=N`, `GET /revisions`, `POST /state/restore` (slice 3) |
+| `hasDelivery`, `recordDelivery`, `commitWebhookMove` | `POST /webhooks/github` past its signature check (slice 3) |
 
-`GET /tickets` works (it only reads the board). The contract suite reports every step
-that needs one of these as skipped, with the method it is waiting for (`PG_PENDING` in
-`tests/contract.test.ts`); slice 3 empties that list.
+The contract suite reports every step that needs one of these as skipped, with the
+methods it is waiting for (`PG_PENDING` in `tests/contract.test.ts`); slice 3 empties
+that list.
 
 ## Run it
 
@@ -83,11 +82,22 @@ What differs from the Deno server on purpose:
 - Only the PWA's own files are served (`/`, `index.html`, `sw.js`, `manifest.webmanifest`,
   `css/`, `js/`, `icons/`), not the whole repo.
 - `PUT /state` accepts up to 2 MiB (was 256K characters against a 64KB store).
+- The archive is its own append-only table (`archived_cards`), not a flag on the card, so
+  `POST /archive` leaves `GET /state` and `rev` alone, as on KV: the client archives cards
+  that are still on the board and drops them with a later `PUT`. Cards are stored as sent
+  (jsonb, so nested key order is not kept), the first of two equal ids in one batch wins
+  (KV kept both), a batch over 2 MiB is a 413, and there are no chunks: `chunk` is always
+  0 and `chunks` is 1 once anything is archived.
+- `POST`/`PATCH`/`DELETE /tickets` lock `board_head` and rewrite from the current board in
+  one transaction, instead of retrying a compare-and-swap five times. A lock wait over 5
+  seconds, a deadlock or a serialization failure is the same 503 `write contention, retry`.
+  Their `changes` rows are attributed to `cli`. A deleted ticket is soft-deleted, and a
+  title or note with U+0000 or a lone surrogate is stored (and later read) with U+FFFD, as
+  for `PUT`, though the create response still echoes what was sent.
 - What `GET /state` gives back after a `PUT` differs from what was sent in a few corner
   cases of storing a board as rows; each is listed, with its reason, at the top of
   `src/pg-store.ts`:
   - a duplicated card or lifeMeta item id keeps only its first occurrence;
-  - an archived id in the body stays archived and off the board;
   - `lifeMeta` always comes back with all four keys (`focus`, `dates`, `notes`,
     `stickies`), and items without a string id are dropped;
   - nested values of unknown card fields don't keep their key order (jsonb);
