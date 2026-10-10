@@ -85,7 +85,7 @@ What differs from the Deno server on purpose:
 - The archive is its own append-only table (`archived_cards`), not a flag on the card, so
   `POST /archive` leaves `GET /state` and `rev` alone, as on KV: the client archives cards
   that are still on the board and drops them with a later `PUT`. Cards are stored as sent
-  (jsonb, so nested key order is not kept), the first of two equal ids in one batch wins
+  (a `json` column, so key order is kept too), the first of two equal ids in one batch wins
   (KV kept both), a batch over 2 MiB is a 413, and there are no chunks: `chunk` is always
   0 and `chunks` is 1 once anything is archived.
 - `POST`/`PATCH`/`DELETE /tickets` lock `board_head` and rewrite from the current board in

@@ -2168,7 +2168,7 @@ test("Koder API contract (Postgres)", async (t) => {
           ...card("t_arch_pg01"),
           board: "projects",
           archivedAt: 5000,
-          clientField: { nested: [1, "two", null] },
+          clientField: { z: 1, a: { y: [1, "two", null], b: 2 } },
         };
         const res = await call("POST", "/archive", { cards: [posted] });
         assert.equal(res.status, 200);
@@ -2181,6 +2181,9 @@ test("Koder API contract (Postgres)", async (t) => {
         assert.deepEqual((await getState(baseUrl)).board.projects.todo.map((c) => c.id), ["t_live_0001", "t_arch_pg01"]);
         const inArchive = async () => (await readArchive()).cards.filter((c) => c.id === "t_arch_pg01");
         assert.deepEqual(await inArchive(), [posted]);
+        // Key order is as posted, top level and nested (jsonb would reorder it).
+        assert.deepEqual(Object.keys((await inArchive())[0]), Object.keys(posted));
+        assert.equal(JSON.stringify((await inArchive())[0]), JSON.stringify(posted));
 
         // The client drops the card with its next PUT: off the board, still archived.
         let state = await putBoard(baseUrl, { projects: { todo: [card("t_live_0001")] }, life: {}, lifeMeta: {} });
@@ -2268,7 +2271,9 @@ test("Koder API contract (Postgres)", async (t) => {
         // Delete soft-deletes the row and logs the card as it was.
         const deleted = await call("DELETE", "/tickets/t_log_0002");
         assert.equal(deleted.status, 200);
-        assert.equal((await deleted.json() as { rev: number }).rev, made.rev + 4);
+        const deletedBody = await deleted.json() as { rev: number; board: Doc["board"] };
+        assert.equal(deletedBody.rev, made.rev + 4);
+        assert.deepEqual(deletedBody.board, (await getState(baseUrl)).board);
         log = await logged(made.rev + 4);
         assert.deepEqual(log.revisions, [{ actor: "cli", summary: "1× card delete" }]);
         assert.equal(log.changes.length, 1);
@@ -2282,11 +2287,13 @@ test("Koder API contract (Postgres)", async (t) => {
         assert.equal(n, 5);
       });
 
-      await step("concurrent ticket writes are serialised: every PATCH and POST lands, revs consecutive", async () => {
+      await step("concurrent ticket writes all land, each seeing the previous one, revs consecutive", async () => {
         const seeded = await seedBoard(baseUrl, { todo: [card("t_conc_0001", "koder", { title: "orig", note: "orig" })] });
-        // Different fields of one ticket: the later write sees the earlier one's
-        // result, so none is lost (a read-modify-write without the lock would
-        // drop all but one).
+        /* Different fields of one ticket. Each write reads the previous write's
+         * result, so none is lost, and the revs are consecutive. As with the PUT
+         * race above, this does NOT prove the head lock or lock_timeout: PGlite
+         * serves one connection and the server pool is 1, so these transactions
+         * run one after another whether or not FOR UPDATE is there. */
         const fields: Record<string, unknown>[] = [{ title: "T" }, { note: "N" }, { priority: "high" }, { project: "holitrackr" }];
         const patched = await Promise.all(fields.map((f) => patchBody("t_conc_0001", f)));
         const results = await Promise.all(patched.map(async (r) => {

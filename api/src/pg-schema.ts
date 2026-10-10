@@ -144,7 +144,7 @@ export const MIGRATIONS: Migration[] = [
          id       text PRIMARY KEY,
          owner_id text   NOT NULL REFERENCES owners(id),
          seq      bigint GENERATED ALWAYS AS IDENTITY,
-         card     jsonb  NOT NULL
+         card     json   NOT NULL
        )`,
       `CREATE INDEX archived_cards_seq ON archived_cards (owner_id, seq)`,
       `DROP INDEX cards_board_col`,

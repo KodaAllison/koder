@@ -363,6 +363,10 @@ const LOCK_TIMEOUT = "5s";
  * write lost to a concurrent one and can simply be retried by the caller. */
 const CONTENTION_CODES = new Set(["55P03", "40001", "40P01"]);
 
+function isContention(err: unknown): boolean {
+  return CONTENTION_CODES.has((err as { code?: string }).code ?? "");
+}
+
 /* The one write path every board write ends in (PUT, POST/PATCH/DELETE
  * tickets): the head's compare-and-swap first, then the caller's row writes,
  * then the `changes` rows and the `revisions` row, all pipelined; the row
@@ -884,7 +888,7 @@ export class PgStore implements Store {
         return await fn(tx, { head: heads[0], cards, items, notes: notes[0] ?? { notes: "", extra: {} } });
       }) as T;
     } catch (err) {
-      if (err instanceof LostRace || CONTENTION_CODES.has((err as { code?: string }).code ?? "")) {
+      if (err instanceof LostRace || isContention(err)) {
         throw new StoreContentionError();
       }
       throw err;
@@ -1031,20 +1035,28 @@ export class PgStore implements Store {
    * batch and two identical requests racing all come out right: the id is the
    * primary key, so exactly one insert of it lands, and the loser's RETURNING
    * omits it. Within one batch the first of two equal ids wins (KV kept both).
-   * Cards are stored verbatim as jsonb, client fields included. The batch is
-   * capped at the board budget; there are no chunks, so `chunk` is always 0
+   * Cards are stored as plain `json` (text as sent, so key order survives; jsonb
+   * would reorder), client fields included. Two concurrent batches holding the
+   * same new ids in opposite orders can deadlock; that is StoreContentionError,
+   * like the ticket writes. The batch is capped at the board budget; there are no chunks, so `chunk` is always 0
    * and `chunks` 1 (see readArchive). */
   async archive(cards: ArchivedCard[]): Promise<ArchiveResult> {
     const body = JSON.stringify(wellFormed(cards));
     const size = Buffer.byteLength(body);
     if (size > BOARD_MAX) return { kind: "tooLarge", size, limit: BOARD_MAX };
-    const landed = await this.sql<{ id: string }[]>`
-      INSERT INTO archived_cards (id, owner_id, card)
-      SELECT e.card->>'id', ${OWNER}, e.card
-        FROM jsonb_array_elements(${body}::text::jsonb) WITH ORDINALITY AS e(card, n)
-       ORDER BY e.n
-      ON CONFLICT (id) DO NOTHING
-      RETURNING id`;
+    let landed: { id: string }[];
+    try {
+      landed = await this.sql<{ id: string }[]>`
+        INSERT INTO archived_cards (id, owner_id, card)
+        SELECT e.card->>'id', ${OWNER}, e.card
+          FROM json_array_elements(${body}::text::json) WITH ORDINALITY AS e(card, n)
+         ORDER BY e.n
+        ON CONFLICT (id) DO NOTHING
+        RETURNING id`;
+    } catch (err) {
+      if (isContention(err)) throw new StoreContentionError();
+      throw err;
+    }
     if (!landed.length) return { kind: "duplicates", duplicates: cards.length, chunks: 1 };
     return { kind: "archived", archived: landed.length, duplicates: cards.length - landed.length, chunk: 0 };
   }
