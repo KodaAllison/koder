@@ -2,9 +2,10 @@
 
 The Koder sync server ported off Deno: Node.js + TypeScript, with Postgres (Neon in
 production) as the only store. It is the replacement for `server/` (Deno Deploy + Deno KV),
-built under KODER-EE05, and it answers the same HTTP API byte for byte: same routes,
-statuses, headers, bodies, validation caps, bearer auth and GitHub webhook HMAC, and it
-serves the PWA from the repo root, same origin.
+built under KODER-EE05, and it answers the same HTTP API, with the deliberate differences listed
+under "What differs" below: same routes, statuses, headers, bodies, validation caps,
+bearer auth and GitHub webhook HMAC, and it serves the PWA from the repo root, same
+origin.
 
 **`server/` is still the live board.** The production app is the Deno Deploy app whose
 entrypoint is `server/main.ts`, redeployed from `main`. Nothing here is deployed yet, and
@@ -77,12 +78,24 @@ round trips per statement and stops it pipelining (about 14 for a small `PUT`). 
 `channel_binding` parameter is dropped from the URL (postgres.js doesn't support it and
 would pass it to the server as an unknown setting).
 
-What differs from the Deno server on purpose: only the PWA's own files are served
-(`/`, `index.html`, `sw.js`, `manifest.webmanifest`, `css/`, `js/`, `icons/`), not the
-whole repo; `PUT /state` accepts up to 2 MiB (was 256K characters against a 64KB store);
-`lifeMeta` always comes back with all four keys; and a few corner cases of storing a board
-as rows (duplicate ids in one body, archived ids, U+0000) are listed at the top of
-`src/pg-store.ts`.
+What differs from the Deno server on purpose:
+
+- Only the PWA's own files are served (`/`, `index.html`, `sw.js`, `manifest.webmanifest`,
+  `css/`, `js/`, `icons/`), not the whole repo.
+- `PUT /state` accepts up to 2 MiB (was 256K characters against a 64KB store).
+- What `GET /state` gives back after a `PUT` differs from what was sent in a few corner
+  cases of storing a board as rows; each is listed, with its reason, at the top of
+  `src/pg-store.ts`:
+  - a duplicated card or lifeMeta item id keeps only its first occurrence;
+  - an archived id in the body stays archived and off the board;
+  - `lifeMeta` always comes back with all four keys (`focus`, `dates`, `notes`,
+    `stickies`), and items without a string id are dropped;
+  - nested values of unknown card fields don't keep their key order (jsonb);
+  - U+0000 and lone UTF-16 surrogates, anywhere in the board (keys included), come back
+    as U+FFFD: Postgres can't store them, and refusing the `PUT` would leave the PWA
+    retrying a 500 forever;
+  - a null or absent `projects`/`life` comes back as `{}`, and an array-shaped one as an
+    object keyed `"0"`, `"1"`, … (the client's `normalize()` reads both the same way).
 
 ## Test it
 

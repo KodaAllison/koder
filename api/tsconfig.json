@@ -7,8 +7,8 @@
    * JSDoc declares; checkJs stays off because the root `npm run check` owns
    * the frontend's own type check. */
   "compilerOptions": {
-    "target": "es2023",
-    "lib": ["es2023"],
+    "target": "es2024",
+    "lib": ["es2024"],
     "module": "nodenext",
     "moduleResolution": "nodenext",
     "types": ["node"],

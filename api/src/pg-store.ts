@@ -28,9 +28,16 @@
  *      client's normalize() would;
  *  (5) jsonb keeps no key order inside nested values of unknown fields
  *      (top-level key order is kept, see field_order);
- *  (6) Postgres text can't hold U+0000, and a lone UTF-16 surrogate can't be
- *      encoded as UTF-8, so a board carrying either fails the write (500)
- *      where KV stored it.
+ *  (6) every string in the body, keys and values at any depth, is made
+ *      storable first (wellFormed below): U+0000, which Postgres text and
+ *      jsonb can't hold, becomes U+FFFD, and so does a lone UTF-16
+ *      surrogate, which has no UTF-8 encoding. KV stored both as sent; here
+ *      GET returns the replaced form, rather than the PUT failing with a 500
+ *      the PWA would retry forever;
+ *  (7) a board whose `projects` or `life` is null or absent comes back as
+ *      {}, and an array-shaped one (isBoardShaped lets it through) comes back
+ *      as an object keyed "0", "1", ...; the client's normalize() reads both
+ *      the same way.
  *
  * Connections: ONE postgres() client per process with a small pool
  * (KODER_PG_MAX, default 3). Every statement is a network round trip to Neon,
@@ -242,8 +249,24 @@ type PlannedCard = { card: Json; board_id: BoardId; column_id: string };
 type PlannedItem = { item: Json; kind: LifeKind };
 type Plan = { meta: BoardMeta; cards: PlannedCard[]; items: PlannedItem[] };
 
+/* Every string made storable: U+0000 and lone surrogates become U+FFFD, in
+ * object keys and values at every depth (exception (6) above). Applied to the
+ * whole body before planning, so the diff, the size check and the rows all
+ * see the board GET will return. Built with fromEntries, never by
+ * assignment, so a "__proto__" key stays data. */
+export function wellFormed(value: unknown): unknown {
+  if (typeof value === "string") return value.toWellFormed().replaceAll("\u0000", "�");
+  if (Array.isArray(value)) return value.map(wellFormed);
+  if (typeof value === "object" && value !== null) {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, v]) => [wellFormed(key) as string, wellFormed(v)]),
+    );
+  }
+  return value;
+}
+
 export function planBoard(board: Board): Plan {
-  const body = board as unknown as Json;
+  const body = wellFormed(board) as Json;
   const layout: Layout = { projects: [], life: [] };
   const cards: PlannedCard[] = [];
   const seenCards = new Set<string>();

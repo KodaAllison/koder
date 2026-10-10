@@ -55,13 +55,31 @@ function bodyStream(req: IncomingMessage): ReadableStream<Uint8Array> {
 }
 
 /* The URL a handler sees. Only the path and query matter to main.ts; the host
- * is the request's own when it parses, so nothing depends on it being right. */
+ * is the request's own when it parses, so nothing depends on it being right.
+ * The path is appended to an origin, never resolved against a base: as a
+ * relative reference "//evil.com/state" would become host evil.com, path
+ * /state, and reach the API; appended, the path stays "//evil.com/state", as
+ * it did under Deno.serve. An absolute-form target ("http://h/p", which only
+ * a proxy sends) is parsed as given. */
 function requestUrl(req: IncomingMessage): string {
   const path = req.url ?? "/";
+  if (!path.startsWith("/")) {
+    try {
+      return new URL(path).href;
+    } catch {
+      return "http://localhost/";
+    }
+  }
+  // A Host that isn't plainly host[:port] (one carrying "/", "?" or "#")
+  // could move the path, so it is replaced, not trusted.
+  const host = req.headers.host ?? "";
+  const origin = /^[A-Za-z0-9.\-]+(:\d+)?$|^\[[0-9A-Fa-f:.]+\](:\d+)?$/.test(host)
+    ? `http://${host}`
+    : "http://localhost";
   try {
-    return new URL(path, `http://${req.headers.host ?? "localhost"}`).href;
+    return new URL(`${origin}${path}`).href;
   } catch {
-    return new URL(path, "http://localhost").href;
+    return "http://localhost/";
   }
 }
 

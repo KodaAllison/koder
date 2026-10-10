@@ -19,7 +19,7 @@ import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
 import { readFile } from "node:fs/promises";
-import { get as httpGet } from "node:http";
+import { get as httpGet, request as httpRequest } from "node:http";
 import { type AddressInfo, connect, createServer } from "node:net";
 import test, { type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -2392,6 +2392,79 @@ test("Koder API contract (Postgres)", async (t) => {
         assert.equal((await getState(baseUrl)).rev, empty.rev);
       });
 
+      await step("U+0000 and lone surrogates are stored as U+FFFD, not refused", async () => {
+        const odd = "a\u0000b \uD800 c\uDC00";
+        const clean = "a�b � c�";
+        const res = await call("PUT", "/state", {
+          baseRev: (await getState(baseUrl)).rev,
+          board: {
+            projects: {
+              [`col ${odd}`]: [{
+                ...card("t_odd_0001"),
+                title: `title ${odd}`,
+                note: `note ${odd}`,
+                [`key ${odd}`]: { nested: [`deep ${odd}`] },
+              }],
+            },
+            life: {},
+            lifeMeta: { focus: [], dates: [], notes: `notes ${odd}`, stickies: [] },
+          },
+        });
+        assert.equal(res.status, 200, await res.clone().text());
+        const board = (await getState(baseUrl)).board;
+        assert.deepEqual(Object.keys(board.projects), [`col ${clean}`]);
+        const stored = board.projects[`col ${clean}`][0] as unknown as Record<string, unknown>;
+        assert.equal(stored.title, `title ${clean}`);
+        assert.equal(stored.note, `note ${clean}`);
+        assert.deepEqual(stored[`key ${clean}`], { nested: [`deep ${clean}`] });
+        assert.equal(board.lifeMeta.notes, `notes ${clean}`);
+      });
+
+      await step("a null, absent or array-shaped board comes back as an object", async () => {
+        // The KV server stored these as sent; rows give them back the way the
+        // client's normalize() reads them anyway (exception (7) in pg-store.ts).
+        const head = await getState(baseUrl);
+        const res = await call("PUT", "/state", {
+          baseRev: head.rev,
+          board: { projects: [[card("t_arr_0001")], []], lifeMeta: {} },
+        });
+        assert.equal(res.status, 200);
+        let board = (await getState(baseUrl)).board;
+        assert.deepEqual(board.projects, { 0: [card("t_arr_0001")], 1: [] });
+        assert.deepEqual(board.life, {});
+        await putBoard(baseUrl, { projects: null, life: null, lifeMeta: {} } as unknown as Doc["board"]);
+        board = (await getState(baseUrl)).board;
+        assert.deepEqual(board.projects, {});
+        assert.deepEqual(board.life, {});
+      });
+
+      await step("a request path starting with // is a path, not a host", async () => {
+        const url = new URL(baseUrl);
+        const raw = (method: string, path: string) =>
+          new Promise<{ status: number; location?: string; body: string }>((resolve, reject) => {
+            const req = httpRequest(
+              { host: url.hostname, port: url.port, path, method, headers: { Authorization: `Bearer ${TOKEN}` } },
+              (res) => {
+                let body = "";
+                res.on("data", (d: Buffer) => (body += d.toString()));
+                res.on("end", () => resolve({ status: res.statusCode!, location: res.headers.location, body }));
+              },
+            );
+            req.on("error", reject);
+            req.end();
+          });
+        // As under Deno: "//x/state" isn't /state, so a GET is a static
+        // request, normalised with a redirect as serveDir did, and any other
+        // method is the API's 404.
+        const get = await raw("GET", "//x/state");
+        assert.equal(get.status, 301);
+        assert.equal(get.location, "/x/state");
+        const put = await raw("PUT", "//x/state");
+        assert.equal(put.status, 404);
+        assert.deepEqual(JSON.parse(put.body), { error: "not found" });
+        assert.equal((await raw("GET", "/state")).status, 200);
+      });
+
       await step("GET /tickets flattens the projects board with refs and filters", async () => {
         await seedBoard(baseUrl, {
           todo: [card("t_list_0a01", "koder"), card("t_list_0b02", "holitrackr")],
@@ -2552,11 +2625,13 @@ function generator(seed: number): Rand {
 }
 
 // Text that has tripped stores before: multi-byte UTF-8, astral emoji, JSON
-// and SQL metacharacters, whitespace. (No U+0000 and no lone surrogates:
-// Postgres can't store either; see pg-store.ts.)
+// and SQL metacharacters, whitespace, and the two things Postgres can't
+// store as sent, U+0000 and a lone surrogate (both come back as U+FFFD; see
+// storable() below and exception (6) in pg-store.ts).
 const WORDS = [
   "Fix", "the", "sync", "—", "em dash", "naïve café", "日本語", "🚀", "👩‍💻", "\"quoted\"", "back\\slash",
   "new\nline", "tab\there", "<b>html</b>", "  padded  ", "→", "100%", "'; DROP TABLE cards; --", "{}", "[]",
+  "nul\u0000byte", "lone\uD800high", "\uDC00lone low",
 ];
 const text = (g: Rand) => Array.from({ length: 1 + g.int(4) }, () => g.pick(WORDS)).join(" ");
 
@@ -2595,7 +2670,7 @@ function randomItem(g: Rand, id: string, kind: string): AnyCard {
 function randomColumns(g: Rand, boardId: "projects" | "life"): string[] {
   const base = boardId === "projects" ? ["backlog", "todo", "doing", "review", "done"] : ["todo", "doing", "done"];
   const columns = base.filter(() => g.chance(0.85));
-  if (g.chance(0.3)) columns.push(g.pick(["someday", "waiting", "col—ü", "7"]));
+  if (g.chance(0.3)) columns.push(g.pick(["someday", "waiting", "col—ü", "7", "col\u0000nul", "col\uD83Dhalf"]));
   return columns.length ? columns : ["todo"];
 }
 
@@ -2699,8 +2774,36 @@ function mutateBoard(g: Rand, previous: AnyBoard, tag: string): AnyBoard {
  * card and board, and pr/prRev never taken from a body. Nested values of
  * unknown fields are compared by value only (jsonb doesn't keep their key
  * order). */
+/* What the store makes of any string it is sent: U+0000 and lone surrogates
+ * replaced with U+FFFD, in keys and values at every depth. Spelled out here
+ * rather than imported, so the test states the rule instead of reusing the
+ * code under test. */
+function storable<T>(value: T): T {
+  if (typeof value === "string") {
+    let out = "";
+    for (let i = 0; i < value.length; i++) {
+      const unit = value.charCodeAt(i);
+      if (unit >= 0xD800 && unit <= 0xDBFF && i + 1 < value.length) {
+        const next = value.charCodeAt(i + 1);
+        if (next >= 0xDC00 && next <= 0xDFFF) {
+          out += value[i] + value[i + 1];
+          i++;
+          continue;
+        }
+      }
+      out += unit === 0 || (unit >= 0xD800 && unit <= 0xDFFF) ? "�" : value[i];
+    }
+    return out as T;
+  }
+  if (Array.isArray(value)) return value.map(storable) as T;
+  if (typeof value === "object" && value !== null) {
+    return Object.fromEntries(Object.entries(value).map(([k, v]) => [storable(k), storable(v)])) as T;
+  }
+  return value;
+}
+
 function assertRoundTrip(got: Doc["board"], sent: AnyBoard) {
-  const expected = structuredClone(sent);
+  const expected = storable(structuredClone(sent));
   for (const b of ["projects", "life"] as const) {
     for (const cards of Object.values(expected[b])) {
       for (const c of cards) {
