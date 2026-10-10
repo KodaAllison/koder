@@ -10,12 +10,12 @@ and later deletes `server/`.
 
 Open tickets this depends on:
 
-- KODER-5C08: choose the host for the container. This runbook is host-agnostic.
+- KODER-5C08: this cutover, including choosing the host for the container (this runbook is
+  host-agnostic) and the final cleanup PR in step 10.
 - KODER-E214: write the KV -> Postgres import (and the verifier). It does not exist yet;
   the requirements it must meet are in step 4.
-- KODER-948E: the Deno-side wrap-up (the final cleanup PR in step 10 and anything
-  that needs the Deno app while it winds down). TODO(decide): confirm what 948E covers
-  beyond step 10 before starting.
+- KODER-948E (optional, not a blocker): run the api contract suite against a real Postgres in
+  CI. Until it lands, real lock waits and deadlocks are only exercised by the docker smoke job.
 
 Why the order matters: `rev` is a single, monotonically increasing integer that the PWA
 compares against (`doc.rev <= SYNC.rev` means "ignore"). The new database MUST start at
@@ -178,7 +178,7 @@ Watch for about 30 days (TODO(decide): length): the host's logs and restarts, Ne
 webhook deliveries (GitHub shows failures), and the daily use of the board. Keep the KV
 database and the Deno app untouched, but idle, during that time. Do not write to KV.
 
-Then, in one final cleanup PR (KODER-948E):
+Then, in one final cleanup PR (KODER-5C08):
 
 - Delete `server/`, `deno.json` and `deno.lock`, and the Deno parts of the docs
   (`server/README.md`, the "Deploy" and "Host the frontend" sections, the Deno lines in the
