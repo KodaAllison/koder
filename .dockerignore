@@ -1,0 +1,17 @@
+# Deny by default, then allow only what the API image needs (see Dockerfile).
+*
+
+!api/package.json
+!api/package-lock.json
+!api/src/
+!index.html
+!sw.js
+!manifest.webmanifest
+!css/
+!js/
+!icons/
+
+# Never in the image, even inside an allowed directory.
+**/node_modules
+**/.env*
+js/config.local.js
