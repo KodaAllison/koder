@@ -719,7 +719,7 @@ async function handle(req: Request): Promise<Response> {
    * board. The old board remains recoverable through the revision history. */
   if (ticketMatch && req.method === "DELETE") {
     const given = ticketMatch[1];
-    const res = await store.deleteTicket(given);
+    const res = await store.deleteTicket(given, "cli");
     if (res.kind === "unresolved") return json(res.error, res.status);
     const { card, column, rev, board } = res;
     return json({ card, ref: ticketRef(card), column, rev, board });
@@ -741,7 +741,7 @@ async function handle(req: Request): Promise<Response> {
     if (column === undefined && Object.keys(edits).length === 0) {
       return json({ error: "nothing to patch", settable: SETTABLE_FIELDS }, 400);
     }
-    const res = await store.patchTicket(given, { column, edits });
+    const res = await store.patchTicket(given, { column, edits }, "cli");
     if (res.kind === "unresolved") return json(res.error, res.status);
     return json({ card: res.card, ref: ticketRef(res.card), column: res.column, rev: res.rev });
   }
@@ -785,7 +785,7 @@ async function handle(req: Request): Promise<Response> {
       project: fields.project ?? null,
     };
 
-    const { rev } = await store.createTicket(card, column);
+    const { rev } = await store.createTicket(card, column, "cli");
     return json({ card, ref: ticketRef(card), rev }, 201);
   }
 
