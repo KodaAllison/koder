@@ -59,6 +59,8 @@ import {
   type Head,
   type PutResult,
   type Store,
+  resolveTicketId,
+  StoreContentionError,
   StoreFullError,
   type StoreLimits,
   type TicketEdits,
@@ -458,6 +460,63 @@ export function scrubSecret(message: string, url: string): string {
   return out.replace(/postgres(ql)?:\/\/[^\s'"]+/gi, "<url>");
 }
 
+// What a server-initiated write loads under the head lock: the live board.
+type Locked = {
+  head: { rev: number; layout: Layout; extra: Json };
+  cards: CardRow[];
+  items: ItemRow[];
+  notes: { notes: string; extra: Json };
+};
+
+/* The rank that puts a card after everything now in a projects column: one
+ * past the highest rank there (ranks are the zero-padded positions a PUT
+ * wrote, so "one past" is the end), or the first rank of an empty column. */
+function endRank(cards: CardRow[], column: string): string {
+  let end = -1;
+  for (const row of cards) {
+    if (row.board_id === "projects" && row.column_id === column) end = Math.max(end, Number(row.rank));
+  }
+  return rankAt(end + 1);
+}
+
+// The layout with `column` added at the end of the projects board if it isn't there.
+function withColumn(layout: Layout, column: string): Layout {
+  return layout.projects.includes(column) ? layout : { ...layout, projects: [...layout.projects, column] };
+}
+
+// Record the board's own change (a new column) when the layout moved.
+function layoutChange(
+  change: (c: Omit<Change, "seq">) => unknown,
+  head: Locked["head"],
+  layout: Layout,
+) {
+  if (layout === head.layout) return;
+  change({
+    entity: "board",
+    entity_id: OWNER,
+    op: "update",
+    before: { layout: head.layout, extra: head.extra },
+    after: { layout, extra: head.extra },
+  });
+}
+
+/* resolveTicketId over the live projects cards, then the row it named. The
+ * 404/409 bodies are the pure function's own. */
+function findTicket(cur: Locked, given: string): { prior: CardRow } | Unresolved {
+  const board = rowsToBoard({
+    meta: { layout: cur.head.layout, extra: {}, notes: "", notesExtra: {} },
+    cards: cur.cards,
+    items: [],
+  });
+  const resolved = resolveTicketId(board, given);
+  if ("error" in resolved) return { kind: "unresolved", ...resolved };
+  const prior = cur.cards.find((row) => row.id === resolved.id && row.board_id === "projects");
+  if (!prior) {
+    return { kind: "unresolved", status: 404, error: { error: `no ticket with id or ref "${given}"` } };
+  }
+  return { prior };
+}
+
 function notYet(method: string): never {
   throw new Error(`PgStore.${method} is not implemented yet (KODER-EE05 slice 3)`);
 }
@@ -791,23 +850,175 @@ export class PgStore implements Store {
     }
   }
 
-  createTicket(_card: Card, _column: string, _actor: Actor): Promise<{ rev: number }> {
-    notYet("createTicket");
+  /* ---- Server-initiated writes: POST/PATCH/DELETE tickets ----
+   * Read-modify-write under the head lock, in ONE transaction: BEGIN; the lock
+   * and the loads, pipelined (as in applyBoardPut); the writes, pipelined;
+   * COMMIT. Four round trips, whatever the ticket. They need no baseRev: the
+   * lock is taken first, so the board they change is the current one, and the
+   * second of two racing writers simply sees the first's result. The loads are
+   * the whole live board (it is capped at 2 MiB), because resolving a ref and
+   * the size check both need all of it.
+   *
+   * Waiting for the lock is bounded by LOCK_TIMEOUT; a timeout, a deadlock or
+   * a serialization failure is StoreContentionError (a 503 the caller retries).
+   *
+   * Like KV's, every successful call bumps rev by exactly 1, a PATCH that
+   * changes nothing included. */
+  private async locked<T>(fn: (tx: PgTx, cur: Locked) => Promise<T>): Promise<T> {
+    try {
+      return await this.sql.begin(async (tx): Promise<T> => {
+        const [, heads, cards, items, notes] = await Promise.all([
+          tx.unsafe(`SET LOCAL lock_timeout = '${LOCK_TIMEOUT}'`),
+          tx<{ rev: number; layout: Layout; extra: Json }[]>`
+            SELECT rev, layout, extra FROM board_head WHERE owner_id = ${OWNER} FOR UPDATE`,
+          tx<CardRow[]>`
+            SELECT id, board_id, column_id, rank, title, note, priority, created, project_id,
+                   field_order, extra, pr, pr_rev
+              FROM cards WHERE owner_id = ${OWNER} AND deleted_at IS NULL`,
+          tx<ItemRow[]>`
+            SELECT id, kind, rank, data, field_order
+              FROM life_items WHERE owner_id = ${OWNER} AND deleted_at IS NULL`,
+          tx<{ notes: string; extra: Json }[]>`
+            SELECT notes, extra FROM life_notes WHERE owner_id = ${OWNER}`,
+        ]);
+        return await fn(tx, { head: heads[0], cards, items, notes: notes[0] ?? { notes: "", extra: {} } });
+      }) as T;
+    } catch (err) {
+      if (err instanceof LostRace || CONTENTION_CODES.has((err as { code?: string }).code ?? "")) {
+        throw new StoreContentionError();
+      }
+      throw err;
+    }
   }
 
+  /* The size check, then the shared write path. `cards` is the live card set
+   * AFTER the change; the board built from it is what GET /state will return,
+   * so it is what is measured against the budget, before anything is written. */
+  private async commitTicketWrite(tx: PgTx, cur: Locked, w: {
+    now: Date;
+    actor: Actor;
+    layout: Layout;
+    cards: CardRow[];
+    changes: Change[];
+    writes: PromiseLike<unknown>[];
+  }): Promise<{ rev: number; board: Board }> {
+    const board = rowsToBoard({
+      meta: { layout: w.layout, extra: cur.head.extra, notes: cur.notes.notes, notesExtra: cur.notes.extra },
+      cards: w.cards,
+      items: cur.items,
+    });
+    const size = Buffer.byteLength(JSON.stringify(board));
+    if (size > BOARD_MAX) throw new StoreFullError(size, BOARD_MAX);
+    const rev = await commitWrite(tx, {
+      baseRev: cur.head.rev,
+      now: w.now,
+      actor: w.actor,
+      layout: w.layout,
+      extra: cur.head.extra,
+      changes: w.changes,
+      writes: w.writes,
+    });
+    return { rev, board };
+  }
+
+  /* Append to the END of a projects column, creating the column (at the end of
+   * the layout) when it doesn't exist yet. The card is stored as given, minus
+   * pr/prRev, which only the webhook writes. */
+  createTicket(card: Card, column: string, actor: Actor): Promise<{ rev: number }> {
+    const now = new Date();
+    return this.locked(async (tx, cur) => {
+      const clean = wellFormed(card) as Card;
+      const col = wellFormed(column) as string;
+      if (cur.cards.some((row) => row.id === clean.id)) {
+        throw new Error(`ticket id ${clean.id} is already on the board`);
+      }
+      const row = cardToRow(clean, "projects", col, endRank(cur.cards, col), { pr: null, pr_rev: null });
+      const layout = withColumn(cur.head.layout, col);
+      const changes: Change[] = [];
+      const change = (c: Omit<Change, "seq">) => changes.push({ seq: changes.length + 1, ...c });
+      change({ entity: "card", entity_id: row.id, op: "insert", after: cardState(row), before: null });
+      layoutChange(change, cur.head, layout);
+      const { rev } = await this.commitTicketWrite(tx, cur, {
+        now,
+        actor,
+        layout,
+        cards: [...cur.cards, row],
+        changes,
+        // The id can only collide with a soft-deleted row (checked above for
+        // live ones), which this brings back as a new card.
+        writes: [upsertCards(tx, [row])],
+      });
+      return { rev };
+    });
+  }
+
+  /* Resolve over the live projects cards exactly as KV does (id first, then
+   * ref), edit in place, and with `column` move the card to the END of that
+   * column, even when it is already there. An edit-only patch keeps its
+   * position. Returns the card as GET /state will show it. */
   patchTicket(
-    _given: string,
-    _change: { column?: string; edits: TicketEdits },
-    _actor: Actor,
+    given: string,
+    change: { column?: string; edits: TicketEdits },
+    actor: Actor,
   ): Promise<{ kind: "ok"; card: Card; column: string; rev: number } | Unresolved> {
-    notYet("patchTicket");
+    const now = new Date();
+    return this.locked(async (tx, cur) => {
+      const found = findTicket(cur, given);
+      if ("kind" in found) return found;
+      const { prior } = found;
+      const column = change.column === undefined ? undefined : wellFormed(change.column) as string;
+      const card = Object.assign(rowToCard(prior), wellFormed(change.edits)) as Card;
+      const target = column ?? prior.column_id;
+      const row = cardToRow(
+        card,
+        "projects",
+        target,
+        column === undefined ? prior.rank : endRank(cur.cards.filter((r) => r.id !== prior.id), target),
+        { pr: prior.pr, pr_rev: prior.pr_rev },
+      );
+      const layout = column === undefined ? cur.head.layout : withColumn(cur.head.layout, column);
+      const changes: Change[] = [];
+      const changeRow = (c: Omit<Change, "seq">) => changes.push({ seq: changes.length + 1, ...c });
+      const writes: PromiseLike<unknown>[] = [];
+      if (canonical(cardState(prior)) !== canonical(cardState(row))) {
+        changeRow({ entity: "card", entity_id: row.id, op: "update", before: cardState(prior), after: cardState(row) });
+        writes.push(upsertCards(tx, [row]));
+      }
+      layoutChange(changeRow, cur.head, layout);
+      const { rev } = await this.commitTicketWrite(tx, cur, {
+        now,
+        actor,
+        layout,
+        cards: cur.cards.map((r) => (r.id === prior.id ? row : r)),
+        changes,
+        writes,
+      });
+      return { kind: "ok", card: rowToCard(row), column: target, rev } as const;
+    });
   }
 
+  /* KV removed the card from the doc; here the row is soft-deleted (a later
+   * PUT that re-sends the id brings it back as a new card). The column stays
+   * in the layout when it empties. */
   deleteTicket(
-    _given: string,
-    _actor: Actor,
+    given: string,
+    actor: Actor,
   ): Promise<{ kind: "ok"; card: Card; column: string; rev: number; board: Board } | Unresolved> {
-    notYet("deleteTicket");
+    const now = new Date();
+    return this.locked(async (tx, cur) => {
+      const found = findTicket(cur, given);
+      if ("kind" in found) return found;
+      const { prior } = found;
+      const { rev, board } = await this.commitTicketWrite(tx, cur, {
+        now,
+        actor,
+        layout: cur.head.layout,
+        cards: cur.cards.filter((r) => r.id !== prior.id),
+        changes: [{ seq: 1, entity: "card", entity_id: prior.id, op: "delete", before: cardState(prior), after: null }],
+        writes: [softDeleteCards(tx, [prior.id], now)],
+      });
+      return { kind: "ok", card: rowToCard(prior), column: prior.column_id, rev, board } as const;
+    });
   }
 
   restore(_rev: number): Promise<{ rev: number; updatedAt: string } | null> {
