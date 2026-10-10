@@ -27,14 +27,15 @@ import { PGlite } from "@electric-sql/pglite";
 import { PGLiteSocketServer } from "@electric-sql/pglite-socket";
 import { nextWebhookRevision } from "../src/workflow.ts";
 
-/* ---- KODER-EE05 slice 1 only: steps that need a Store method PgStore does
- * not implement yet. A step whose name starts with one of these prefixes is
+/* ---- KODER-EE05 slices 1-2 only: steps that need a Store method PgStore does
+ * not implement yet (after slice 2: boardAt, listRevisions, restore,
+ * hasDelivery, recordDelivery, commitWebhookMove). A step whose name starts with one of these prefixes is
  * reported as skipped (with the reason) instead of failing on the method's
  * "not implemented yet" 500. SLICE 3 MUST EMPTY THIS LIST AND DELETE THE
  * MECHANISM (this constant and pendingAware below): the contract suite has no
  * business skipping steps once PgStore is whole. ---- */
 const PG_PENDING: [prefix: string, needs: string][] = [
-  ["GET /state sends an ETag and answers 304", "boardAt (?rev=N), createTicket"],
+  ["GET /state sends an ETag and answers 304", "boardAt (?rev=N)"],
   ["PR status route enforces read auth and stays read-only", "hasDelivery, commitWebhookMove"],
   ["only the four active repositories are trusted", "hasDelivery, commitWebhookMove"],
   ["repository identity requires exact canonical casing", "hasDelivery, recordDelivery"],
@@ -49,26 +50,19 @@ const PG_PENDING: [prefix: string, needs: string][] = [
   ["only a newer same-repo PR can replace", "hasDelivery, commitWebhookMove"],
   ["closed without merge is a board-revision no-op", "hasDelivery, recordDelivery"],
   ["an ambiguous visible ref is refused", "hasDelivery, commitWebhookMove"],
-  ["DELETE removes one resolved ticket", "commitWebhookMove, deleteTicket, boardAt, restore"],
+  ["DELETE removes one resolved ticket", "commitWebhookMove, boardAt, restore"],
   ["restore keeps the current PR link", "commitWebhookMove, restore, boardAt"],
   ["restore after the PR link changed", "commitWebhookMove, restore"],
   ["restore matches cards by id across columns", "commitWebhookMove, restore"],
-  ["restore keeps a deleted card's own link", "commitWebhookMove, deleteTicket, restore"],
-  ["a restored deleted card may carry a link", "commitWebhookMove, deleteTicket, restore"],
-  ["DELETE refuses missing and ambiguous refs", "deleteTicket"],
+  ["restore keeps a deleted card's own link", "commitWebhookMove, restore"],
+  ["a restored deleted card may carry a link", "commitWebhookMove, restore"],
   ["redelivery is idempotent and the changed revision is snapshotted", "hasDelivery, commitWebhookMove, boardAt"],
-  ["archive is append-only and idempotent by id", "readArchive, archive"],
-  ["archive refuses malformed bodies and needs the bearer token", "readArchive"],
-  ["GET /revisions lists restore points", "listRevisions, boardAt, createTicket"],
+  ["GET /revisions lists restore points", "listRevisions, boardAt"],
   ["restore re-lands a snapshot as a new head", "restore, boardAt, listRevisions"],
   ["restore and snapshot lookups refuse bad or unknown revs", "restore, boardAt"],
-  ["POST /tickets creates one card", "createTicket, boardAt"],
-  ["POST /tickets fills defaults", "createTicket"],
-  ["PATCH edits each field in place", "patchTicket, boardAt"],
-  ["PATCH column moves the card", "patchTicket"],
-  ["PATCH resolves ids and refs", "patchTicket"],
-  ["PATCH refuses invalid bodies", "patchTicket (the inclusive-caps edge write)"],
-  ["PATCH cannot set pr or prRev", "commitWebhookMove, patchTicket"],
+  ["POST /tickets creates one card", "boardAt"],
+  ["PATCH edits each field in place", "boardAt"],
+  ["PATCH cannot set pr or prRev", "commitWebhookMove"],
 ];
 
 /* Wraps the subtest call once, so the ported steps read as they did under
@@ -76,7 +70,7 @@ const PG_PENDING: [prefix: string, needs: string][] = [
 function pendingAware(t: TestContext) {
   return (name: string, fn: () => void | Promise<void>) => {
     const pending = PG_PENDING.find(([prefix]) => name.startsWith(prefix));
-    return t.test(name, { skip: pending ? `KODER-EE05 slice 2/3: needs PgStore.${pending[1]}` : false }, fn);
+    return t.test(name, { skip: pending ? `KODER-EE05 slice 3: needs PgStore.${pending[1]}` : false }, fn);
   };
 }
 
@@ -2168,39 +2162,218 @@ test("Koder API contract (Postgres)", async (t) => {
         assert.equal(after.board.projects.todo[0].title, `racer ${winner + 1}`);
       });
 
-      await step("archived rows are untouched by a PUT that omits them, or that names them", async () => {
-        await seedBoard(baseUrl, { todo: [card("t_live_0001")], done: [] });
-        // The archive slice will put rows here; until then, by hand.
-        await db.query(
-          `INSERT INTO cards (id, owner_id, board_id, column_id, rank, title, note, priority, created,
-                              project_id, archived_at, archived_from, field_order)
-           VALUES ('t_arch_pg01', 'koda', 'projects', 'done', '00000000', 'Archived', '', 'med', 1,
-                   'koder', now(), 'projects', '{id,title,note,priority,created,project}')`,
-        );
-        const row = async () => (await db.query(`SELECT * FROM cards WHERE id = 't_arch_pg01'`)).rows[0];
-        const archivedRow = await row();
+      await step("archiving a live card changes neither GET /state nor rev; a PUT decides whether it leaves the board", async () => {
+        const seeded = await seedBoard(baseUrl, { todo: [card("t_live_0001"), card("t_arch_pg01")] });
+        const posted = {
+          ...card("t_arch_pg01"),
+          board: "projects",
+          archivedAt: 5000,
+          clientField: { nested: [1, "two", null] },
+        };
+        const res = await call("POST", "/archive", { cards: [posted] });
+        assert.equal(res.status, 200);
+        const body = await res.json() as { archived: number; duplicates: number };
+        assert.deepEqual([body.archived, body.duplicates], [1, 0]);
 
-        // A PUT that leaves it out does not soft-delete it.
-        let state = await putBoard(baseUrl, {
-          projects: { todo: [card("t_live_0001", "koder", { title: "edited" })], done: [] },
-          life: {},
-          lifeMeta: {},
-        });
-        assert.deepEqual(await row(), archivedRow);
+        // The archive is its own store: the board and rev never moved, and the
+        // card is still on it.
+        await assertUntouched(seeded);
+        assert.deepEqual((await getState(baseUrl)).board.projects.todo.map((c) => c.id), ["t_live_0001", "t_arch_pg01"]);
+        const inArchive = async () => (await readArchive()).cards.filter((c) => c.id === "t_arch_pg01");
+        assert.deepEqual(await inArchive(), [posted]);
+
+        // The client drops the card with its next PUT: off the board, still archived.
+        let state = await putBoard(baseUrl, { projects: { todo: [card("t_live_0001")] }, life: {}, lifeMeta: {} });
         assert.ok(!JSON.stringify(state.board).includes("t_arch_pg01"));
+        assert.deepEqual(await inArchive(), [posted]);
 
-        // A PUT that names it can't edit it or bring it back to the board.
+        // A PUT that re-sends the id (a stale tab) keeps it on the board, as on KV;
+        // the archived copy is not rewritten.
         state = await putBoard(baseUrl, {
           projects: {
-            todo: [card("t_live_0001", "koder", { title: "edited" })],
-            done: [card("t_arch_pg01", "koder", { title: "resent from a stale tab" })],
+            todo: [card("t_live_0001"), card("t_arch_pg01", "koder", { title: "resent from a stale tab" })],
           },
           life: {},
           lifeMeta: {},
         });
-        assert.deepEqual(await row(), archivedRow);
-        assert.deepEqual(state.board.projects.done, []);
-        assert.equal(state.board.projects.todo[0].title, "edited");
+        assert.equal(state.board.projects.todo[1].title, "resent from a stale tab");
+        assert.deepEqual(await inArchive(), [posted]);
+      });
+
+      /* ---- Ticket writes, seen from the database: what the HTTP contract
+       * can't tell, that each write is one set of `changes` rows and one
+       * `revisions` row, and one rev. ---- */
+      type ChangeRow = { seq: number; entity: string; entity_id: string; op: string; before: any; after: any; actor: string };
+      const headRev = async () => (await db.query<{ rev: number }>(`SELECT rev::int AS rev FROM board_head`)).rows[0].rev;
+      const logged = async (rev: number) => ({
+        revisions: (await db.query<{ actor: string; summary: string | null }>(
+          `SELECT actor, summary FROM revisions WHERE rev = $1`, [rev],
+        )).rows,
+        changes: (await db.query<ChangeRow>(
+          `SELECT seq::int AS seq, entity, entity_id, op, before, after, actor FROM changes WHERE rev = $1 ORDER BY seq`, [rev],
+        )).rows,
+      });
+
+      await step("POST, PATCH and DELETE /tickets each write one revisions row and their changes rows, rev + 1", async () => {
+        const seeded = await seedBoard(baseUrl, { todo: [card("t_log_0001"), card("t_log_0002")] });
+
+        // Create in a column the board doesn't have yet: the layout grows with it.
+        const created = await createTicket({ title: "logged", column: "review" });
+        assert.equal(created.status, 201);
+        const made = await created.json() as { card: Card; rev: number };
+        assert.equal(made.rev, seeded.rev + 1);
+        assert.equal(await headRev(), made.rev);
+        let log = await logged(made.rev);
+        assert.deepEqual(log.revisions, [{ actor: "cli", summary: "1× card insert, 1× board update" }]);
+        assert.deepEqual(log.changes.map((c) => [c.seq, c.entity, c.op, c.actor]), [[1, "card", "insert", "cli"], [2, "board", "update", "cli"]]);
+        assert.equal(log.changes[0].before, null);
+        assert.equal(log.changes[0].entity_id, made.card.id);
+        assert.equal(log.changes[0].after.title, "logged");
+        assert.equal(log.changes[0].after.column_id, "review");
+        assert.deepEqual(log.changes[1].before.layout.projects, ["todo"]);
+        assert.deepEqual(log.changes[1].after.layout.projects, ["todo", "review"]);
+        assert.deepEqual(Object.keys((await getState(baseUrl)).board.projects), ["todo", "review"]);
+
+        // An edit keeps the position: one card update, the rank untouched.
+        const edited = await patchBody("t_log_0001", { title: "edited" });
+        assert.equal(edited.status, 200);
+        assert.equal((await edited.json() as Patched).rev, made.rev + 1);
+        log = await logged(made.rev + 1);
+        assert.deepEqual(log.revisions, [{ actor: "cli", summary: "1× card update" }]);
+        assert.equal(log.changes.length, 1);
+        assert.equal(log.changes[0].before.title, "Webhook ticket");
+        assert.equal(log.changes[0].after.title, "edited");
+        assert.equal(log.changes[0].after.rank, log.changes[0].before.rank);
+
+        // A patch that changes nothing is still a write, like KV: rev + 1, no rows.
+        const same = await patchBody("t_log_0001", { title: "edited" });
+        assert.equal((await same.json() as Patched).rev, made.rev + 2);
+        log = await logged(made.rev + 2);
+        assert.deepEqual(log.revisions, [{ actor: "cli", summary: null }]);
+        assert.deepEqual(log.changes, []);
+
+        // A move goes to the end of the target column: after the card created there.
+        const moved = await patchBody("t_log_0001", { column: "review" });
+        assert.equal((await moved.json() as Patched).rev, made.rev + 3);
+        log = await logged(made.rev + 3);
+        assert.equal(log.changes.length, 1);
+        assert.deepEqual([log.changes[0].before.column_id, log.changes[0].after.column_id], ["todo", "review"]);
+        assert.equal(log.changes[0].after.rank, "00000001");
+        assert.deepEqual((await getState(baseUrl)).board.projects.review.map((c) => c.id), [made.card.id, "t_log_0001"]);
+
+        // A refused write leaves no trace.
+        assert.equal((await patchBody("KODER-DEAD", { title: "ghost" })).status, 404);
+        assert.equal(await headRev(), made.rev + 3);
+
+        // Delete soft-deletes the row and logs the card as it was.
+        const deleted = await call("DELETE", "/tickets/t_log_0002");
+        assert.equal(deleted.status, 200);
+        assert.equal((await deleted.json() as { rev: number }).rev, made.rev + 4);
+        log = await logged(made.rev + 4);
+        assert.deepEqual(log.revisions, [{ actor: "cli", summary: "1× card delete" }]);
+        assert.equal(log.changes.length, 1);
+        assert.equal(log.changes[0].after, null);
+        assert.equal(log.changes[0].before.title, "Webhook ticket");
+        const gone = (await db.query<{ gone: boolean }>(`SELECT deleted_at IS NOT NULL AS gone FROM cards WHERE id = 't_log_0002'`)).rows;
+        assert.deepEqual(gone, [{ gone: true }]);
+
+        // Exactly one revisions row per write, none extra.
+        const n = (await db.query<{ n: number }>(`SELECT count(*)::int AS n FROM revisions WHERE rev > $1`, [seeded.rev])).rows[0].n;
+        assert.equal(n, 5);
+      });
+
+      await step("concurrent ticket writes are serialised: every PATCH and POST lands, revs consecutive", async () => {
+        const seeded = await seedBoard(baseUrl, { todo: [card("t_conc_0001", "koder", { title: "orig", note: "orig" })] });
+        // Different fields of one ticket: the later write sees the earlier one's
+        // result, so none is lost (a read-modify-write without the lock would
+        // drop all but one).
+        const fields: Record<string, unknown>[] = [{ title: "T" }, { note: "N" }, { priority: "high" }, { project: "holitrackr" }];
+        const patched = await Promise.all(fields.map((f) => patchBody("t_conc_0001", f)));
+        const results = await Promise.all(patched.map(async (r) => {
+          assert.equal(r.status, 200);
+          return await r.json() as Patched;
+        }));
+        const byRev = results.map((r, i) => ({ ...r, fields: fields[i] })).sort((a, b) => a.rev - b.rev);
+        assert.deepEqual(byRev.map((r) => r.rev), [1, 2, 3, 4].map((n) => seeded.rev + n));
+        for (const [i, r] of byRev.entries()) {
+          for (const earlier of byRev.slice(0, i + 1)) {
+            for (const [key, value] of Object.entries(earlier.fields)) {
+              assert.deepEqual((r.card as unknown as Record<string, unknown>)[key], value, `rev ${r.rev} lost ${key}`);
+            }
+          }
+        }
+        const final = (await getState(baseUrl)).board.projects.todo[0];
+        assert.deepEqual([final.title, final.note, final.priority, final.project], ["T", "N", "high", "holitrackr"]);
+
+        // Concurrent creates all land, in the column in rev order, ranks distinct.
+        const head = await getState(baseUrl);
+        const posted = await Promise.all([1, 2, 3, 4, 5, 6].map((n) => createTicket({ title: `racer ${n}`, column: "todo" })));
+        const made = await Promise.all(posted.map(async (r) => {
+          assert.equal(r.status, 201);
+          return await r.json() as { card: Card; rev: number };
+        }));
+        made.sort((a, b) => a.rev - b.rev);
+        assert.deepEqual(made.map((m) => m.rev), [1, 2, 3, 4, 5, 6].map((n) => head.rev + n));
+        const after = await getState(baseUrl);
+        assert.equal(after.rev, head.rev + 6);
+        assert.deepEqual(after.board.projects.todo.map((c) => c.id), ["t_conc_0001", ...made.map((m) => m.card.id)]);
+        const ranks = (await db.query<{ n: number }>(
+          `SELECT count(DISTINCT rank)::int AS n FROM cards WHERE column_id = 'todo' AND deleted_at IS NULL`,
+        )).rows[0].n;
+        assert.equal(ranks, 7);
+      });
+
+      await step("create and patch are refused with a 507 at the 2 MiB budget, writing nothing", async () => {
+        const board = (note: string) => ({
+          projects: { todo: [card("t_full_0001", "koder", { note }), card("t_full_0002")] },
+          life: {},
+          lifeMeta: {},
+        });
+        const empty = await putBoard(baseUrl, board(""));
+        const base = Buffer.byteLength(JSON.stringify(empty.board));
+        const slack = 3000; // room for a small ticket, not for a 5000-char note
+        const full = await putBoard(baseUrl, board("x".repeat(PG_BOARD_MAX - slack - base)));
+        assert.equal(Buffer.byteLength(JSON.stringify(full.board)), PG_BOARD_MAX - slack);
+        const noRowsAfter = async () =>
+          assert.equal((await db.query<{ n: number }>(`SELECT count(*)::int AS n FROM revisions WHERE rev > $1`, [full.rev])).rows[0].n, 0);
+
+        const refusals = [
+          await createTicket({ title: "over budget", note: "n".repeat(5000) }),
+          await patchBody("t_full_0002", { note: "n".repeat(5000) }),
+        ];
+        for (const res of refusals) {
+          assert.equal(res.status, 507);
+          const body = await res.json() as { error: string; size: number; limit: number };
+          assert.match(body.error, /^board store full: \d+ of 2097152 bytes — archive done tickets to free space$/);
+          assert.equal(body.limit, PG_BOARD_MAX);
+          assert.ok(body.size > PG_BOARD_MAX);
+        }
+        await assertUntouched(full);
+        await noRowsAfter();
+
+        // Under the budget it still lands, and an edit that frees room does too.
+        assert.equal((await createTicket({ title: "fits" })).status, 201);
+        assert.equal((await patchBody("t_full_0001", { note: "" })).status, 200);
+        assert.equal((await createTicket({ title: "n".repeat(300), note: "n".repeat(5000) })).status, 201);
+      });
+
+      await step("concurrent identical POST /archive: exactly one batch is counted as archived", async () => {
+        const batch = [archived("t_archc_0001", 10), archived("t_archc_0002", 20)];
+        const responses = await Promise.all([1, 2, 3, 4, 5].map(() => call("POST", "/archive", { cards: batch })));
+        const bodies = await Promise.all(responses.map(async (r) => {
+          assert.equal(r.status, 200);
+          return await r.json() as Record<string, number>;
+        }));
+        const landed = bodies.filter((b) => "chunk" in b);
+        assert.equal(landed.length, 1, JSON.stringify(bodies));
+        assert.deepEqual([landed[0].archived, landed[0].duplicates], [2, 0]);
+        for (const b of bodies.filter((x) => !("chunk" in x))) {
+          assert.deepEqual([b.archived, b.duplicates], [0, 2]);
+        }
+        const mine = (await readArchive()).cards.filter((c) => c.id.startsWith("t_archc_"));
+        assert.deepEqual(mine.map((c) => c.id), ["t_archc_0002", "t_archc_0001"]); // newest archivedAt first
+        const seqs = (await db.query<{ id: string }>(`SELECT id FROM archived_cards WHERE id LIKE 't_archc_%' ORDER BY seq`)).rows;
+        assert.deepEqual(seqs.map((r) => r.id), ["t_archc_0001", "t_archc_0002"]);
       });
 
       await step("PUT keeps stored pr/prRev and can't forge, strip or replace them", async () => {
@@ -2592,11 +2765,17 @@ test("Postgres: migrations are idempotent across a restart, and the board surviv
     }
     const count = async (table: string) =>
       Number((await database.db.query<{ n: number }>(`SELECT count(*)::int AS n FROM ${table}`)).rows[0].n);
-    assert.equal(await count("schema_migrations"), 1);
+    assert.equal(await count("schema_migrations"), 2);
     assert.equal(await count("owners"), 1);
     assert.equal(await count("board_head"), 1);
     assert.equal(await count("life_notes"), 1);
     assert.equal(await count("revisions"), 2);
+    // Migration 2 retired the archived flag on cards in favour of its own table.
+    const columns = (await database.db.query<{ column_name: string }>(
+      `SELECT column_name FROM information_schema.columns WHERE table_name = 'cards'`,
+    )).rows.map((row) => row.column_name);
+    assert.ok(!columns.includes("archived_at") && !columns.includes("archived_from"));
+    assert.equal(await count("archived_cards"), 0);
   } finally {
     await database.close();
   }
