@@ -15,7 +15,10 @@ nothing in `server/` changes until the cutover (KODER-EE05 slice 4).
 
 Slice 3 of 4: every route is implemented, and the whole contract suite ported from
 `server/` passes against Postgres with no step skipped. What is left is the cutover
-(slice 4): deploying this, importing the KV board, and retiring `server/`.
+(slice 4): deploying this, importing the KV board, and retiring `server/`. The import must
+insert a `revisions` row for the imported head rev (actor `migration`, `updated_at` = the KV
+doc's `updatedAt`, no `changes` rows) when it sets `board_head.rev`: history only serves and
+restores revs that have one.
 
 ## History, restore and the webhook
 

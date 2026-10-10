@@ -398,11 +398,13 @@ Phase M0 (prep, no behaviour change)
 
 Phase M1 (backfill, shadow DB)
 - `scripts/migrate-kv-to-pg.ts` (idempotent, re-runnable): create schema; read `["board"]`; insert cards with rank
-  assigned in array order; `life_items`; `life_notes`; set `board_head.rev = doc.rev`; read all `["archive", n]` chunks
+  assigned in array order; `life_items`; `life_notes`; set `board_head.rev = doc.rev` and, in the same transaction,
+  insert the `revisions` row for that rev (actor `migration`, `updated_at` = the KV doc's `updatedAt`, no `changes`
+  rows): `GET /state?rev=N` and restore only accept a rev that has a `revisions` row, so without it the board as it
+  stood at cutover could never be served or restored; read all `["archive", n]` chunks
   -> cards with `archived_at` (from `archivedAt` ms) and `archived_from` (from `board`); import `["github-delivery", *]`
-  into `webhook_deliveries(outcome='migrated')`; import up to 20 `["board", rev]` snapshots into `changes`/`revisions`
-  as synthetic `update` batches (or store them in a `revision_snapshots` table until retired; cheaper and exact;
-  decide in Q5).
+  into `webhook_deliveries(outcome='migrated')`. The 20 `["board", rev]` snapshots are NOT imported (Q5): history
+  starts at cutover, after the safety export.
 - Verifier (`scripts/verify-migration.ts`): load KV doc and PG-assembled doc and compare canonical JSON (sorted keys,
   column order preserved): rev equal, per-board card count equal, per-card field equality including `pr`/`prRev`/
   `created`/unknown fields (`extra`), lifeMeta equality, archive count and ids equal, delivery id set equal. Exit
@@ -433,7 +435,9 @@ Phase M4 (rollback and retirement)
 Data verification checklist (run at M1, nightly in M2, at M3 before and after switching)
 1. rev equal. 2. Card counts per board/column. 3. Sha-256 of canonical JSON per card equal. 4. Order within each
 column equal. 5. Archive id set equal. 6. Delivery id set equal. 7. `GET /state` byte-diff via `curl` against both stores
-on a fixed rev (golden). 8. Restore dry-run of the latest 3 revisions reconstructs the KV snapshots exactly.
+on a fixed rev (golden). 8. Restore dry-run from the new history: after a few
+post-cutover writes, `GET /state?rev=<imported head>` is served and equals the KV doc, and restoring it brings that
+board back as a new rev.
 
 ## 9. Service worker, offline-first and localStorage
 
@@ -524,7 +528,9 @@ Phases 0-3 are the commitment (about 4 weekends of work); everything after is in
 5. **Answered (2026-10-08): keep the full `changes` log, no retention cap; drop the 20 KV snapshots at migration**
    (PgStore history starts at cutover; the §8 safety export to dated JSON still runs first, so nothing is destroyed).
    So there is no `revision_snapshots` table (§8 M1): `GET /state?rev=N` reverse-applies `changes` from head, and
-   `GET /revisions` lists the newest 200 while older revs stay reachable (implemented in `api/`, 2026-10-09). (Was:
+   `GET /revisions` lists the newest 200 while older revs stay reachable (implemented in `api/`, 2026-10-09). The
+   import must write a `revisions` row for the imported head rev (actor `migration`, no `changes` rows), or the
+   cutover board can't be served by `?rev=` or restored (§8 M1). (Was:
    keep all or cap at N days? Keep exact-snapshot fidelity for the migrated snapshots, or accept synthetic diffs?)
 6. **Answered (2026-10-08): restore keeps the CURRENT `pr`/`prRev` of surviving cards, and a card deleted since the
    snapshot keeps the snapshot's own** (`restoreWorkflowMetadata`), applied to `KvStore` too and asserted in the
