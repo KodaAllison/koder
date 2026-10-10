@@ -3031,6 +3031,50 @@ test("Koder API contract (Postgres)", async (t) => {
         assert.deepEqual(await deliveryRow(delivery), [{ outcome: "moved", rev: before.rev + 1 }]);
       });
 
+      await step("a webhook move past the 2 MiB budget is a 507 that records nothing, so the redelivery moves it once", async () => {
+        const board = (note: string) => ({
+          projects: { todo: [card("t_full_hook", "koder", { note }), card("t_full_keep")] },
+          life: {},
+          lifeMeta: {},
+        });
+        const empty = await putBoard(baseUrl, board(""));
+        const base = Buffer.byteLength(JSON.stringify(empty.board));
+        // 20 bytes short of the budget: the move's pr/prRev and new review
+        // column can't fit.
+        const full = await putBoard(baseUrl, board("x".repeat(PG_BOARD_MAX - 20 - base)));
+        assert.equal(Buffer.byteLength(JSON.stringify(full.board)), PG_BOARD_MAX - 20);
+        const counts = await tableCounts();
+        const delivery = freshDelivery();
+        const payload = pullRequest(90, "KODER-HOOK over budget");
+
+        const refused = await postWebhook(baseUrl, payload, { delivery });
+        assert.equal(refused.status, 507);
+        const body = await refused.json() as { error: string; limit: number; size: number };
+        assert.match(body.error, /^board store full: \d+ of 2097152 bytes — archive done tickets to free space$/);
+        assert.equal(body.limit, PG_BOARD_MAX);
+        assert.ok(body.size > PG_BOARD_MAX);
+        // No delivery row: a recorded one would turn every redelivery into
+        // "redelivered" and the card would never move.
+        assert.deepEqual(await deliveryRow(delivery), []);
+        await assertUntouched(full);
+        assert.deepEqual(await tableCounts(), counts);
+
+        // Free space, then GitHub redelivers the same id: it moves, once.
+        const freed = await putBoard(baseUrl, board(""));
+        const retry = await postWebhook(baseUrl, payload, { delivery });
+        assert.equal(retry.status, 200);
+        const moved = await retry.json() as { updated: boolean; rev: number };
+        assert.equal(moved.updated, true);
+        assert.equal(moved.rev, freed.rev + 1);
+        const after = await getState(baseUrl);
+        assert.equal(after.rev, freed.rev + 1);
+        assert.deepEqual(after.board.projects.review.map((c) => [c.id, c.pr, c.prRev]), [["t_full_hook", "KodaAllison/koder#90", 1]]);
+        assert.deepEqual(await deliveryRow(delivery), [{ outcome: "moved", rev: freed.rev + 1 }]);
+        const again = await postWebhook(baseUrl, payload, { delivery });
+        assert.equal((await again.json() as { redelivered?: boolean }).redelivered, true);
+        assert.equal((await getState(baseUrl)).rev, freed.rev + 1);
+      });
+
       await step("contention (40001, 55P03) is a 409 on PUT and a 503 on any other write, leaves no trace, and the retry lands", async () => {
         const contention = { status: 503, body: { error: "write contention, retry" } };
         // PUT answers what KV did when a PUT lost a race, so the PWA merges and retries.
