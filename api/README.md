@@ -103,8 +103,9 @@ What differs from the Deno server on purpose:
 - `POST`/`PATCH`/`DELETE /tickets`, `POST /state/restore` and the webhook lock `board_head`
   and rewrite from the current board in one transaction, instead of retrying a
   compare-and-swap five times. A lock wait over 5 seconds, a deadlock or a serialization
-  failure is the same 503 `write contention, retry`, and so is a serialization failure or
-  deadlock on `PUT /state` (KV had no such case; a stale `baseRev` is still the 409). The
+  failure is the same 503 `write contention, retry`. On `PUT /state` a serialization
+  failure or deadlock is instead the 409 `conflict: concurrent write, retry` KV answered
+  when a PUT lost a race, so the PWA merges and retries at once. The
   ticket routes' `changes` rows are attributed to `cli`. A deleted ticket is soft-deleted,
   and a title or note with U+0000 or a lone surrogate is stored (and later read) with
   U+FFFD, as for `PUT`, though the create response still echoes what was sent.

@@ -1063,10 +1063,12 @@ export class PgStore implements Store {
         return { kind: "ok", rev, updatedAt: now.toISOString() } as PutResult;
       });
     } catch (err) {
-      if (err instanceof LostRace) return { kind: "conflict" };
-      // A serialization failure, deadlock or lock timeout is no 409 (nothing
-      // says the body is stale): it is the 503 the server's own writes answer.
-      if (isContention(err)) throw new StoreContentionError();
+      // A lost race, serialization failure, deadlock or lock timeout is the
+      // 409 "concurrent write, retry" KV answered when a PUT lost a race: the
+      // PWA merges and retries on a 409 at once, where a 503 would only show
+      // a sync error until its next push. (Under READ COMMITTED, with every
+      // writer taking the board_head lock first, it is hardly reachable.)
+      if (err instanceof LostRace || isContention(err)) return { kind: "conflict" };
       throw err;
     }
   }

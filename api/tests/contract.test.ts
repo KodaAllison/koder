@@ -3031,19 +3031,27 @@ test("Koder API contract (Postgres)", async (t) => {
         assert.deepEqual(await deliveryRow(delivery), [{ outcome: "moved", rev: before.rev + 1 }]);
       });
 
-      await step("contention (40001, 55P03) on any write is a 503 that leaves no trace, and the retry lands", async () => {
-        const contention = { error: "write contention, retry" };
-        /* Fault on `table`, send `request`: 503, and the board, rev and every
-         * history/delivery/archive table exactly as they were. Then remove the
-         * fault and send the same request again: `ok`. */
-        const faulted = async (code: string, table: string, request: () => Promise<Response>, ok: number) => {
+      await step("contention (40001, 55P03) is a 409 on PUT and a 503 on any other write, leaves no trace, and the retry lands", async () => {
+        const contention = { status: 503, body: { error: "write contention, retry" } };
+        // PUT answers what KV did when a PUT lost a race, so the PWA merges and retries.
+        const putConflict = { status: 409, body: { error: "conflict: concurrent write, retry" } };
+        /* Fault on `table`, send `request`: the `refused` answer, and the
+         * board, rev and every history/delivery/archive table exactly as they
+         * were. Then remove the fault and send the same request again: `ok`. */
+        const faulted = async (
+          code: string,
+          table: string,
+          request: () => Promise<Response>,
+          ok: number,
+          refused = contention,
+        ) => {
           const before = await getState(baseUrl);
           const counts = await tableCounts();
           await injectFault(table, code);
           try {
             const res = await request();
-            assert.equal(res.status, 503, `${code} on ${table}`);
-            assert.deepEqual(await res.json(), contention);
+            assert.equal(res.status, refused.status, `${code} on ${table}`);
+            assert.deepEqual(await res.json(), refused.body);
           } finally {
             await settled();
             await removeFault(table);
@@ -3060,7 +3068,7 @@ test("Koder API contract (Postgres)", async (t) => {
           });
           const edited = structuredClone(seeded.board);
           edited.projects.todo[0].title = `edited under ${code}`;
-          await faulted(code, "revisions", () => call("PUT", "/state", { baseRev: seeded.rev, board: edited }), 200);
+          await faulted(code, "revisions", () => call("PUT", "/state", { baseRev: seeded.rev, board: edited }), 200, putConflict);
           await faulted(code, "revisions", () => createTicket({ title: `made under ${code}` }), 201);
           await faulted(code, "revisions", () => patchBody("t_fault_0001", { column: "doing" }), 200);
           await faulted(code, "revisions", () => call("DELETE", "/tickets/t_fault_0002"), 200);
