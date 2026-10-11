@@ -565,7 +565,7 @@ function diffWrites(tx: PgTx, plan: Plan, diff: Diff, now: Date, workflow: "keep
 // board_head finds another writer got there first.
 class LostRace extends Error {}
 
-type PgTx = postgres.TransactionSql<{ int8: number }>;
+export type PgTx = postgres.TransactionSql<{ int8: number }>;
 
 /* How long a server-initiated write waits for the board_head lock before
  * giving up as contention. Whole seconds: a held lock is another write's few
@@ -632,7 +632,7 @@ async function commitWrite(tx: PgTx, w: {
  * new or resurrected one comes back without. Only the webhook and restore
  * pass "write", which stores the pr/pr_rev the row carries (the webhook's
  * new link; restore's restoreWorkflowMetadata result). */
-function upsertCards(tx: PgTx, rows: CardRow[], workflow: "keep" | "write" = "keep") {
+export function upsertCards(tx: PgTx, rows: CardRow[], workflow: "keep" | "write" = "keep") {
   const write = workflow === "write";
   return tx`
     INSERT INTO cards AS c (id, owner_id, board_id, column_id, rank, title, note, priority,
@@ -803,7 +803,52 @@ const PG_TYPES = {
     parse: (value: string) => Number(value),
   },
 };
-type PgSql = postgres.Sql<{ int8: number }>;
+export type PgSql = postgres.Sql<{ int8: number }>;
+
+/* Connect and migrate, handing back the bare client: PgStore.open wraps it,
+ * and the one-shot KV import (kv-import.ts) runs its own transaction on it. */
+export async function openSql(connectionString: string, options: { max: number }): Promise<PgSql> {
+  let url: URL;
+  try {
+    url = new URL(connectionString);
+  } catch {
+    throw new Error("NEON_DATABASE_URL is not a valid postgres:// URL");
+  }
+  const ssl = sslFor(url);
+  /* Neon's connection strings carry `channel_binding=require`, a libpq
+   * client option. postgres.js doesn't know it and would forward it to the
+   * server as a startup setting, which Postgres rejects as an unknown
+   * parameter; it doesn't do channel binding either, so drop it. */
+  let target = connectionString;
+  if (url.searchParams.has("channel_binding")) {
+    url.searchParams.delete("channel_binding");
+    target = url.href;
+  }
+  let sql: PgSql;
+  try {
+    sql = postgres(target, {
+      max: options.max,
+      ...(ssl === undefined ? {} : { ssl }),
+      // Neon's pooler (PgBouncer, transaction mode) can't hold named prepared
+      // statements across transactions; the spike measured with this setting.
+      ...(url.hostname.includes("-pooler") ? { prepare: false } : {}),
+      connect_timeout: 15,
+      onnotice: () => {},
+      types: PG_TYPES,
+    }) as unknown as PgSql;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(`PgStore could not open the database: ${scrubSecret(message, connectionString)}`);
+  }
+  try {
+    await migrate(sql);
+  } catch (err) {
+    await sql.end({ timeout: 1 }).catch(() => {});
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(`PgStore could not open the database: ${scrubSecret(message, connectionString)}`);
+  }
+  return sql;
+}
 
 export class PgStore implements Store {
   readonly limits: StoreLimits = {
@@ -824,46 +869,7 @@ export class PgStore implements Store {
    * scrubbed) if the database can't be reached or migrated, which main.ts
    * turns into a startup failure. */
   static async open(connectionString: string, options: { max: number }): Promise<PgStore> {
-    let url: URL;
-    try {
-      url = new URL(connectionString);
-    } catch {
-      throw new Error("NEON_DATABASE_URL is not a valid postgres:// URL");
-    }
-    const ssl = sslFor(url);
-    /* Neon's connection strings carry `channel_binding=require`, a libpq
-     * client option. postgres.js doesn't know it and would forward it to the
-     * server as a startup setting, which Postgres rejects as an unknown
-     * parameter; it doesn't do channel binding either, so drop it. */
-    let target = connectionString;
-    if (url.searchParams.has("channel_binding")) {
-      url.searchParams.delete("channel_binding");
-      target = url.href;
-    }
-    let sql: PgSql;
-    try {
-      sql = postgres(target, {
-        max: options.max,
-        ...(ssl === undefined ? {} : { ssl }),
-        // Neon's pooler (PgBouncer, transaction mode) can't hold named prepared
-        // statements across transactions; the spike measured with this setting.
-        ...(url.hostname.includes("-pooler") ? { prepare: false } : {}),
-        connect_timeout: 15,
-        onnotice: () => {},
-        types: PG_TYPES,
-      }) as unknown as PgSql;
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      throw new Error(`PgStore could not open the database: ${scrubSecret(message, connectionString)}`);
-    }
-    try {
-      await migrate(sql);
-    } catch (err) {
-      await sql.end({ timeout: 1 }).catch(() => {});
-      const message = err instanceof Error ? err.message : String(err);
-      throw new Error(`PgStore could not open the database: ${scrubSecret(message, connectionString)}`);
-    }
-    return new PgStore(sql);
+    return new PgStore(await openSql(connectionString, options));
   }
 
   async close(): Promise<void> {
