@@ -6,6 +6,11 @@ repo when this was written, so the `agent_runs` shape below is a placeholder to 
 Ticket context: KODER-DBA0 (Finances module). I could not read that ticket's body from here; the finance
 requirements below come from the brief (integer pence, immutable ledger, idempotent imports).
 
+**Update 2026-10-11:** the Node + Postgres port described below was built (KODER-EE05/E214) and then shelved; it is
+removed from `main` and kept at the git tag `node-api-archive` (`api/`, `Dockerfile`, the cutover runbook). Koda stays on
+Deno Deploy for now and revisits by January 2027 (Deno Deploy reportedly shuts down around April 2027). References to
+`api/` and the cutover below are to that tag. Cloudflare Workers + Neon remains an open alternative.
+
 **Update 2026-10-09:** Deno is being left. Rather than adding `PgStore` to the Deno server, the server is being
 ported to Node.js + Postgres in `api/` (same HTTP API, `Store` seam and pure domain rules), with Neon still the
 target database (Q1). The live Deno server in `server/` stays untouched until the cutover. Phases 1-2 below are done

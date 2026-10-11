@@ -69,39 +69,6 @@ This targets the new Deno Deploy (https://console.deno.com). Deploy Classic
    KODER_TOKEN=<token>
    ```
 
-### DB spike probe
-
-A guarded latency probe for the storage spike (`docs/specs/storage-spike.md`,
-KODER-6784). It does nothing unless you enable it.
-
-- Route: `GET /spike/db?target=deploy|neon[&n=100][&cold=1]`, bearer auth like
-  every other API route. `404 {"error":"db spike disabled"}` unless
-  `KODER_DB_SPIKE=1`.
-- Env: `KODER_DB_SPIKE=1`; `NEON_DATABASE_URL` for `target=neon`. `target=deploy`
-  reads `DATABASE_URL`, which Deploy injects only when a Postgres database is
-  attached, and on koder that detaches KV (see Deploy step 4). So `deploy` is
-  effectively unusable here. Neon was chosen (storage spec Q1). A
-  missing URL is a `400 {"error":"<VAR> not set"}`. Remove `KODER_DB_SPIKE` when
-  the measurement is done.
-- Each request opens a fresh single connection (so connect time is measured) and
-  closes it. A `-pooler` host gets `prepare: false` for PgBouncer. `n` is
-  clamped to 1..500. Connection failures are `502` with the password scrubbed.
-- Response: `{ target, region, connectMs, firstQueryMs, selectOne: {n,p50,p95,max},
-  txn3: {n,p50,p95}, serverVersion }`, in ms. `cold=1` returns only the connect,
-  first-query and version fields: no loops, no writes. A full run creates a
-  tiny `spike_probe` table and deletes its rows older than a day.
-- Client, from `server/`:
-
-  ```bash
-  deno task spike:db -- --target neon|deploy [--n 100] [--cold] [--json]
-  ```
-
-  It reads `KODER_API`/`KODER_TOKEN` from the environment, else
-  `scripts/.koder.env` (the environment wins), prints a small table (or the raw
-  JSON with `--json`) and exits non-zero with the server's message on an HTTP
-  error. `region` comes from `DENO_REGION`, which the Deploy docs do not list,
-  so it may be `null`.
-
 ## Host the frontend (so it works on your phone)
 
 `main.ts` serves **both** the API and the PWA's static files, so the same one

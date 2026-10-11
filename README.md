@@ -144,12 +144,6 @@ branch stamped, they'd all conflict on that one line and the fix would be to
 re-run the script anyway. Stamp once on `main` after merging. For the same
 reason `node --test` doesn't assert freshness; `--check` above is the guard.
 
-## Node + Postgres server (in progress)
-
-`server/` above is the live backend. Its replacement, a Node + Postgres port with the same
-HTTP API, lives in [`api/`](api/README.md) and ships as a container (`Dockerfile`). The plan
-for switching over is [docs/runbooks/cutover-to-node.md](docs/runbooks/cutover-to-node.md).
-
 ## Development notes
 
 - Local server for the API: `cd server && KODER_TOKEN=dev deno task dev`, then
