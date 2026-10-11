@@ -9,16 +9,18 @@ origin.
 
 **`server/` is still the live board.** The production app is the Deno Deploy app whose
 entrypoint is `server/main.ts`, redeployed from `main`. Nothing here is deployed yet, and
-nothing in `server/` changes until the cutover (KODER-EE05 slice 4).
+nothing in `server/` changes until the cutover.
 
 ## Status
 
-Slice 3 of 4: every route is implemented, and the whole contract suite ported from
-`server/` passes against Postgres with no step skipped. What is left is the cutover
-(slice 4): deploying this, importing the KV board, and retiring `server/`. The import must
-insert a `revisions` row for the imported head rev (actor `migration`, `updated_at` = the KV
-doc's `updatedAt`, no `changes` rows) when it sets `board_head.rev`: history only serves and
-restores revs that have one.
+The port is complete (KODER-EE05): every route is implemented, the whole contract suite
+ported from `server/` passes against Postgres with no step skipped, and the server ships as
+a container image with CI behind it (below). What is left is operational, not code: choose
+the host (KODER-5C08), write and run the KV import (KODER-E214), then retire `server/`; the
+steps are in [`docs/runbooks/cutover-to-node.md`](../docs/runbooks/cutover-to-node.md). The
+import must insert a `revisions` row for the imported head rev (actor `migration`,
+`updated_at` = the KV doc's `updatedAt`, no `changes` rows) when it sets `board_head.rev`:
+history only serves and restores revs that have one.
 
 ## History, restore and the webhook
 
@@ -131,6 +133,50 @@ What differs from the Deno server on purpose:
     retrying a 500 forever;
   - a null or absent `projects`/`life` comes back as `{}`, and an array-shaped one as an
     object keyed `"0"`, `"1"`, … (the client's `normalize()` reads both the same way).
+
+## Run it in a container
+
+The `Dockerfile` at the repo root builds a small image (`node:22-alpine`, about 170 MB)
+that runs `node api/src/main.ts`: the `api/` sources, their production dependencies
+(`npm ci --omit=dev`) and the PWA files the server serves. `.dockerignore` is deny-by-default,
+so `server/`, `docs/`, `tests/`, `.git`, `node_modules`, `.env*` and `js/config.local.js` never
+reach the image, and it holds no secrets: everything is configured by env vars at run time.
+It runs as the non-root `node` user with `NODE_ENV=production` and listens on 8000.
+
+```bash
+docker build -t koder-api .          # from the repo root
+docker run --rm -p 8000:8000 \
+  -e NEON_DATABASE_URL='postgres://user:pass@host/db?sslmode=require' \
+  -e KODER_TOKEN='<long random token>' \
+  -e KODER_WEBHOOK_SECRET='<github webhook secret>' \
+  koder-api
+```
+
+The image takes the variables in the Environment table above (`NEON_DATABASE_URL` and
+`KODER_TOKEN` are required); `PORT` defaults to 8000.
+
+Neon: use the **direct** connection string (host without `-pooler`), not the pooled one:
+through the pooler the driver can't use prepared statements and a small `PUT /state` costs
+about 14 round trips instead of 4 (see the connection details above). To reach a Postgres on
+the host machine from Docker Desktop, use `host.docker.internal` and `sslmode=disable`.
+
+Health check: the image declares a `HEALTHCHECK` that runs `fetch` on `GET /` with node
+itself (no curl in the image). `GET /` is served from disk, needs no token and makes no
+database call, so it proves the process is up; the database is proven at startup (the
+process exits if it can't be reached). Orchestrators that take their own probe should use
+`GET /`.
+
+`scripts/smoke.sh` is a black-box check of a running server: auth, `PUT`/`GET /state` with
+ETag and 304, a stale-write 409, `POST` and `GET /tickets`. It **writes** to the board and
+expects an empty database (rev 0), so point it only at a fresh deployment:
+
+```bash
+api/scripts/smoke.sh https://koder-api.example.com '<token>'
+```
+
+CI (`.github/workflows/ci.yml`) runs the frontend tests, `npm run check` and `npm test` in
+`api/` on Node 22 and 24 (Linux), and builds this image and runs `smoke.sh` against it with a
+`postgres:16` service container.
 
 ## Test it
 

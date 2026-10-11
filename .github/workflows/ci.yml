@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# A newer push to the same ref supersedes the run in flight.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The PWA and its tooling: JSDoc type check + node --test over tests/.
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: npm ci
+      - run: npm test
+
+  # The Node + Postgres server in api/ (PGlite stands in for Postgres here).
+  api:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
+    defaults:
+      run:
+        working-directory: api
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: api/package-lock.json
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+
+  # Build the image and drive it over HTTP against a real Postgres.
+  docker-smoke:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: koder
+          POSTGRES_PASSWORD: koder-ci
+          POSTGRES_DB: koder
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U koder -d koder"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # Throwaway values for this job only.
+      KODER_TOKEN: ci-token
+      KODER_WEBHOOK_SECRET: ci-webhook-secret
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the image
+        run: docker build -t koder-api .
+      - name: Run the image
+        # Host networking, so 127.0.0.1:5432 is the service container's mapped
+        # port and the API listens on 127.0.0.1:8000.
+        run: |
+          docker run -d --name koder-api --network host \
+            -e NEON_DATABASE_URL='postgres://koder:koder-ci@127.0.0.1:5432/koder?sslmode=disable' \
+            -e KODER_TOKEN="$KODER_TOKEN" \
+            -e KODER_WEBHOOK_SECRET="$KODER_WEBHOOK_SECRET" \
+            koder-api
+      - name: Wait for the container to be healthy
+        # Bounded at 90s. Docker's first probe runs one HEALTHCHECK interval (30s)
+        # after start, so 90s leaves room for two more tries before giving up.
+        run: |
+          for _ in $(seq 1 45); do
+            status="$(docker inspect -f '{{.State.Health.Status}}' koder-api)"
+            echo "health: $status"
+            [ "$status" = healthy ] && exit 0
+            [ "$(docker inspect -f '{{.State.Running}}' koder-api)" = true ] || break
+            sleep 2
+          done
+          docker logs koder-api
+          exit 1
+      - name: Smoke test against Postgres
+        run: api/scripts/smoke.sh http://127.0.0.1:8000 "$KODER_TOKEN"
+      - name: Container logs show no stack trace
+        run: |
+          docker logs koder-api 2>&1 | tee container.log
+          if grep -Eq '^\s+at |Error:|Unhandled|UnhandledPromiseRejection' container.log; then
+            echo "stack trace or error in container logs" >&2
+            exit 1
+          fi
+      - name: Dump logs on failure
+        if: failure()
+        run: docker logs koder-api || true
