@@ -3,6 +3,9 @@
 Status: findings for Koda. Ticket KODER-59BC (agent half of KODER-2B82, Phase 0 of
 `docs/specs/storage-expansion.md`). Date: 2026-10-08.
 
+Note 2026-10-11: the probe code this spec refers to (`server/spike/`) was removed from `main` when the Postgres
+migration was shelved; it, and the Node port, are at the git tag `node-api-archive`. The findings below stand.
+
 Two questions: (1) can PGlite run the future `PgStore` contract suite under Deno, and (2) what do the
 vendors' own pages say about the figures `storage-expansion.md` section 14 marked unverified.
 

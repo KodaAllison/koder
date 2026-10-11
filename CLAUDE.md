@@ -15,32 +15,27 @@ Service worker in `sw.js` — adding a JS module means adding it to `SHELL_ASSET
 touch `CACHE_NAME`: it's stamped from a content hash by `node scripts/stamp-sw.mjs`, run on
 `main` before deploy and never on a feature branch (see "Deploying" in README.md).
 
-Two servers, same HTTP API:
+The server is `server/` (Deno Deploy + KV), the live production app; it redeploys from
+`main`, so don't touch it casually. `main.ts` is the sync API plus the signed GitHub webhook
+(`POST /webhooks/github`) that moves a card to Review on PR open and Done on merge;
+`github.ts` holds the repo allowlist and PR status; `workflow.ts` the webhook helpers;
+`store.ts` the storage interface and `kv-store.ts` its Deno KV implementation.
 
-- `server/` (Deno Deploy + KV) is the LEGACY server and is **still the live production app**
-  until the cutover (`docs/runbooks/cutover-to-node.md`); it redeploys from `main`, so don't
-  touch it casually. `main.ts` is the sync API plus the signed GitHub webhook
-  (`POST /webhooks/github`) that moves a card to Review on PR open and Done on merge;
-  `github.ts` holds the repo allowlist and PR status; `workflow.ts` the webhook helpers.
-- `api/` is its Node 22.18+ + Postgres (Neon) replacement (KODER-EE05), complete but not
-  deployed. Node runs the `.ts` directly (no build); same file split, plus `pg-store.ts`
-  (all SQL), `pg-schema.ts` (migrations), `static.ts` (serves only the PWA's files). See
-  `api/README.md`. The root `Dockerfile` builds it (`docker build -t koder-api .`).
+Deno Deploy is reported to shut down around April 2027 (secondary sources). The migration off
+it (a Node + Postgres port, KODER-EE05/E214) was built, then deliberately shelved on
+2026-10-11 and removed from `main`; it is kept at the git tag `node-api-archive`
+(`git checkout node-api-archive -- api Dockerfile` brings it back). KODER-5C08 tracks
+revisiting it; revisit by January 2027.
 
 Tests: `npm test` from the repo root runs the JSDoc type check (`tsc --checkJs`) and
 `node --test` over `tests/` (store/ref logic, the koder-ticket CLI, PR status, SW stamping,
 project generation). Keep `store.js` and `ref.js` free of DOM/localStorage so this stays
 true. JS uses `// @ts-check` + JSDoc types.
 
-- `api/`: `npm run test:api` from the root, or `npm run check` / `npm test` inside `api/`.
-  The contract suite is `api/tests/contract.test.ts` (ported from `server/webhook.deno.ts`;
-  it drives a spawned server over HTTP on PGlite). `PgStore` has no test file of its own.
-- `server/`: `deno task check` and `deno task test` from `server/` still apply to it.
-- CI (`.github/workflows/ci.yml`): frontend tests, `api` on Node 22 and 24, and a
-  `docker-smoke` job that builds the image and runs `api/scripts/smoke.sh` against
-  `postgres:16`. It doesn't run the Deno tests.
+- `server/`: `deno task check` and `deno task test` from `server/`.
+- CI (`.github/workflows/ci.yml`): runs the frontend tests only. It doesn't run the Deno tests.
 
-Specs for bigger work live in `docs/specs/` (agent orchestration, storage expansion).
+Specs for bigger work live in `docs/specs/` (agent orchestration, storage expansion, storage spike).
 
 ## Koder skills
 
