@@ -53,6 +53,15 @@
       <!-- Ticket ref (e.g. KODER-8CDA) — click to copy. Hidden for a new
            ticket, which has no id to derive one from yet (see js/modal.js). -->
       <button type="button" class="card-ref modal-ref" id="modalRef" hidden></button>
+      <!-- Read-only view: what opens when you click an existing card. Edit
+           swaps it for the form below (see js/modal.js). -->
+      <div id="viewPane" class="view-pane" hidden>
+        <h3 class="view-title" id="viewTitle"></h3>
+        <div class="view-chips" id="viewChips"></div>
+        <div class="view-note" id="viewNote"></div>
+        <p class="view-created" id="viewCreated"></p>
+      </div>
+      <div id="editPane" class="edit-pane">
       <div>
         <label for="fTitle">Title</label>
         <input type="text" id="fTitle" placeholder="What needs doing?" maxlength="140">
@@ -80,10 +89,13 @@
           <select id="fCol"></select>
         </div>
       </div>
+      </div>
       <div class="modal-actions">
         <button class="btn btn-danger" id="btnDelete" hidden>Delete</button>
         <button class="btn btn-ghost" id="btnCancel">Cancel</button>
         <button class="btn btn-primary" id="btnSave">Save</button>
+        <button class="btn btn-ghost" id="btnClose" hidden>Close</button>
+        <button class="btn btn-primary" id="btnEdit" hidden>Edit</button>
       </div>
       <p class="delete-error" id="deleteError" role="alert" hidden></p>
     </div>
