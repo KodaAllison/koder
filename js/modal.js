@@ -28,6 +28,22 @@ const projectField = /** @type {HTMLElement} */ (document.getElementById('projec
 const btnDelete = /** @type {HTMLButtonElement} */ (document.getElementById('btnDelete'));
 const modalRef = /** @type {HTMLButtonElement} */ (document.getElementById('modalRef'));
 const deleteError = /** @type {HTMLElement} */ (document.getElementById('deleteError'));
+const viewPane = /** @type {HTMLElement} */ (document.getElementById('viewPane'));
+const editPane = /** @type {HTMLElement} */ (document.getElementById('editPane'));
+const viewTitle = /** @type {HTMLElement} */ (document.getElementById('viewTitle'));
+const viewChips = /** @type {HTMLElement} */ (document.getElementById('viewChips'));
+const viewNote = /** @type {HTMLElement} */ (document.getElementById('viewNote'));
+const viewCreated = /** @type {HTMLElement} */ (document.getElementById('viewCreated'));
+const btnCancel = /** @type {HTMLButtonElement} */ (document.getElementById('btnCancel'));
+const btnSave = /** @type {HTMLButtonElement} */ (document.getElementById('btnSave'));
+const btnClose = /** @type {HTMLButtonElement} */ (document.getElementById('btnClose'));
+const btnEdit = /** @type {HTMLButtonElement} */ (document.getElementById('btnEdit'));
+const modalTitle = /** @type {HTMLElement} */ (document.getElementById('modalTitle'));
+
+/** Clicking an existing card opens it to READ; Edit swaps in the form. A new
+ * ticket has nothing to read, so it opens straight into the form.
+ * @type {'view'|'edit'} */
+let mode = 'edit';
 
 /** The ref chip, click-to-copy. Quoting a ref somewhere else is the whole point
  * of having one, and on a phone there is no other way to get the text off a
@@ -122,8 +138,6 @@ export function openModal(card, colId) {
     fProject.value = proj;
   }
 
-  const modalTitle = /** @type {HTMLElement} */ (document.getElementById('modalTitle'));
-  modalTitle.textContent = card ? 'Edit ticket' : 'New ticket';
   // A new ticket has no id yet, so no ref to show — it gets one on save.
   modalRef.hidden = !card;
   if (card) {
@@ -140,16 +154,68 @@ export function openModal(card, colId) {
   deleteError.hidden = true;
   deleteError.textContent = '';
   pristine = formSnapshot();   // after every field is populated, before the user can touch it
+  setMode(card ? 'view' : 'edit');
   overlay.classList.add('open');
-  fTitle.focus();
+  if (!card) fTitle.focus();
+}
+
+/** @param {'view'|'edit'} next */
+function setMode(next) {
+  mode = next;
+  const viewing = next === 'view';
+  viewPane.hidden = !viewing;
+  editPane.hidden = viewing;
+  btnClose.hidden = btnEdit.hidden = !viewing;
+  btnCancel.hidden = btnSave.hidden = viewing;
+  modalTitle.textContent = viewing ? 'Ticket' : editing && editing.card ? 'Edit ticket' : 'New ticket';
+  if (viewing) renderView();
+}
+
+/* Everything shown here is textContent, never innerHTML: title/note arrive from
+ * the sync server like any other field. Reads the saved card, not the form, so
+ * a cancelled edit can't leave stale text on screen. */
+function renderView() {
+  if (!editing || !editing.card) return;
+  const { card, colId } = editing;
+  const boardId = boardFor(activeTab);
+  viewTitle.textContent = card.title;
+  /** @type {HTMLElement[]} */
+  const chips = [];
+  /** @param {string} cls @param {string} text */
+  const chip = (cls, text) => {
+    const c = document.createElement('span');
+    c.className = `chip ${cls}`;
+    c.textContent = text;
+    chips.push(c);
+  };
+  const col = colsFor(boardId).find(c => c.id === colId);
+  chip('status', col ? col.name : colId);
+  chip(card.priority, { low: 'Low', med: 'Medium', high: 'High' }[card.priority]);
+  if (boardId === 'projects') {
+    const p = PROJECTS.find(x => x.id === card.project);
+    chip('project unlinked', p ? p.name : 'Unassigned');
+  }
+  viewChips.replaceChildren(...chips);
+  const note = (card.note || '').trim();
+  viewNote.textContent = note || 'No notes.';
+  viewNote.classList.toggle('empty', !note);
+  viewCreated.textContent = card.created
+    ? `Created ${new Date(card.created).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' })}`
+    : '';
 }
 
 function closeModal() { overlay.classList.remove('open'); editing = null; }
 
 /* Every discard path (Cancel, backdrop, Escape) goes through here; save and
- * delete call closeModal directly since they aren't losing anything. */
+ * delete call closeModal directly since they aren't losing anything. Backing
+ * out of an edit on an existing ticket returns to reading it; anything else
+ * closes. */
 function dismissModal() {
-  if (formSnapshot() !== pristine && !confirm('Discard your changes to this ticket?')) return;
+  if (mode === 'edit' && formSnapshot() !== pristine && !confirm('Discard your changes to this ticket?')) return;
+  if (mode === 'edit' && editing && editing.card) {
+    openModal(editing.card, editing.colId);   // refill the form from the saved card, back to view
+    return;
+  }
   closeModal();
 }
 
@@ -186,16 +252,16 @@ function saveModal() {
 }
 
 /* Static wiring — these elements exist for the lifetime of the page. */
-const btnCancel = /** @type {HTMLButtonElement} */ (document.getElementById('btnCancel'));
-const btnSave = /** @type {HTMLButtonElement} */ (document.getElementById('btnSave'));
 btnCancel.onclick = dismissModal;
 btnSave.onclick = saveModal;
+btnClose.onclick = closeModal;
+btnEdit.onclick = () => { setMode('edit'); fTitle.focus(); };
 overlay.addEventListener('click', e => { if (e.target === overlay) dismissModal(); });
 document.addEventListener('keydown', e => {
   /* Escape is document-wide, so it also fires with the modal shut — where the
    * form still holds the last ticket's values and would prompt about them. */
   if (e.key === 'Escape' && overlay.classList.contains('open')) dismissModal();
-  if (e.key === 'Enter' && overlay.classList.contains('open') && e.target === fTitle) saveModal();
+  if (e.key === 'Enter' && mode === 'edit' && overlay.classList.contains('open') && e.target === fTitle) saveModal();
 });
 
 btnDelete.onclick = async () => {
