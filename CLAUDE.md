@@ -39,7 +39,7 @@ Specs for bigger work live in `docs/specs/` (agent orchestration, storage expans
 
 ## Koder skills
 
-The koder-ticket and koder-sprint skills are mastered here
+The koder-ticket (CLI), koder-work (one-ticket lifecycle) and koder-sprint skills are mastered here
 (`.claude/skills/<name>/SKILL.md`; koder-ticket's CLI source of truth is
 `scripts/koder-ticket.sh`) and synced to `~/.claude/skills/` and the sibling
 repos so cloud/mobile sessions can use the board. After editing any of them, run
