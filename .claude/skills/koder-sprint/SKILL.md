@@ -36,6 +36,9 @@ end of its report (it has full context); you finish it.
 
 ## Board rules
 
+These extend **koder-work** (the one-ticket lifecycle: `doing` first, one PR per
+ticket naming one ref, then `review`). Every card in a sprint follows it.
+
 - **Move a card the instant its state changes**, in the same command as the
   action that changed it. Koda works off the board in parallel; don't batch
   moves and don't wait for the GitHub webhook.

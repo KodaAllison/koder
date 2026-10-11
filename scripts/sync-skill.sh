@@ -10,6 +10,7 @@
 #
 # Skills synced (SKILLS below), each from .claude/skills/<skill>/SKILL.md here:
 #   * koder-ticket — plus its CLI (master: scripts/koder-ticket.sh here)
+#   * koder-work — SKILL.md only; the one-ticket lifecycle, built on the koder-ticket CLI.
 #   * koder-sprint — SKILL.md only; it drives the koder-ticket CLI. Listed in
 #     LOCAL_ONLY while it's being refined, so it goes to ~/.claude/skills only.
 # Credentials (.koder.env) are NEVER copied into repos; a .gitignore guard is
@@ -23,7 +24,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SRC_SH="$ROOT/scripts/koder-ticket.sh"
-SKILLS="koder-ticket koder-sprint"
+SKILLS="koder-ticket koder-work koder-sprint"
 # Skills still being refined: synced to ~/.claude/skills only, not into repos.
 LOCAL_ONLY=" koder-sprint "
 

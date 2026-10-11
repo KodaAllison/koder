@@ -1,6 +1,6 @@
 ---
 name: koder-ticket
-description: Read, add, edit, and move tickets on Koda's personal kanban board (Koder). Use whenever Koda asks to file/track/log a ticket or todo on "the board", "koder", or "my kanban" — or asks to look at, pick up, or work on tickets for a project (e.g. "grab a ticket from holitrackr and work on it").
+description: The commands for Koda's personal kanban board (Koder): read, add, edit, move and delete tickets with the bundled CLI. Use whenever Koda asks to file/track/log a ticket or todo on "the board", "koder", or "my kanban", or to look at tickets for a project. To actually work a ticket (build or fix something that is on the board), follow koder-work as well.
 ---
 
 # Work with tickets on the Koder board
@@ -100,28 +100,17 @@ is no longer wanted; move shipped work to `done`. `close` is an exact alias for
 still restore the ticket for a limited time. Missing tickets return an error,
 so a retry cannot silently create another revision.
 
-## The "pick up work" workflow
+## Working a ticket
 
-When Koda says "look at the tickets on X and work on one":
-
-1. `list --project X --column todo` (fall back to `--column backlog` if empty)
-2. Pick the highest-priority ticket you can actually complete; tell Koda which
-   and why before starting — **by ref**, so it's findable on the board
-3. Move it to `doing`
-4. Do the work in the project repo, then commit, push, and open a PR
-5. Once the PR is up, move the ticket to `review` — **not** `done`. `done` is
-   reserved for after merge; a ticket in `done` should always mean the work
-   actually shipped. Koda (or another agent given the review) merges the PR
-   and moves the card to `done`.
-
-If you had to stop partway, move the ticket back to `todo` and add a new
-ticket noting remaining work.
+How to take a ticket from pick-up to review (move it to `doing` first, one PR
+per ticket naming one ref, then `review`) is the **koder-work** skill. This one
+is only the commands.
 
 ## Conventions
 
 - Titles short and imperative; context goes in `--note`
 - New work → `backlog`; things Koda will do next → `todo`
-- One ticket per distinct piece of work; don't bundle
+- One ticket per distinct piece of work; don't bundle (and one PR per ticket, see koder-work)
 
 ## Fallback: raw API
 
