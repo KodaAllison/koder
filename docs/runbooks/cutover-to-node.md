@@ -17,8 +17,8 @@ Open tickets this depends on:
 
 - KODER-5C08: this cutover, including choosing the host for the container (this runbook is
   host-agnostic) and the final cleanup PR in step 10.
-- KODER-E214: write the KV -> Postgres import (and the verifier). It does not exist yet;
-  the requirements it must meet are in step 4.
+- KODER-E214: the KV -> Postgres import and verifier (`api/scripts/export-kv.deno.ts`,
+  `api/scripts/import-kv.ts`). Step 4 says how to run them.
 - KODER-948E (optional, not a blocker): run the api contract suite against a real Postgres in
   CI. Until it lands, real lock waits and deadlocks are only exercised by the docker smoke job.
 
@@ -31,13 +31,13 @@ server's data.
 
 - [ ] KODER-5C08 decided; the host can run a container image, give it env vars, terminate
       HTTPS and (ideally) restart it on failure. TODO(decide): host.
-- [ ] KODER-E214 merged: an import script that satisfies step 4, plus a verifier that diffs
-      the KV doc against the Postgres-assembled doc.
+- [ ] KODER-E214 merged (the export script, the import script and its built-in verifier).
 - [ ] The slice 1-4 PRs of KODER-EE05 are merged and CI is green on `main` (frontend, api on
       Node 22 and 24, docker-smoke).
-- [ ] You can read KV: Deno Deploy access, or a way to run a script with the KV database
-      attached. TODO(decide): how the export/import script reads KV (a one-off Deno script
-      with the KV database, or a temporary read-only endpoint on the old app).
+- [ ] You can read KV: `api/scripts/export-kv.deno.ts` opens it over KV Connect with
+      `DENO_KV_ACCESS_TOKEN` (a Deno Deploy access token) and the database's connect URL, or
+      reads a local KV file. It only ever calls `kv.get` / `kv.list`, so it cannot change
+      the live board. TODO(decide): where the connect URL comes from for this database.
 - [ ] The GitHub webhook secret, the sync token and the GitHub token are at hand (password
       manager); you will reuse them on the new host so clients and GitHub need no change
       other than the URL.
@@ -78,8 +78,8 @@ database and attaching Postgres detaches KV, which would take down the live boar
    api/scripts/smoke.sh https://<new-host> '<KODER_TOKEN>'
    ```
    Then wipe the smoke data: drop and recreate the Koder database (or the schema) so the
-   import in step 4 starts from an empty database. TODO(decide): whether the import script
-   refuses a non-empty database (recommended) or the wipe is manual.
+   import in step 4 starts from an empty database. The import script refuses a non-empty
+   database, so the wipe is manual.
 
 ## 3. Safety export from KV (before touching anything)
 
@@ -92,7 +92,27 @@ Keep these outside the repo (they are personal data), dated, in private storage:
 
 ## 4. Import KV into Postgres (KODER-E214)
 
-Run against the new, empty database. The import must:
+Two programs with a JSON file between them, because only Deno can read KV and only Node
+runs the Postgres code. Keep the dump outside the repo: it is your whole board, and the
+exporter creates it readable by you only and never overwrites an existing file.
+
+```bash
+# 1. Deno, read-only against KV (a local file path works too, for a rehearsal)
+DENO_KV_ACCESS_TOKEN=... deno run --allow-env --allow-net --allow-write --unstable-kv   api/scripts/export-kv.deno.ts https://api.deno.com/databases/<id>/connect ~/koder-kv-<date>.json
+
+# 2. Node 22.18+, into the EMPTY database; imports, then verifies
+NEON_DATABASE_URL=postgres://... node api/scripts/import-kv.ts ~/koder-kv-<date>.json
+
+# Re-check later without writing anything
+NEON_DATABASE_URL=postgres://... node api/scripts/import-kv.ts ~/koder-kv-<date>.json --verify-only
+```
+
+The importer migrates the schema, refuses a database that holds any data (nothing is
+written), loads everything in ONE transaction (all or nothing), then runs the verifier.
+Exit 0 means imported and identical; 1 is a refusal, an error or a difference (stop the
+cutover); 2 is a usage error. It never prints the connection string.
+
+What the import does (the requirements this step started from):
 
 - Set `board_head.rev` to the KV doc's exact head `rev`. Never reset it, never add one.
 - In the same transaction insert the `revisions` row for that rev: actor `migration`,
@@ -108,9 +128,12 @@ Run against the new, empty database. The import must:
 - Not import the 20 `["board", rev]` KV snapshots: history starts at the cutover.
 - Be re-runnable on an empty database, and refuse (or clearly report) a non-empty one.
 
-Then run the verifier: rev equal, card counts per column, per-card canonical JSON equal,
-order within each column, `lifeMeta`, archive id set and delivery id set equal. Any diff
-stops the cutover. The documented, intentional differences (duplicate ids, U+FFFD
+The verifier (run by the import, or alone with `--verify-only`) reads the database back
+through the same code `GET /state`, `GET /archive` and the webhook use, and checks: rev and
+`updatedAt` equal, column order, card counts and order per column, per-card canonical JSON,
+`lifeMeta`, top-level extras, the `revisions` row (actor `migration`, no `changes`, and
+`GET /state?rev=<head>` equal to `GET /state`), the archive (ids, order, each card) and the
+delivery id set. Any diff stops the cutover. The documented, intentional differences (duplicate ids, U+FFFD
 normalisation, null `projects` becoming `{}`) are in `api/README.md`, "What differs".
 
 This first import is a rehearsal: the old app keeps taking writes, so the copy goes stale.

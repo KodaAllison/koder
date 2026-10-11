@@ -16,11 +16,14 @@ nothing in `server/` changes until the cutover.
 The port is complete (KODER-EE05): every route is implemented, the whole contract suite
 ported from `server/` passes against Postgres with no step skipped, and the server ships as
 a container image with CI behind it (below). What is left is operational, not code: choose
-the host (KODER-5C08), write and run the KV import (KODER-E214), then retire `server/`; the
-steps are in [`docs/runbooks/cutover-to-node.md`](../docs/runbooks/cutover-to-node.md). The
-import must insert a `revisions` row for the imported head rev (actor `migration`,
-`updated_at` = the KV doc's `updatedAt`, no `changes` rows) when it sets `board_head.rev`:
-history only serves and restores revs that have one.
+the host (KODER-5C08) and run the cutover, then retire `server/`; the steps are in
+[`docs/runbooks/cutover-to-node.md`](../docs/runbooks/cutover-to-node.md). The KV import
+(KODER-E214) is written: `scripts/export-kv.deno.ts` dumps KV under Deno, and
+`scripts/import-kv.ts` loads the dump into an empty database under Node and verifies it
+(`src/kv-import.ts`, `src/kv-dump.ts`; tests in `tests/kv-import.test.ts`). It sets
+`board_head.rev` to the KV head and inserts a `revisions` row for it (actor `migration`,
+`updated_at` = the KV doc's `updatedAt`, no `changes` rows): history only serves and
+restores revs that have one.
 
 ## History, restore and the webhook
 
