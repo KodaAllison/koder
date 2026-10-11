@@ -125,7 +125,7 @@ function knownIds() {
 }
 
 /* Success-path status. Not simply "clear the badge": a board approaching the
- * server's 60_000 ceiling gets a heads-up here, while pushes still work, so
+ * server's 64KB store cap gets a heads-up here, while pushes still work, so
  * the first 413 isn't also the first warning. */
 function statusOk() { hooks.onStatus(sizeWarning()); }
 

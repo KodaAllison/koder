@@ -115,7 +115,19 @@ export function cardMatchesView(card, view, projectIdSet) {
   return card.project === view;
 }
 
-export function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 7); }
+/* Timestamp + 5 random base-36 chars is only ~60M values per millisecond, so
+ * two ids minted in the same ms collide about once in 60M pairs, which is
+ * enough to flake a bulk test and is a real (if remote) hazard in bulk
+ * creation. Remembering what this session has issued and re-rolling on a hit
+ * makes in-process collisions impossible; ids from other devices differ in
+ * the timestamp and random tail, which is as good as it gets. */
+const issuedIds = new Set();
+export function uid() {
+  let id;
+  do { id = Date.now().toString(36) + Math.random().toString(36).slice(2, 7); } while (issuedIds.has(id));
+  issuedIds.add(id);
+  return id;
+}
 
 export const PRIORITIES = /** @type {Priority[]} */ (['low', 'med', 'high']);
 
@@ -164,22 +176,32 @@ export function removeDoneCards(s, boardId, ids) {
 }
 
 /* ---------- size ceiling ----------
- * The whole board rides in one PUT /state, and the server rejects a body over
- * 60_000 because Deno KV caps a value at 64KB (server/main.ts). Past that line
+ * The whole board is ONE Deno KV value, capped at 64KB (STORE_VALUE_MAX in
+ * server/kv-store.ts, which measures it with V8 serialize()). Past that line
  * every push 413s and the board just sits dirty, so the size is worth watching
  * before it's fatal rather than after. */
-export const BOARD_SIZE_LIMIT = 60_000;
+export const BOARD_SIZE_LIMIT = 65_536;
 
 /* Warn at 80%, which leaves ~12_000 of headroom — enough that the shrunk board
  * still pushes cleanly once done cards are archived off it. */
 export const BOARD_SIZE_WARN = BOARD_SIZE_LIMIT * 0.8;
 
-/* Measured the same way the server measures the request it arrives in: String
- * .length, not UTF-8 bytes. The wire body wraps this in {"baseRev":N,"board":…},
- * a couple of dozen characters that the warn headroom absorbs. */
+/* An estimate of the bytes the server will STORE, which is not JSON length.
+ * V8 serialize() keeps a string that is all Latin-1 at one byte a character,
+ * but any character above U+00FF (an em dash, an arrow, a curly quote) makes
+ * the whole string two bytes a character. So a board of notes full of those
+ * is nearly double its JSON length, and a plain String.length check let one
+ * sit past the cap, answering 413, before any warning showed. Counting each
+ * such string twice tracks the real figure to within a few percent (it can
+ * come in slightly under, which the warn headroom absorbs). */
 /** @param {BoardState} s @returns {number} */
 export function boardSize(s) {
-  return JSON.stringify(s).length;
+  let extra = 0;
+  const json = JSON.stringify(s, (_key, v) => {
+    if (typeof v === 'string' && /[^ -ÿ]/.test(v)) extra += v.length;
+    return v;
+  });
+  return json.length + extra;
 }
 
 /* Mirrors NOTE_MAX in server/main.ts. The server enforces it on agent writes

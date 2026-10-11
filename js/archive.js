@@ -2,7 +2,7 @@
 /* Archiving finished cards.
  *
  * The whole board is ONE value on the sync server, and Deno KV caps a value at
- * 64KB (the server rejects a PUT body over 60_000). Done is the only column
+ * 64KB (the stored board can't exceed 65_536 bytes). Done is the only column
  * that only ever grows, so it is what eventually walks the board into that
  * wall — and the failure mode is bad: every push 413s, the board stays dirty
  * forever, and all you get is a badge.
