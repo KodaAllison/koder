@@ -16,6 +16,7 @@ import {
   projectPrefix, ticketRef, prefixCollisions, LIFE_PREFIX, UNASSIGNED_PREFIX,
 } from '../js/ref.js';
 import { readFileSync } from 'node:fs';
+import { serialize } from 'node:v8';
 
 function card(id, extra = {}) {
   return { id, title: `card ${id}`, note: '', priority: 'med', created: 1, project: null, ...extra };
@@ -541,4 +542,20 @@ test('prefixCollisions reports a genuine clash and a reserved-prefix clash', () 
   assert.deepEqual(prefixCollisions(['portfolio-web', 'portfolio-website']),
     { PORWE: ['portfolio-web', 'portfolio-website'] });
   assert.deepEqual(prefixCollisions(['life']), { LIFE: ['(reserved)', 'life'] });
+});
+
+test('boardSize counts a string with a non-Latin-1 character twice, as the store does', () => {
+  const plain = normalize({ projects: { todo: [card('a', { note: 'x'.repeat(1000) })] } });
+  const fancy = normalize({ projects: { todo: [card('a', { note: 'x'.repeat(999) + '—' })] } });
+  assert.equal(boardSize(plain), JSON.stringify(plain).length);
+  assert.equal(boardSize(fancy), JSON.stringify(fancy).length + 1000);
+});
+
+test('boardSize stays within a few percent of what V8 serialize() stores', () => {
+  const notes = ['x'.repeat(400), 'x'.repeat(399) + '—', '“quoted” → '.repeat(40)];
+  for (const note of notes) {
+    const s = normalize({ projects: { todo: Array.from({ length: 60 }, (_, i) => card(`c${i}`, { note })) } });
+    const stored = serialize(s).byteLength;
+    assert.ok(Math.abs(boardSize(s) - stored) / stored < 0.05, `estimate ${boardSize(s)} vs stored ${stored}`);
+  }
 });
