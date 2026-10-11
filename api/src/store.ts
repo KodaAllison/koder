@@ -162,7 +162,8 @@ export function noSnapshotMessage(rev: number, keptRevisions: number | null): st
 
 /* Who is behind a board write, for backends that keep a changes log. PUT /state
  * ("browser") and the ticket routes ("cli": they serve the CLI and agents)
- * pass one; the other writers get theirs in a later slice.
+ * pass one; PgStore's restore and webhook writes log "restore" and "webhook"
+ * themselves, and "migration" is reserved for the cutover import.
  * An agent run (agent:<run>) joins this union when agents land — left out until
  * then rather than typed as a template string now. */
 export type Actor = "browser" | "cli" | "webhook" | "restore" | "migration";
